@@ -1,0 +1,11 @@
+id       = "coderabbit"
+name     = "CodeRabbit CLI"
+homepage = "https://www.coderabbit.ai"
+
+[[installs]]
+method   = "native"
+bin      = "coderabbit"
+paths    = ["~/.local/bin/coderabbit"]
+version  = { cmd = ["coderabbit", "--version"] }
+latest   = "self"
+update   = { cmd = ["coderabbit", "update"] }

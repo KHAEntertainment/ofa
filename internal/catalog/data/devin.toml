@@ -1,0 +1,11 @@
+id       = "devin"
+name     = "Devin"
+homepage = "https://devin.ai"
+
+[[installs]]
+method   = "native"
+bin      = "devin"
+paths    = ["~/.local/bin/devin"]
+version  = { cmd = ["devin", "--version"] }
+latest   = "self"
+update   = { cmd = ["devin", "update"] }

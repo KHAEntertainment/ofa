@@ -1,0 +1,11 @@
+id       = "codex"
+name     = "Codex CLI"
+homepage = "https://github.com/openai/codex"
+
+[[installs]]
+method   = "brew-cask"
+package  = "codex"
+bin      = "codex"
+version  = { cmd = ["codex", "--version"] }
+latest   = "brew"
+update   = { cmd = ["brew", "upgrade", "--cask", "codex"] }

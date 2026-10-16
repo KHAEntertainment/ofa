@@ -1,0 +1,11 @@
+id       = "kilocode"
+name     = "Kilo Code"
+homepage = "https://kilocode.ai"
+
+[[installs]]
+method   = "npm"
+package  = "@kilocode/cli"
+bin      = "kilocode"
+version  = { cmd = ["kilocode", "--version"] }
+latest   = "npm"
+update   = { cmd = ["npm", "install", "-g", "@kilocode/cli@latest"] }

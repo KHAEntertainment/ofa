@@ -1,0 +1,23 @@
+# Build artifacts
+/bin/
+/dist/
+*.test
+# The compiled ofa binary in this repo's root, if anyone runs `go build`
+# from the project root without `go install`.
+/ofa
+
+# Go
+*.out
+coverage.txt
+coverage.html
+*.prof
+
+# Editor / OS
+.DS_Store
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Local state (used by `ofa scan`)
+# Keep this out of the repo — it's per-machine.

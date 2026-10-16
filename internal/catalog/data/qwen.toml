@@ -1,0 +1,19 @@
+id       = "qwen"
+name     = "Qwen Code"
+homepage = "https://github.com/QwenLM/qwen-code"
+
+[[installs]]
+method   = "npm"
+package  = "@qwen-code/qwen-code"
+bin      = "qwen"
+version  = { cmd = ["qwen", "--version"] }
+latest   = "npm"
+update   = { cmd = ["npm", "install", "-g", "@qwen-code/qwen-code@latest"] }
+
+[[installs]]
+method   = "brew-formula"
+package  = "qwen-code"
+bin      = "qwen"
+version  = { cmd = ["qwen", "--version"] }
+latest   = "brew"
+update   = { cmd = ["brew", "upgrade", "qwen-code"] }

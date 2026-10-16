@@ -1,0 +1,27 @@
+id       = "opencode"
+name     = "opencode"
+homepage = "https://opencode.ai"
+
+[[installs]]
+method   = "npm"
+package  = "opencode-ai"
+bin      = "opencode"
+version  = { cmd = ["opencode", "--version"] }
+latest   = "npm"
+update   = { cmd = ["npm", "install", "-g", "opencode-ai@latest"] }
+
+[[installs]]
+method   = "npm"
+package  = "@opencode-ai/cli"
+bin      = "opencode2"
+version  = { cmd = ["opencode2", "--version"] }
+latest   = "npm"
+update   = { cmd = ["npm", "install", "-g", "@opencode-ai/cli@latest"] }
+
+[[installs]]
+method   = "brew-formula"
+package  = "opencode"
+bin      = "opencode"
+version  = { cmd = ["opencode", "--version"] }
+latest   = "brew"
+update   = { cmd = ["brew", "upgrade", "opencode"] }

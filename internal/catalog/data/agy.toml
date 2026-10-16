@@ -1,0 +1,11 @@
+id       = "agy"
+name     = "Antigravity"
+homepage = ""
+
+[[installs]]
+method   = "native"
+bin      = "agy"
+paths    = ["~/.local/bin/agy"]
+version  = { cmd = ["agy", "--version"] }
+latest   = "self"
+update   = { cmd = ["agy", "update"] }

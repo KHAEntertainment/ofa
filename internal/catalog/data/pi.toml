@@ -1,0 +1,11 @@
+id       = "pi"
+name     = "Pi Coding Agent"
+homepage = "https://www.npmjs.com/package/@earendil-works/pi-coding-agent"
+
+[[installs]]
+method   = "npm"
+package  = "@earendil-works/pi-coding-agent"
+bin      = "pi"
+version  = { cmd = ["pi", "--version"] }
+latest   = "npm"
+update   = { cmd = ["npm", "install", "-g", "@earendil-works/pi-coding-agent@latest"] }

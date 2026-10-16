@@ -1,0 +1,11 @@
+id       = "mmx"
+name     = "MiniMax"
+homepage = "https://www.minimax.io"
+
+[[installs]]
+method   = "npm"
+package  = "mmx-cli"
+bin      = "mmx"
+version  = { cmd = ["mmx", "--version"] }
+latest   = "self"
+update   = { cmd = ["mmx", "update"] }

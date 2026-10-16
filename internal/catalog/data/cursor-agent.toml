@@ -1,0 +1,11 @@
+id       = "cursor-agent"
+name     = "Cursor Agent"
+homepage = "https://cursor.com"
+
+[[installs]]
+method   = "native"
+bin      = "cursor-agent"
+paths    = ["~/.local/bin/cursor-agent"]
+version  = { cmd = ["cursor-agent", "--version"] }
+latest   = "self"
+update   = { cmd = ["cursor-agent", "update"] }

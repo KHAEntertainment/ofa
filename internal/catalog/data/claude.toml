@@ -1,0 +1,11 @@
+id       = "claude"
+name     = "Claude Code"
+homepage = "https://claude.ai/code"
+
+[[installs]]
+method   = "native"
+bin      = "claude"
+paths    = ["~/.local/bin/claude"]
+version  = { cmd = ["claude", "--version"] }
+latest   = "self"
+update   = { cmd = ["claude", "update"] }

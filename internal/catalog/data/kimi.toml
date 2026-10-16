@@ -1,0 +1,19 @@
+id       = "kimi"
+name     = "Kimi Code"
+homepage = ""
+
+[[installs]]
+method   = "uv"
+package  = "kimi-cli"
+bin      = "kimi-cli"
+version  = { cmd = ["kimi-cli", "--version"] }
+latest   = "pypi"
+update   = { cmd = ["uv", "tool", "upgrade", "kimi-cli"] }
+
+[[installs]]
+method   = "native"
+bin      = "kimi"
+paths    = ["~/.kimi-code/bin/kimi"]
+version  = { cmd = ["kimi", "--version"] }
+latest   = "self"
+update   = { cmd = ["kimi", "upgrade", "--yes"] }

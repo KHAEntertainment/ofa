@@ -1,0 +1,11 @@
+id       = "copilot"
+name     = "GitHub Copilot CLI"
+homepage = "https://github.com/features/copilot"
+
+[[installs]]
+method   = "npm"
+package  = "@github/copilot"
+bin      = "copilot"
+version  = { cmd = ["copilot", "--version"] }
+latest   = "self"
+update   = { cmd = ["copilot", "update"] }
