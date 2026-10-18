@@ -25,6 +25,17 @@ const { meta } = piece;
 if (!meta.palette) {
   throw new Error("expected a colored banner (palette set)");
 }
+// Assert the rendered dims match what internal/banner/banner.go declares.
+// If anyone changes the text, font, or pixel size in this file, the
+// banner.go Cols/Rows constants go stale; fail loudly here instead.
+const EXPECTED_COLS = 35;
+const EXPECTED_ROWS = 8;
+if (meta.cols !== EXPECTED_COLS || meta.rows !== EXPECTED_ROWS) {
+  throw new Error(
+    `unexpected dims: ${meta.cols}x${meta.rows}, ` +
+    `banner.go declares ${EXPECTED_COLS}x${EXPECTED_ROWS}`,
+  );
+}
 
 // Drive the frame once with a color buffer; the frame writes palette
 // indices into env.color per cell.

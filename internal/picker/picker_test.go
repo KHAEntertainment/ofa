@@ -330,15 +330,3 @@ func indexOf(s, sub string) int {
 	}
 	return -1
 }
-
-func containsOrig(s, sub string) bool {
-	if len(sub) == 0 {
-		return true
-	}
-	for i := 0; i+len(sub) <= len(s); i++ {
-		if s[i:i+len(sub)] == sub {
-			return true
-		}
-	}
-	return false
-}

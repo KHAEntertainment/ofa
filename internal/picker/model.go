@@ -117,6 +117,9 @@ func (m model) View() string {
 	// Banner is the OFA logomark (35x8) with SGR 24-bit color escapes
 	// already inlined. bubbletea forwards these to the terminal verbatim,
 	// so the fade between #e67a4c and #4282d7 lands on screen as baked.
+	// Note: the picker always emits colors. NO_COLOR is honored by the
+	// banner.Render path used for --help, but the picker requires a TTY
+	// and the terminal handles color display from there.
 	//
 	// Center it above the items: each row gets (maxWidth-bannerWidth)/2
 	// plain leading spaces and the remainder as trailing spaces, so every
