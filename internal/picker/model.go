@@ -3,8 +3,11 @@ package picker
 import (
 	"fmt"
 	"strings"
+	"unicode/utf8"
 
 	tea "github.com/charmbracelet/bubbletea"
+
+	"ofa/internal/banner"
 )
 
 // model is the bubbletea state machine. Public for tea.Program's
@@ -97,7 +100,45 @@ func (m model) View() string {
 		return ""
 	}
 	var b strings.Builder
-	b.WriteString("ofa — select updates to apply\n\n")
+
+	// Find the widest item row so we can center the banner above it.
+	// Each row is `cursor + "[" + check + "] " + label` — the prefix is
+	// always 6 chars ("> " or "  ", then "[x]" or "[ ]", then " "), so
+	// only the label length varies. Rune count because labels may carry
+	// unicode (e.g., the "→" in `claude → updater available`).
+	maxWidth := 0
+	for _, it := range m.items {
+		w := 6 + utf8.RuneCountInString(it.Label)
+		if w > maxWidth {
+			maxWidth = w
+		}
+	}
+
+	// Banner is the OFA logomark (35x8) with SGR 24-bit color escapes
+	// already inlined. bubbletea forwards these to the terminal verbatim,
+	// so the fade between #e67a4c and #4282d7 lands on screen as baked.
+	// Note: the picker always emits colors. NO_COLOR is honored by the
+	// banner.Render path used for --help, but the picker requires a TTY
+	// and the terminal handles color display from there.
+	//
+	// Center it above the items: each row gets (maxWidth-bannerWidth)/2
+	// plain leading spaces and the remainder as trailing spaces, so every
+	// banner row is exactly maxWidth wide and the logomark sits over the
+	// middle of the items. Plain spaces carry no SGR code, so the
+	// terminal's background color shows through and the colored cells
+	// stay intact. A trailing blank line separates the banner from the
+	// first row.
+	const bannerWidth = banner.Cols
+	extra := maxWidth - bannerWidth
+	var leftPad, rightPad string
+	if extra > 0 {
+		leftPad = strings.Repeat(" ", (extra+1)/2) // bias extra to the left
+		rightPad = strings.Repeat(" ", extra-len(leftPad))
+	}
+	for _, line := range strings.Split(banner.Art, "\n") {
+		fmt.Fprintf(&b, "%s%s%s\n", leftPad, line, rightPad)
+	}
+	b.WriteString("\n")
 	for i, it := range m.items {
 		cursor := "  "
 		if m.cursor == i {

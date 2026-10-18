@@ -1,0 +1,8 @@
+{
+  "type": "module",
+  "private": true,
+  "description": "Build-time generator for the baked OFA banner (internal/banner/art.go). See README.md.",
+  "scripts": {
+    "generate": "node generate.mjs > ../../internal/banner/art.go"
+  }
+}

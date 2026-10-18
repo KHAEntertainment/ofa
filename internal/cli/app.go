@@ -20,6 +20,7 @@ import (
 	"os"
 	"time"
 
+	"ofa/internal/banner"
 	"ofa/internal/catalog"
 	"ofa/internal/config"
 	"ofa/internal/detect"
@@ -116,6 +117,12 @@ func (a *App) Run() ExitCode {
 		fmt.Fprintf(a.Stdout, "ofa %s\n", version)
 		return ExitOK
 	case "-h", "--help", "help":
+		// Print the banner above the help text so the brand surfaces
+		// when a user runs `ofa --help` or hits an error. Other surfaces
+		// (check, scan, apply's non-interactive path, --version) stay
+		// plain.
+		_ = banner.Render(a.Stderr)
+		fmt.Fprintln(a.Stderr)
 		a.usage()
 		return ExitOK
 	case "scan":

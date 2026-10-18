@@ -54,7 +54,14 @@ Go 1.25+ required.
 
 ```
 $ ofa
-ofa — select updates to apply
+  ▓▓▓▓▓▓╗   ▓▓▓▓▓▓▓▓▓▓╗   ▓▓▓▓▓▓╗
+▓▓╔═════▓▓╗ ▓▓╔═══════╝ ▓▓╔═════▓▓╗
+▓▓║     ▓▓║ ▓▓║         ▓▓║     ▓▓║
+▓▓║     ▓▓║ ▓▓▓▓▓▓▓▓╗   ▓▓▓▓▓▓▓▓▓▓║
+▓▓║     ▓▓║ ▓▓╔═════╝   ▓▓╔═════▓▓║
+▓▓║     ▓▓║ ▓▓║         ▓▓║     ▓▓║
+╚═▓▓▓▓▓▓╔═╝ ▓▓║         ▓▓║     ▓▓║
+  ╚═════╝   ╚═╝         ╚═╝     ╚═╝
 
 > [ ] agy            1.3.4           agy → updater available
   [ ] claude         2.1.300         claude → updater available
@@ -63,6 +70,14 @@ ofa — select updates to apply
 
 ↑/↓ navigate · space toggle · a all · enter apply · q quit
 ```
+
+The "OFA" logomark above is rendered in 24-bit color in a real terminal —
+the letters fade from `#e67a4c` (orange) on the left to `#4282d7` (blue)
+on the right. The banner is generated at build time by
+[`scripts/gen-banner/`](./scripts/gen-banner) from
+[ascii.rest](https://ascii.rest)'s `tall` font and baked into the binary
+as a constant string, so the CLI has no ascii.rest runtime and no network
+dependency. `NO_COLOR=1` strips the escapes for plain logs.
 
 First run on a machine with no `~/.config/ofa/state.json` auto-scans first, so the picker has data to work with.
 

@@ -233,6 +233,25 @@ func TestView_ContainsItemsAndFooter(t *testing.T) {
 	}
 }
 
+func TestView_HeaderIsBanner(t *testing.T) {
+	m := fixture()
+	v := m.View()
+	// The banner is baked with SGR 24-bit color escapes (the orange→blue
+	// fade). Its presence in the View is the contract: every refresh of
+	// the picker re-emits it above the rows.
+	if !contains(v, "\x1b[38;2;") {
+		t.Errorf("View should contain banner ANSI escapes, got:\n%s", v)
+	}
+	// The banner must come before the first item row so the order is
+	// banner → blank → rows → footer.
+	bannerIdx := indexOf(v, "\x1b[38;2;")
+	rowIdx := indexOf(v, "[ ] claude")
+	if bannerIdx < 0 || rowIdx < 0 || bannerIdx > rowIdx {
+		t.Errorf("banner should appear before item rows (banner@%d, claude@%d)\n%s",
+			bannerIdx, rowIdx, v)
+	}
+}
+
 func TestView_QuittingReturnsEmpty(t *testing.T) {
 	m := fixture()
 	m.quitting = true
@@ -297,4 +316,17 @@ func contains(s, sub string) bool {
 		}
 	}
 	return false
+}
+
+// indexOf returns the byte index of sub in s, or -1 if not found.
+func indexOf(s, sub string) int {
+	if len(sub) == 0 {
+		return 0
+	}
+	for i := 0; i+len(sub) <= len(s); i++ {
+		if s[i:i+len(sub)] == sub {
+			return i
+		}
+	}
+	return -1
 }
