@@ -38,7 +38,7 @@ const (
 )
 
 // version is overridden at build time via -ldflags.
-const version = "0.1.0-dev"
+const version = "0.2.0"
 
 // App holds the dependencies for a single CLI invocation. New() fills in
 // sensible defaults; tests override individual fields to inject stubs.
