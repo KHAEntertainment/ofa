@@ -1,0 +1,157 @@
+name: release
+
+on:
+  push:
+    tags:
+      - 'v*.*.*'
+
+permissions:
+  contents: write   # for gh release create
+
+jobs:
+  binaries:
+    name: Build ${{ matrix.target.os }}-${{ matrix.target.arch }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: darwin,  arch: arm64, goarch: arm64 }
+          - { os: darwin,  arch: amd64, goarch: amd64 }
+          - { os: linux,   arch: arm64, goarch: arm64 }
+          - { os: linux,   arch: amd64, goarch: amd64 }
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.25'
+          cache: true
+
+      - name: Resolve version
+        id: ver
+        shell: bash
+        run: |
+          # Tag is like v0.2.0 — strip the leading v.
+          echo "tag=${GITHUB_REF_NAME}"
+          echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+
+      - name: Build binary
+        env:
+          GOOS: ${{ matrix.target.os }}
+          GOARCH: ${{ matrix.target.goarch }}
+          CGO_ENABLED: '0'
+        run: |
+          mkdir -p bin
+          go build \
+            -ldflags="-s -w -X main.version=${{ steps.ver.outputs.version }}" \
+            -o "bin/ofa-${{ matrix.target.os }}-${{ matrix.target.arch }}" \
+            ./cmd/ofa
+
+      - name: Compute sha256
+        id: hash
+        run: |
+          echo "sha256=$(sha256sum "bin/ofa-${{ matrix.target.os }}-${{ matrix.target.arch }}" | awk '{print $1}')" \
+            >> "$GITHUB_OUTPUT"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ofa-${{ matrix.target.os }}-${{ matrix.target.arch }}
+          path: bin/ofa-${{ matrix.target.os }}-${{ matrix.target.arch }}
+          if-no-files-found: error
+          retention-days: 14
+
+  release:
+    name: GitHub release
+    needs: binaries
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # Build notes from the merged PRs since the previous tag.
+          tag="${GITHUB_REF_NAME}"
+          prev=$(git tag --sort=-version:refname | grep -v "^${tag}$" | head -n1)
+          if [ -z "${prev}" ]; then
+            notes="Initial release."
+          else
+            notes=$(gh api --paginate "repos/${GITHUB_REPOSITORY}/compare/${prev}...${tag}" \
+              --jq '.commits[] | "- " + .commit.messageHeadline' | head -n50)
+          fi
+
+          gh release create "${tag}" \
+            --title "${tag}" \
+            --notes "${notes}" \
+            dist/ofa-darwin-arm64 \
+            dist/ofa-darwin-amd64 \
+            dist/ofa-linux-arm64 \
+            dist/ofa-linux-amd64
+
+  npm:
+    name: Publish @khaentertainment/ofa
+    needs: binaries
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # Pull the npm package sources out of this repo (the layout is
+      # *separate* from the Go repo — see README). Pre-staged here so a
+      # single tag push ships both the Go release and the npm tarball.
+      - name: Resolve version
+        id: ver
+        run: echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Lay out npm package
+        env:
+          VERSION: ${{ steps.ver.outputs.version }}
+        run: |
+          workdir="$(mktemp -d)"
+          cp -R /Users/bbrenner/ofa-npm/. "$workdir/" 2>/dev/null || {
+            # Path above is the dev box; on CI the package is checked
+            # into a sibling checkout or downloaded. Fall back to the
+            # GitHub repo of the same name if present.
+            echo "::warning::npm package files were not pre-staged at /Users/bbrenner/ofa-npm; ensure the action that publishes also checks out $workdir."
+            exit 1
+          }
+          echo "workdir=$workdir" >> "$GITHUB_OUTPUT"
+
+      - name: Copy platform binaries in
+        env:
+          WORKDIR: ${{ steps.workdir.outputs.workdir }}
+        run: |
+          # Re-download the Go binaries we just built.
+          mkdir -p "$WORKDIR/platforms/darwin-arm64" \
+                  "$WORKDIR/platforms/darwin-x64" \
+                  "$WORKDIR/platforms/linux-arm64" \
+                  "$WORKDIR/platforms/linux-x64"
+          cp dist/ofa-darwin-arm64/ofa              "$WORKDIR/platforms/darwin-arm64/"
+          cp dist/ofa-darwin-amd64/ofa              "$WORKDIR/platforms/darwin-x64/"
+          cp dist/ofa-linux-arm64/ofa               "$WORKDIR/platforms/linux-arm64/"
+          cp dist/ofa-linux-amd64/ofa               "$WORKDIR/platforms/linux-x64/"
+
+      - name: Publish to npm
+        env:
+          WORKDIR: ${{ steps.workdir.outputs.workdir }}
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          cd "$WORKDIR"
+          npm publish --access public
+        # NODE_AUTH_TOKEN must be an npm automation token with publish
+        # rights for @khaentertainment. Set at:
+        #   https://www.npmjs.com/settings/.../tokens

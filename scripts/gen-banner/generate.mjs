@@ -128,8 +128,16 @@ package banner
 const Art = ${goLiteral}
 `;
 
-writeFileSync(process.argv[2] ?? "art.go", goSrc);
-console.error(`wrote ${process.argv[2] ?? "art.go"} (${meta.cols}x${meta.rows})`);
+// Write to file if a path arg was given, otherwise write to stdout so
+// downstream tools (e.g. `generate.mjs > internal/banner/art.go`) get
+// the same content as the file-mode invocation.
+const outPath = process.argv[2];
+if (outPath) {
+  writeFileSync(outPath, goSrc);
+  console.error(`wrote ${outPath} (${meta.cols}x${meta.rows})`);
+} else {
+  process.stdout.write(goSrc);
+}
 
 // helper: number of fade steps per theme. Mirrors banner.ts's `steps` constant.
 function stepsOf(m) {
