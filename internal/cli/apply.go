@@ -79,17 +79,14 @@ func (a *App) applyCmd(args []string) ExitCode {
 		}
 	}
 
-	exec := a.UpdateExec
-	if *dryRun {
-		// Wrap DefaultExecutor to force DryRun=true on every request,
-		// so the caller can pass --dry-run without building them
-		// differently.
-		exec = func(req update.Request) update.Result {
-			req.DryRun = true
-			return a.UpdateExec(req)
-		}
+	// In --dry-run, set DryRun=true on every request *before* handing
+	// them to update.Apply. That way update.Apply's PATH-existence
+	// preflight (intended only for real runs) is bypassed — the request
+	// models a dry-run whether the binary is installed or not.
+	for i := range requests {
+		requests[i].DryRun = *dryRun
 	}
-	summary := update.Apply(requests, exec)
+	summary := update.Apply(requests, a.UpdateExec)
 	printApplySummary(a.Stdout, summary)
 
 	return ExitCode(summary.ExitCode())

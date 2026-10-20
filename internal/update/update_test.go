@@ -9,6 +9,28 @@ import (
 	"testing"
 )
 
+// withLookPathAllowed stubs ExecLookPath to consider every binary present
+// on PATH, so unit tests don't fail on machines without the project's
+// real harness binaries installed (e.g. Linux CI without `brew` or
+// `claude`). The original is restored at test cleanup.
+func withLookPathAllowed(t *testing.T) {
+	t.Helper()
+	orig := ExecLookPath
+	ExecLookPath = func(string) (string, error) { return "/usr/bin/true", nil }
+	t.Cleanup(func() { ExecLookPath = orig })
+}
+
+// withLookPathDenied stubs ExecLookPath to fail for every binary. Used
+// by tests that exercise the "binary missing on PATH" skip path.
+func withLookPathDenied(t *testing.T) {
+	t.Helper()
+	orig := ExecLookPath
+	ExecLookPath = func(string) (string, error) {
+		return "", &exec.Error{Name: "<stub>", Err: exec.ErrNotFound}
+	}
+	t.Cleanup(func() { ExecLookPath = orig })
+}
+
 // stubExecutor answers canned results keyed by request Label (the human-
 // readable identifier the CLI sets). Anything not in the map errors so a
 // missing stub is loud.
@@ -37,6 +59,7 @@ func TestApply_Empty(t *testing.T) {
 }
 
 func TestApply_Success(t *testing.T) {
+	withLookPathAllowed(t) // brew not on PATH on every CI image
 	exec := stubExecutor(map[string]Result{
 		"codex (brew-cask)": {ExitCode: 0},
 	})

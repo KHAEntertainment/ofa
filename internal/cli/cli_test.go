@@ -83,6 +83,14 @@ func testCatalog(t *testing.T) []catalog.Harness {
 
 // newTestApp builds an App wired with stubbed dependencies.
 func newTestApp(t *testing.T, args []string, stdin io.Reader) (*App, *bytes.Buffer, *bytes.Buffer, *stubDetect, *stubResolve, *stubExec) {
+	t.Helper()
+	// Stub exec.LookPath so apply tests don't depend on whether the
+	// harness binary is installed on the test machine. Real installs
+	// are exercised by the smoke binaries in cmd/*-smoke, not here.
+	origLookPath := update.ExecLookPath
+	update.ExecLookPath = func(string) (string, error) { return "/usr/bin/true", nil }
+	t.Cleanup(func() { update.ExecLookPath = origLookPath })
+
 	stdout := &bytes.Buffer{}
 	stderr := &bytes.Buffer{}
 	sd := &stubDetect{}

@@ -82,8 +82,9 @@ func (s Summary) ExitCode() int {
 	return 0
 }
 
-// execLookPath is exec.LookPath behind a var so tests can stub PATH.
-var execLookPath = exec.LookPath
+// ExecLookPath is exec.LookPath behind a var so tests can stub PATH.
+// Exported so cross-package tests can swap it.
+var ExecLookPath = exec.LookPath
 
 // Apply runs requests sequentially. A failing updater does not abort the
 // run — the rest still execute. Skip-if-removed applies unless DryRun is
@@ -110,7 +111,7 @@ func Apply(requests []Request, exec Executor) Summary {
 		if !req.DryRun {
 			bin := req.Cmd.first()
 			if bin != "" {
-				if _, err := execLookPath(bin); err != nil {
+				if _, err := ExecLookPath(bin); err != nil {
 					s.Skipped = append(s.Skipped, Result{
 						Label:         req.Label,
 						Cmd:           req.Cmd,
