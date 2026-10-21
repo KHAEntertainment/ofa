@@ -102,56 +102,75 @@ jobs:
     name: Publish @khaentertainment/ofa
     needs: binaries
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write       # required for npm trusted publishing (OIDC)
     steps:
       - uses: actions/checkout@v4
 
-      # Pull the npm package sources out of this repo (the layout is
-      # *separate* from the Go repo — see README). Pre-staged here so a
-      # single tag push ships both the Go release and the npm tarball.
       - name: Resolve version
         id: ver
+        shell: bash
         run: echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
 
       - name: Set up Node
         uses: actions/setup-node@v4
         with:
           node-version: '20'
+          # Adding registry-url here is what enables --provenance
+          # below: setup-node wires up the OIDC credential so npm
+          # publish can attest the build back to this workflow without
+          # needing an NPM_TOKEN secret.
+          registry-url: 'https://registry.npmjs.org'
 
-      - name: Lay out npm package
+      - name: Download platform binaries
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      # Take the in-repo `npm/` layout (sans platform binaries) into a
+      # scratch dir, stamp the version from the tag, and drop the four
+      # binaries built by the `binaries` job into platforms/<arch>/.
+      - name: Lay out package + drop in platform binaries
+        id: layout
         env:
           VERSION: ${{ steps.ver.outputs.version }}
         run: |
-          workdir="$(mktemp -d)"
-          cp -R /Users/bbrenner/ofa-npm/. "$workdir/" 2>/dev/null || {
-            # Path above is the dev box; on CI the package is checked
-            # into a sibling checkout or downloaded. Fall back to the
-            # GitHub repo of the same name if present.
-            echo "::warning::npm package files were not pre-staged at /Users/bbrenner/ofa-npm; ensure the action that publishes also checks out $workdir."
-            exit 1
-          }
-          echo "workdir=$workdir" >> "$GITHUB_OUTPUT"
-
-      - name: Copy platform binaries in
-        env:
-          WORKDIR: ${{ steps.workdir.outputs.workdir }}
-        run: |
-          # Re-download the Go binaries we just built.
-          mkdir -p "$WORKDIR/platforms/darwin-arm64" \
-                  "$WORKDIR/platforms/darwin-x64" \
-                  "$WORKDIR/platforms/linux-arm64" \
-                  "$WORKDIR/platforms/linux-x64"
-          cp dist/ofa-darwin-arm64/ofa              "$WORKDIR/platforms/darwin-arm64/"
-          cp dist/ofa-darwin-amd64/ofa              "$WORKDIR/platforms/darwin-x64/"
-          cp dist/ofa-linux-arm64/ofa               "$WORKDIR/platforms/linux-arm64/"
-          cp dist/ofa-linux-amd64/ofa               "$WORKDIR/platforms/linux-x64/"
+          set -euo pipefail
+          stage="$(mktemp -d)"
+          cp -R npm/. "$stage/"
+          node -e '
+            const fs=require("fs"), p=process.argv[1];
+            const j=JSON.parse(fs.readFileSync(p));
+            j.version=process.argv[2];
+            fs.writeFileSync(p, JSON.stringify(j,null,2)+"\n");
+          ' "$stage/package.json" "$VERSION"
+          mkdir -p \
+            "$stage/platforms/darwin-arm64" \
+            "$stage/platforms/darwin-x64" \
+            "$stage/platforms/linux-arm64" \
+            "$stage/platforms/linux-x64"
+          # The Go matrix names architectures `amd64`; npm's platform
+          # key is `x64`. Rename on copy.
+          cp dist/ofa-darwin-arm64/ofa "$stage/platforms/darwin-arm64/"
+          cp dist/ofa-darwin-amd64/ofa "$stage/platforms/darwin-x64/"
+          cp dist/ofa-linux-arm64/ofa  "$stage/platforms/linux-arm64/"
+          cp dist/ofa-linux-amd64/ofa  "$stage/platforms/linux-x64/"
+          chmod 0755 "$stage"/platforms/*/ofa
+          echo "stage=$stage" >> "$GITHUB_OUTPUT"
 
       - name: Publish to npm
         env:
-          WORKDIR: ${{ steps.workdir.outputs.workdir }}
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+          STAGE: ${{ steps.layout.outputs.stage }}
         run: |
-          cd "$WORKDIR"
-          npm publish --access public
-        # NODE_AUTH_TOKEN must be an npm automation token with publish
-        # rights for @khaentertainment. Set at:
-        #   https://www.npmjs.com/settings/.../tokens
+          cd "$STAGE"
+          # --provenance requires OIDC (id-token: write above). The
+          # npm package must have a Trusted Publisher configured to
+          # point at this workflow, otherwise publish fails with
+          # EOTP / no OIDC token. Configure once at:
+          #   https://www.npmjs.com/package/@khaentertainment/ofa/access
+          #     → Publishing access → Trusted Publishers → GitHub Actions
+          #       Repository: KHAEntertainment/ofa
+          #       Workflow filename: release.yml
+          npm publish --access public --provenance
