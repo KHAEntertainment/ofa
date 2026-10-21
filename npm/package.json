@@ -1,0 +1,39 @@
+{
+  "name": "@khaentertainment/ofa",
+  "version": "0.2.0",
+  "description": "One For All: detect and update every coding harness from a single CLI. https://github.com/KHAEntertainment/ofa",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/KHAEntertainment/ofa.git"
+  },
+  "homepage": "https://github.com/KHAEntertainment/ofa",
+  "bugs": {
+    "url": "https://github.com/KHAEntertainment/ofa/issues"
+  },
+  "keywords": ["ofa", "harness", "update", "cli", "agent", "claude", "codex", "opencode", "kimi", "copilot", "devin"],
+  "bin": {
+    "ofa": "bin/ofa"
+  },
+  "files": [
+    "bin",
+    "platforms",
+    "scripts",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "postinstall": "node ./scripts/postinstall.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "os": [
+    "darwin",
+    "linux"
+  ],
+  "cpu": [
+    "arm64",
+    "x64"
+  ]
+}

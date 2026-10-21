@@ -1,0 +1,28 @@
+#!/usr/bin/env node
+// Wrapper that execs the platform-matched binary if installed.
+// On install, scripts/postinstall.js copies the correct native binary
+// to ./bin/ofa-bin. This wrapper exists at install time even before
+// postinstall runs.
+
+const { execFileSync } = require("node:child_process");
+const path = require("node:path");
+const fs = require("node:fs");
+
+const here = __dirname;
+const platformBin = path.join(here, "ofa-bin");
+
+if (!fs.existsSync(platformBin)) {
+  console.error(
+    `@khaentertainment/ofa: native binary not staged for ${process.platform}-${process.arch}.\n` +
+    `Run \`npm rebuild @khaentertainment/ofa\` (allowing scripts) to retry, or\n` +
+    `install Go 1.25+ and run: go install github.com/KHAEntertainment/ofa/cmd/ofa@latest`
+  );
+  process.exit(1);
+}
+
+try {
+  execFileSync(platformBin, process.argv.slice(2), { stdio: "inherit" });
+} catch (err) {
+  if (err.status != null) process.exit(err.status);
+  throw err;
+}

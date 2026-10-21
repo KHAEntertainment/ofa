@@ -1,0 +1,13 @@
+# Filled in by scripts/postinstall.js on `npm install`.
+# NOT committed — these are platform-specific binaries that CI drops
+# into the package during the release workflow.
+bin/ofa-bin
+platforms/darwin-arm64/ofa
+platforms/darwin-x64/ofa
+platforms/linux-arm64/ofa
+platforms/linux-x64/ofa
+
+# npm install / publish cruft
+node_modules
+*.log
+.npmrc

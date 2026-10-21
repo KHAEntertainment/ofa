@@ -1,0 +1,219 @@
+# OFA — One For All
+
+A single command to detect, version-check, and update every coding harness on your machine.
+
+`ofa` knows about Claude Code, Codex, opencode, Kimi, Cursor's agent, GitHub Copilot, Antigravity (`agy`), Devin, CodeRabbit, and the rest of the popular CLI harnesses. It scans what's installed, asks each package manager / self-updater whether anything's available, and runs the update — interactive picker or one-shot.
+
+```
+$ ofa check
+Scan: 13 harnesses, 8 with updates
+  agy          1.3.4          [self]    agy → updater available
+  claude       2.1.300        [self]    claude → updater available
+  coderabbit   0.7.6          [self]    coderabbit → updater available
+  copilot      1.0.80         [self]    copilot → updater available
+  cursor-agent 2026.10.14-... [self]    cursor-agent → updater available
+  devin        3000.11.3      [self]    devin → updater available
+  kimi         2.2.0          [self]    kimi → updater available
+  mmx          1.0.25         [self]    mmx → updater available
+```
+
+Exit code is `1` if anything's pending, `0` otherwise — pipe it into your shell scripts.
+
+## Why
+
+Every coding harness has its own update story. Claude Code has `claude update`. Codex is `brew upgrade --cask codex`. opencode lives in three places simultaneously — npm, a brew tap, and a beta npm package — and only one is on your PATH. Tracking which is current, and which is shadowed, is friction OFA absorbs.
+
+OFA never reimplements an updater. It runs the native one (`brew upgrade`, `npm i -g <pkg>@latest`, `claude update`, `agy update`, etc.) and reports the outcome.
+
+## Install
+
+### macOS (Homebrew)
+
+```sh
+$ brew install KHAEntertainment/tap/ofa
+```
+
+### npm (any platform)
+
+```sh
+$ npm install -g @khaentertainment/ofa
+```
+
+### From source
+
+```sh
+$ git clone https://github.com/KHAEntertainment/ofa
+$ cd ofa && go build -o ~/.local/bin/ofa ./cmd/ofa
+```
+
+Go 1.25+ required.
+
+## Usage
+
+### Interactive picker (default)
+
+```
+$ ofa
+  ▓▓▓▓▓▓╗   ▓▓▓▓▓▓▓▓▓▓╗   ▓▓▓▓▓▓╗
+▓▓╔═════▓▓╗ ▓▓╔═══════╝ ▓▓╔═════▓▓╗
+▓▓║     ▓▓║ ▓▓║         ▓▓║     ▓▓║
+▓▓║     ▓▓║ ▓▓▓▓▓▓▓▓╗   ▓▓▓▓▓▓▓▓▓▓║
+▓▓║     ▓▓║ ▓▓╔═════╝   ▓▓╔═════▓▓║
+▓▓║     ▓▓║ ▓▓║         ▓▓║     ▓▓║
+╚═▓▓▓▓▓▓╔═╝ ▓▓║         ▓▓║     ▓▓║
+  ╚═════╝   ╚═╝         ╚═╝     ╚═╝
+
+> [ ] agy            1.3.4           agy → updater available
+  [ ] claude         2.1.300         claude → updater available
+  [ ] coderabbit     0.7.6           coderabbit → updater available
+  ...
+
+↑/↓ navigate · space toggle · a all · enter apply · q quit
+```
+
+The "OFA" logomark above is rendered in 24-bit color in a real terminal —
+the letters fade from `#e67a4c` (orange) on the left to `#4282d7` (blue)
+on the right. The banner is generated at build time by
+[`scripts/gen-banner/`](./scripts/gen-banner) from
+[ascii.rest](https://ascii.rest)'s `tall` font and baked into the binary
+as a constant string, so the CLI has no ascii.rest runtime and no network
+dependency. `NO_COLOR=1` strips the escapes for plain logs.
+
+First run on a machine with no `~/.config/ofa/state.json` auto-scans first, so the picker has data to work with.
+
+### Non-interactive
+
+```sh
+$ ofa check             # what's outdated? exit 1 if anything pending
+$ ofa check --json      # jq-friendly
+$ ofa apply --dry-run   # show the plan without running
+$ ofa apply --yes       # run all available updates
+$ ofa apply --only pi   # narrow to one harness
+$ ofa apply --verbose   # stream each installer's full output (default: progress lines)
+$ ofa scan              # detect + write state, report drift since last scan
+```
+
+`ofa check --json` is the scriptable variant:
+
+```json
+{
+  "scanned_at": "2026-10-15T20:31:42Z",
+  "harness_count": 13,
+  "update_count": 8,
+  "harnesses": {
+    "claude": {
+      "name": "Claude Code",
+      "installs": [
+        {"version": "2.1.300", "tier": "self", "outdated": false, "updater_available": true}
+      ]
+    }
+  }
+}
+```
+
+## How it works
+
+```
+catalog.Embedded()  →  detect.Scan()  →  resolve.Resolve()  →  picker / CLI
+                                              ↓
+                                       update.Apply()  →  DefaultExecutor
+```
+
+Two-layer registry:
+
+1. **Catalog** — a directory of TOML files, one per harness, embedded into the binary at build time. Adding a new harness is adding a file.
+2. **State** — `~/.config/ofa/state.json`, the result of the last scan on this machine, used to compute drift (added / removed / changed).
+
+Detection is deterministic. Each install method (`brew-formula`, `brew-cask`, `npm`, `pipx`, `uv`, `native`) has its own backend behind a `Detector` interface; new methods add a backend, not new code in the resolver.
+
+Resolution is per-tier. `brew` resolves via `brew outdated --json`; `npm` via `npm view <pkg> version`; `pypi` (covers `pipx` and `uv`) via the PyPI JSON API; `self` reports "updater available" without fabricating a version diff; `none` is report-only.
+
+Updates are delegated to native updaters. `ofa apply` never reimplements an update — it runs `brew upgrade <name>`, `npm install -g <pkg>@latest`, or `<bin> update` and reports the outcome.
+
+## The shadow problem
+
+`opencode`, `qwen`, and `kimi` can each be installed multiple ways on the same machine (e.g., opencode via npm *and* via the `anomalyco/tap` brew formula, both writing to `/opt/homebrew/bin`). `which opencode` answers one of them — the wrong one is the one you didn't update. OFA enumerates every install and marks the active one (the `which`-winner) versus the shadowed ones:
+
+```
+$ ofa check
+  opencode     1.18.35       [npm]  opencode → 1.19.1        (active, stale)
+  opencode     1.19.0        [brew] opencode (at latest)      (shadowed)
+```
+
+## Supported harnesses
+
+| Harness                | Install methods                              | Update path |
+|------------------------|----------------------------------------------|-------------|
+| Claude Code            | native                                       | `claude update` |
+| Codex                  | brew cask                                    | `brew upgrade --cask codex` |
+| Cursor Agent           | native                                       | `cursor-agent update` |
+| Devin                  | native                                       | `devin update` |
+| GitHub Copilot CLI     | npm                                          | `copilot update` |
+| Kimi Code              | uv, native                                    | `uv tool upgrade kimi-cli`, `kimi upgrade --yes` |
+| Kilo Code              | npm                                          | `npm i -g @kilocode/cli@latest` |
+| MiniMax (`mmx`)        | npm                                          | `mmx update` |
+| opencode               | npm, brew formula, npm (beta)                | `npm i -g ...`, `brew upgrade opencode` |
+| Pi Coding Agent        | npm                                          | `npm i -g @earendil-works/pi-coding-agent@latest` |
+| Qwen Code              | npm, brew formula                            | `npm i -g ...`, `brew upgrade qwen-code` |
+| Antigravity (`agy`)    | native                                       | `agy update` |
+| CodeRabbit CLI         | native                                       | `coderabbit update` |
+
+Adding a harness is a PR with a TOML file. See [`internal/catalog/data/agy.toml`](./internal/catalog/data/agy.toml) for the simplest example.
+
+## Platform
+
+v1 is macOS-only. The seam for cross-platform is the `Detector` interface — Windows (WSL) and Linux are additive, not a rewrite. The `update.cmd` field is data, not code, so a Linux update path is a new field on the same catalog entry.
+
+## Roadmap
+
+Tentative, in rough priority order. None of these are committed to a release date.
+
+### Near-term: distribution
+
+- **NPM packaging.** Publish `@khaentertainment/ofa` so `npm install -g @khaentertainment/ofa` works on any platform. The Go binary is the npm `bin`; no JS wrapper. Cross-compiled at build time for `darwin-arm64`, `darwin-amd64`, `linux-amd64`, `linux-arm64`.
+- **Homebrew tap.** `KHAEntertainment/homebrew-tap/ofa` for `brew install KHAEntertainment/tap/ofa`. Lower-friction install on macOS than the npm variant for users who don't already have Node.
+- **GitHub Releases + CI/CD.** Tagged releases (`vX.Y.Z`) trigger cross-compile + npm publish via GitHub Actions. Untaged pushes run `go build && go test` on PRs.
+
+### Medium-term: platform reach
+
+- **Linux detector backends.** `apt`, `dnf`, `snap`, plus the existing npm/pipx/uv/native ones. The `Detector` interface is already the seam; new backends add a file, not a rewrite.
+- **Windows (WSL) and native Windows.** WSL reuses the Linux backends; native Windows adds `scoop`, `winget`, and Windows registry probing for native installs.
+
+### Long-term: agent-assisted Catalog (`ofa doctor`)
+
+When a scan finds a binary on PATH that doesn't match any Catalog entry, or a Catalog entry fails to detect a known install, OFA needs help from a human-shaped intelligence to write the TOML. The design avoids any API key or rate-limit dependency on OFA's side:
+
+1. OFA writes the facts it knows into a shared context folder: `~/.ofa/CLAUDE.md` (always loaded by Claude Code), `~/.ofa/doctor-context.md` (per-invocation facts: which binary, its `--version` output, the gaps it fills).
+2. OFA spawns a headless session of an installed agent — e.g. `claude -p "Read ~/.ofa/CLAUDE.md and ~/.ofa/doctor-context.md. Draft a Catalog entry."` — whichever harness the user has installed. No model API, no vendor lock-in; OFA is the orchestrator, the agent does the thinking.
+3. The proposed TOML lands at `~/.ofa/doctor-history/<timestamp>/proposed-catalog.toml`. The user reviews it; if approved, copies it into the Catalog (`~/.local/share/ofa/catalog/<id>.toml` on macOS, or upstream via PR for shared coverage).
+
+Doctor is opt-in (`ofa doctor` only) and never runs in the default `ofa` path. The `~/.ofa/` directory is created on first use, not at install.
+
+### Open ideas (not scheduled)
+
+- **Pre-release filtering in version compare.** Currently `0.0.0-beta-18743` compares as `0.0.0` numerically — correct for our purpose but probably wrong semantically (a beta should yield to a stable release when both exist). Semver-aware compare with a `stable > pre-release` rule is the intended fix.
+- **Update hooks.** Run a shell command before/after each update (`~/.config/ofa/hooks.toml`).
+- **Version pinning.** Skip updates for harnesses the user wants frozen (`--pin <id>@<version>`).
+- **Schedule.** Optional cron-style background scan + report (no auto-apply — OFA never applies without explicit user action).
+
+## Contributing
+
+The Catalog is the contribution surface. Adding a harness:
+
+```sh
+$ cp internal/catalog/data/agy.toml internal/catalog/data/your-harness.toml
+$ # edit id, name, installs (method/bin/package/version/latest/update)
+$ go test ./...
+$ # open a PR
+```
+
+If `ofa doctor` (see [Roadmap](#roadmap)) finds a binary on your machine that doesn't match a catalog entry, it drafts a TOML for you to review and contribute upstream. Doctor is an opt-in command — not part of the default `ofa` path.
+
+## License
+
+MIT — see [LICENSE](./LICENSE).
+
+## Acknowledgments
+
+- The [charmbracelet/bubbletea](https://github.com/charmbracelet/bubbletea) TUI framework powers the interactive picker.
+- Each catalog entry is a thin pointer at the actual upstream tool that does the work. OFA is glue, not a reimplementation.
