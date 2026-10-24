@@ -4,9 +4,22 @@ on:
   push:
     tags:
       - 'v*.*.*'
+  # Manual re-run for an existing tag. A failed npm publish (wrong
+  # trusted-publisher permissions, a registry hiccup) should not
+  # require cutting a new tag — dispatch with the tag to retry.
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Existing tag to (re)publish, e.g. v0.2.1'
+        required: true
+        type: string
 
 permissions:
   contents: write   # for gh release create
+
+env:
+  # Empty on a push trigger, so this falls through to the pushed tag.
+  TAG: ${{ github.event.inputs.tag || github.ref_name }}
 
 jobs:
   # Verify the version stamp lands before anything ships. -X is a
@@ -19,6 +32,10 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
+        with:
+          # On a manual dispatch, build from the tag being re-released,
+          # not from whatever branch the dispatch ran against.
+          ref: ${{ env.TAG }}
 
       - name: Set up Go
         uses: actions/setup-go@v7
@@ -29,7 +46,7 @@ jobs:
       - name: Resolve version
         id: ver
         shell: bash
-        run: echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+        run: echo "version=${TAG#v}" >> "$GITHUB_OUTPUT"
 
       - name: Build and check
         env:
@@ -58,6 +75,8 @@ jobs:
           - { os: linux,   arch: amd64, goarch: amd64 }
     steps:
       - uses: actions/checkout@v7
+        with:
+          ref: ${{ env.TAG }}
 
       - name: Set up Go
         uses: actions/setup-go@v7
@@ -70,8 +89,8 @@ jobs:
         shell: bash
         run: |
           # Tag is like v0.2.0 — strip the leading v.
-          echo "tag=${GITHUB_REF_NAME}"
-          echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+          echo "tag=${TAG}"
+          echo "version=${TAG#v}" >> "$GITHUB_OUTPUT"
 
       # The matrix uses `include:` with bare keys, so the context is
       # matrix.os / matrix.arch / matrix.goarch — NOT matrix.target.*.
@@ -117,6 +136,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
+        with:
+          ref: ${{ env.TAG }}
 
       - name: Download all artifacts
         uses: actions/download-artifact@v8
@@ -148,7 +169,7 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           # Build notes from the merged PRs since the previous tag.
-          tag="${GITHUB_REF_NAME}"
+          tag="${TAG}"
           prev=$(git tag --sort=-version:refname | grep -v "^${tag}$" | head -n1)
           if [ -z "${prev}" ]; then
             notes="Initial release."
@@ -160,14 +181,26 @@ jobs:
           # Checksums for the attached binaries.
           ( cd dist && sha256sum ofa-* > checksums.txt )
 
-          gh release create "${tag}" \
-            --title "${tag}" \
-            --notes "${notes}" \
-            dist/ofa-darwin-arm64 \
-            dist/ofa-darwin-amd64 \
-            dist/ofa-linux-arm64 \
-            dist/ofa-linux-amd64 \
+          # Idempotent: a re-run for a tag that already has a release
+          # refreshes the assets instead of failing, so the workflow can
+          # be re-dispatched to retry only the npm publish.
+          assets=(
+            dist/ofa-darwin-arm64
+            dist/ofa-darwin-amd64
+            dist/ofa-linux-arm64
+            dist/ofa-linux-amd64
             dist/checksums.txt
+          )
+          if gh release view "${tag}" >/dev/null 2>&1; then
+            echo "Release ${tag} already exists — refreshing assets."
+            gh release edit "${tag}" --title "${tag}" --notes "${notes}"
+            gh release upload "${tag}" "${assets[@]}" --clobber
+          else
+            gh release create "${tag}" \
+              --title "${tag}" \
+              --notes "${notes}" \
+              "${assets[@]}"
+          fi
 
   npm:
     name: Publish @khaentertainment/ofa
@@ -178,11 +211,13 @@ jobs:
       id-token: write       # required for npm trusted publishing (OIDC)
     steps:
       - uses: actions/checkout@v7
+        with:
+          ref: ${{ env.TAG }}
 
       - name: Resolve version
         id: ver
         shell: bash
-        run: echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+        run: echo "version=${TAG#v}" >> "$GITHUB_OUTPUT"
 
       - name: Set up Node
         uses: actions/setup-node@v7
@@ -268,14 +303,33 @@ jobs:
       - name: Publish to npm
         env:
           STAGE: ${{ steps.layout.outputs.stage }}
+          PKG: '@khaentertainment/ofa'
+          PKG_VERSION: ${{ steps.ver.outputs.version }}
         run: |
           cd "$STAGE"
-          # --provenance requires OIDC (id-token: write above). The
-          # npm package must have a Trusted Publisher configured to
-          # point at this workflow, otherwise publish fails with
-          # EOTP / no OIDC token. Configure once at:
+
+          # Idempotent: if this version is already on npm, there is
+          # nothing to do. (npm refuses to publish over an existing
+          # version, and a re-run of the pipeline is the expected way
+          # to recover from a transient publish failure.)
+          if npm view "${PKG}@${PKG_VERSION}" version >/dev/null 2>&1; then
+            echo "::notice::${PKG}@${PKG_VERSION} is already published — skipping."
+            exit 0
+          fi
+
+          # --provenance requires OIDC (id-token: write above). The npm
+          # package must have a Trusted Publisher configured to point at
+          # this workflow, otherwise publish fails with EOTP / no OIDC
+          # token. Configure once at:
           #   https://www.npmjs.com/package/@khaentertainment/ofa/access
           #     → Publishing access → Trusted Publishers → GitHub Actions
-          #       Repository: KHAEntertainment/ofa
+          #       Organization or user: KHAEntertainment
+          #       Repository: ofa
           #       Workflow filename: release.yml
+          #       Allowed actions: enable BOTH "publish" and "dist-tag"
+          #         (a publisher created after 2026-09-03 is granted
+          #          `npm stage publish` only, and `npm publish` needs
+          #          the publish + dist-tag permissions — without them
+          #          the registry answers 403 "OIDC permission denied
+          #          for this action").
           npm publish --access public --provenance
