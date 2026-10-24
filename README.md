@@ -48,6 +48,55 @@ $ cd ofa && go build -o ~/.local/bin/ofa ./cmd/ofa
 
 Go 1.25+ required.
 
+### Verifying what you installed
+
+Releases since `0.2.1` are built and published entirely by GitHub Actions,
+using npm trusted publishing — the workflow authenticates over OIDC, so no
+long-lived publish token exists anywhere in the pipeline. Each published
+tarball carries a SLSA provenance statement naming the repository and workflow
+that built it.
+
+Confirm an attestation exists (no install needed — this follows whatever
+`latest` points at):
+
+```sh
+$ npm view @khaentertainment/ofa dist.attestations
+{
+  url: 'https://registry.npmjs.org/-/npm/v1/attestations/@khaentertainment%2fofa@0.2.1',
+  provenance: { predicateType: 'https://slsa.dev/provenance/v1' }
+}
+```
+
+To actually verify the signatures, install it as a dependency of a project —
+`npm audit signatures` deliberately refuses global installs (`EAUDITGLOBAL`):
+
+```sh
+$ mkdir verify && cd verify && npm init -y
+$ npm install @khaentertainment/ofa
+$ npm audit signatures
+
+1 package has a verified registry signature
+
+1 package has a verified attestation
+```
+
+The same attestation is browsable as **View provenance** on the
+[package page](https://www.npmjs.com/package/@khaentertainment/ofa).
+
+### One PATH caveat
+
+`ofa` resolves to the **first** match on your `PATH`. If you built from source
+into `~/.local/bin` and later installed via npm or Homebrew, the older local
+binary keeps winning — and will keep reporting its own version:
+
+```sh
+$ which -a ofa            # every copy, in PATH order
+$ ofa --version           # what you are actually running
+```
+
+Remove or update the stale copy to let the packaged binary take over. This is
+the same shadowing OFA reports for other harnesses.
+
 ## Usage
 
 ### Interactive picker (default)
