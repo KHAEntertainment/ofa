@@ -45,7 +45,7 @@ jobs:
           echo "ok: ${reported}"
 
   binaries:
-    name: Build ${{ matrix.target.os }}-${{ matrix.target.arch }}
+    name: Build ${{ matrix.os }}-${{ matrix.arch }}
     needs: version
     runs-on: ubuntu-latest
     strategy:
@@ -73,23 +73,41 @@ jobs:
           echo "tag=${GITHUB_REF_NAME}"
           echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
 
+      # The matrix uses `include:` with bare keys, so the context is
+      # matrix.os / matrix.arch / matrix.goarch — NOT matrix.target.*.
+      # Referencing matrix.target.os silently resolves to the empty
+      # string, which produced four identical artifact names and one
+      # unusable artifact. Assert the context is populated so a future
+      # edit to the matrix fails loudly instead of silently.
+      - name: Verify matrix context
+        env:
+          M_OS: ${{ matrix.os }}
+          M_ARCH: ${{ matrix.arch }}
+          M_GOARCH: ${{ matrix.goarch }}
+        run: |
+          if [ -z "${M_OS}" ] || [ -z "${M_ARCH}" ] || [ -z "${M_GOARCH}" ]; then
+            echo "::error::matrix context is empty (os='${M_OS}' arch='${M_ARCH}' goarch='${M_GOARCH}'). Check the matrix definition and the context paths used below."
+            exit 1
+          fi
+          echo "building ${M_OS}-${M_ARCH} (GOARCH=${M_GOARCH})"
+
       - name: Build binary
         env:
-          GOOS: ${{ matrix.target.os }}
-          GOARCH: ${{ matrix.target.goarch }}
+          GOOS: ${{ matrix.os }}
+          GOARCH: ${{ matrix.goarch }}
           CGO_ENABLED: '0'
         run: |
           mkdir -p bin
           go build \
             -ldflags="-s -w -X ofa/internal/cli.version=${{ steps.ver.outputs.version }}" \
-            -o "bin/ofa-${{ matrix.target.os }}-${{ matrix.target.arch }}" \
+            -o "bin/ofa-${{ matrix.os }}-${{ matrix.arch }}" \
             ./cmd/ofa
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: ofa-${{ matrix.target.os }}-${{ matrix.target.arch }}
-          path: bin/ofa-${{ matrix.target.os }}-${{ matrix.target.arch }}
+          name: ofa-${{ matrix.os }}-${{ matrix.arch }}
+          path: bin/ofa-${{ matrix.os }}-${{ matrix.arch }}
           if-no-files-found: error
           retention-days: 14
 
@@ -105,6 +123,25 @@ jobs:
         with:
           path: dist
           merge-multiple: true
+
+      # merge-multiple flattens each artifact's contents into dist/, so
+      # the four binaries land as dist/ofa-<os>-<arch> (files, not
+      # directories). Assert they are all there before creating the
+      # release, so a naming drift fails here rather than in gh.
+      - name: Verify artifact set
+        run: |
+          missing=0
+          for f in ofa-darwin-arm64 ofa-darwin-amd64 ofa-linux-arm64 ofa-linux-amd64; do
+            if [ ! -f "dist/${f}" ]; then
+              echo "::error::missing expected artifact dist/${f}"
+              missing=1
+            fi
+          done
+          if [ "${missing}" -ne 0 ]; then
+            echo "::error::present in dist/: $(ls -1 dist 2>/dev/null | tr '\n' ' ')"
+            exit 1
+          fi
+          echo "ok: $(ls -1 dist | tr '\n' ' ')"
 
       - name: Create release
         env:
@@ -185,12 +222,13 @@ jobs:
             "$stage/platforms/darwin-x64" \
             "$stage/platforms/linux-arm64" \
             "$stage/platforms/linux-x64"
-          # The Go matrix names architectures `amd64`; npm's platform
-          # key is `x64`. Rename on copy.
-          cp dist/ofa-darwin-arm64/ofa "$stage/platforms/darwin-arm64/"
-          cp dist/ofa-darwin-amd64/ofa "$stage/platforms/darwin-x64/"
-          cp dist/ofa-linux-arm64/ofa  "$stage/platforms/linux-arm64/"
-          cp dist/ofa-linux-amd64/ofa  "$stage/platforms/linux-x64/"
+          # merge-multiple flattens the artifacts into dist/ as files
+          # named ofa-<os>-<arch>. The Go matrix names architectures
+          # `amd64`; npm's platform key is `x64`. Rename on copy.
+          cp dist/ofa-darwin-arm64 "$stage/platforms/darwin-arm64/ofa"
+          cp dist/ofa-darwin-amd64 "$stage/platforms/darwin-x64/ofa"
+          cp dist/ofa-linux-arm64  "$stage/platforms/linux-arm64/ofa"
+          cp dist/ofa-linux-amd64  "$stage/platforms/linux-x64/ofa"
           chmod 0755 "$stage"/platforms/*/ofa
           echo "stage=$stage" >> "$GITHUB_OUTPUT"
 
