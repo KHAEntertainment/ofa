@@ -18,10 +18,10 @@ jobs:
     name: Verify version stamping
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Set up Go
-        uses: actions/setup-go@v5
+        uses: actions/setup-go@v7
         with:
           go-version: '1.25'
           cache: true
@@ -57,10 +57,10 @@ jobs:
           - { os: linux,   arch: arm64, goarch: arm64 }
           - { os: linux,   arch: amd64, goarch: amd64 }
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Set up Go
-        uses: actions/setup-go@v5
+        uses: actions/setup-go@v7
         with:
           go-version: '1.25'
           cache: true
@@ -104,7 +104,7 @@ jobs:
             ./cmd/ofa
 
       - name: Upload artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: ofa-${{ matrix.os }}-${{ matrix.arch }}
           path: bin/ofa-${{ matrix.os }}-${{ matrix.arch }}
@@ -116,10 +116,10 @@ jobs:
     needs: binaries
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Download all artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           path: dist
           merge-multiple: true
@@ -177,7 +177,7 @@ jobs:
       contents: read
       id-token: write       # required for npm trusted publishing (OIDC)
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Resolve version
         id: ver
@@ -185,17 +185,50 @@ jobs:
         run: echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
 
       - name: Set up Node
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v7
         with:
-          node-version: '20'
-          # Adding registry-url here is what enables --provenance
-          # below: setup-node wires up the OIDC credential so npm
-          # publish can attest the build back to this workflow without
-          # needing an NPM_TOKEN secret.
+          # npm CLI 11.5.0 added OIDC publish support (npm/cli#8336) and
+          # npm's docs require 11.5.1+ on Node 22.14.0+. Node 22 ships
+          # npm 10.9.9, which is still too old: it signs the provenance
+          # statement fine, then sends setup-node's placeholder token on
+          # the publish PUT, and the registry answers that with a bare
+          # "404 Not Found" — which reads like a missing package rather
+          # than an auth failure. Node 24 ships npm 11.19.1.
+          node-version: '24'
+          # registry-url wires up the OIDC credential that npm publish
+          # picks up in preference to any token.
           registry-url: 'https://registry.npmjs.org'
+          # Never cache the package manager in a release build.
+          package-manager-cache: false
+
+      # Fail loudly rather than shipping a 404 that looks like a missing
+      # package. npm's docs: trusted publishing needs npm >= 11.5.1.
+      - name: Assert npm supports OIDC publish
+        run: |
+          have="$(npm --version)"
+          major="${have%%.*}"
+          rest="${have#*.}"
+          minor="${rest%%.*}"
+          patch="${rest#*.}"
+          patch="${patch%%-*}"   # strip any prerelease suffix
+          too_old=0
+          if [ "${major}" -lt 11 ]; then
+            too_old=1
+          elif [ "${major}" -eq 11 ]; then
+            if [ "${minor}" -lt 5 ]; then
+              too_old=1
+            elif [ "${minor}" -eq 5 ] && [ "${patch}" -lt 1 ]; then
+              too_old=1
+            fi
+          fi
+          if [ "${too_old}" -ne 0 ]; then
+            echo "::error::npm ${have} cannot authenticate a publish with OIDC (need >= 11.5.1). Bump node-version in this workflow."
+            exit 1
+          fi
+          echo "npm ${have} supports OIDC publish"
 
       - name: Download platform binaries
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           path: dist
           merge-multiple: true
