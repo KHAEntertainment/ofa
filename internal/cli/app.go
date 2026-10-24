@@ -37,8 +37,16 @@ const (
 	ExitError           ExitCode = 2
 )
 
-// version is overridden at build time via -ldflags.
-const version = "0.2.0"
+// version is the build version. It is a var, not a const, so the
+// release workflow can stamp it with
+// -ldflags="-X ofa/internal/cli.version=<version>".
+//
+// A const here would silently defeat the stamping: -X only rewrites
+// string *variables*, and a const would leave the binary reporting a
+// stale version no matter what tag was pushed. See
+// cmd/ofa/version_test.go, which builds the binary with a stamp and
+// asserts it actually shows up.
+var version = "dev"
 
 // App holds the dependencies for a single CLI invocation. New() fills in
 // sensible defaults; tests override individual fields to inject stubs.

@@ -9,8 +9,44 @@ permissions:
   contents: write   # for gh release create
 
 jobs:
+  # Verify the version stamp lands before anything ships. -X is a
+  # silent no-op when the symbol path is wrong or the target is a
+  # const, so a broken flag would publish a binary reporting the wrong
+  # version with no error anywhere in the pipeline. Builds natively
+  # (the matrix targets are cross-compiled and can't be executed here).
+  version:
+    name: Verify version stamping
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.25'
+          cache: true
+
+      - name: Resolve version
+        id: ver
+        shell: bash
+        run: echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+
+      - name: Build and check
+        env:
+          VERSION: ${{ steps.ver.outputs.version }}
+        run: |
+          go build -ldflags="-X ofa/internal/cli.version=${VERSION}" -o ofa-check ./cmd/ofa
+          reported="$(./ofa-check --version)"
+          expected="ofa ${VERSION}"
+          if [ "${reported}" != "${expected}" ]; then
+            echo "::error::version stamp mismatch: expected '${expected}', got '${reported}'"
+            exit 1
+          fi
+          echo "ok: ${reported}"
+
   binaries:
     name: Build ${{ matrix.target.os }}-${{ matrix.target.arch }}
+    needs: version
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
@@ -45,15 +81,9 @@ jobs:
         run: |
           mkdir -p bin
           go build \
-            -ldflags="-s -w -X main.version=${{ steps.ver.outputs.version }}" \
+            -ldflags="-s -w -X ofa/internal/cli.version=${{ steps.ver.outputs.version }}" \
             -o "bin/ofa-${{ matrix.target.os }}-${{ matrix.target.arch }}" \
             ./cmd/ofa
-
-      - name: Compute sha256
-        id: hash
-        run: |
-          echo "sha256=$(sha256sum "bin/ofa-${{ matrix.target.os }}-${{ matrix.target.arch }}" | awk '{print $1}')" \
-            >> "$GITHUB_OUTPUT"
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
@@ -90,13 +120,17 @@ jobs:
               --jq '.commits[] | "- " + .commit.messageHeadline' | head -n50)
           fi
 
+          # Checksums for the attached binaries.
+          ( cd dist && sha256sum ofa-* > checksums.txt )
+
           gh release create "${tag}" \
             --title "${tag}" \
             --notes "${notes}" \
             dist/ofa-darwin-arm64 \
             dist/ofa-darwin-amd64 \
             dist/ofa-linux-arm64 \
-            dist/ofa-linux-amd64
+            dist/ofa-linux-amd64 \
+            dist/checksums.txt
 
   npm:
     name: Publish @khaentertainment/ofa

@@ -7,10 +7,6 @@ import (
 	"ofa/internal/cli"
 )
 
-// version is the OFA build version. Bumped per release; a release step
-// will stamp it via -ldflags.
-const version = "0.2.0"
-
 func main() {
 	app := cli.New(os.Args[1:], os.Stdin, os.Stdout, os.Stderr)
 	os.Exit(int(app.Run()))

@@ -21,3 +21,12 @@ coverage.html
 
 # Local state (used by `ofa scan`)
 # Keep this out of the repo — it's per-machine.
+# Local harness tool state (skill installs, symlink farms). Not project
+# source — the ascii.rest copy this repo actually depends on lives in
+# scripts/gen-banner/ with its license.
+.agents/
+.claude/
+.devin/
+.qwen/
+.windsurf/
+skills-lock.json
