@@ -203,7 +203,7 @@ jobs:
           fi
 
   npm:
-    name: Publish @khaentertainment/ofa
+    name: Stage @khaentertainment/ofa
     needs: binaries
     runs-on: ubuntu-latest
     permissions:
@@ -222,23 +222,30 @@ jobs:
       - name: Set up Node
         uses: actions/setup-node@v7
         with:
-          # npm CLI 11.5.0 added OIDC publish support (npm/cli#8336) and
-          # npm's docs require 11.5.1+ on Node 22.14.0+. Node 22 ships
-          # npm 10.9.9, which is still too old: it signs the provenance
-          # statement fine, then sends setup-node's placeholder token on
-          # the publish PUT, and the registry answers that with a bare
-          # "404 Not Found" — which reads like a missing package rather
-          # than an auth failure. Node 24 ships npm 11.19.1.
+          # Node 24 ships npm 11.19.1. npm CLI 11.15.0 is required for
+          # `npm stage publish` and 11.21.0 for OIDC `npm dist-tag`,
+          # so the CLI is upgraded explicitly below — no Node release
+          # bundles 11.21.0 yet.
           node-version: '24'
-          # registry-url wires up the OIDC credential that npm publish
-          # picks up in preference to any token.
+          # registry-url wires up the OIDC credential that npm picks up
+          # in preference to any token.
           registry-url: 'https://registry.npmjs.org'
           # Never cache the package manager in a release build.
           package-manager-cache: false
 
-      # Fail loudly rather than shipping a 404 that looks like a missing
-      # package. npm's docs: trusted publishing needs npm >= 11.5.1.
-      - name: Assert npm supports OIDC publish
+      # npm CLI 11.5.0 added OIDC publish support (npm/cli#8336),
+      # 11.15.0 added `npm stage publish`, and 11.21.0 added OIDC
+      # `npm dist-tag`. Node 24 ships 11.19.1, so upgrade explicitly.
+      # A CLI that is too old signs the provenance statement and then
+      # fails the PUT with a bare "404 Not Found" — the registry
+      # answers a bad token on PUT with 404 rather than 401, so it reads
+      # like a missing package rather than an auth failure.
+      - name: Ensure npm CLI is new enough
+        run: |
+          npm install -g npm@^11.21.0
+          npm --version
+
+      - name: Assert npm supports staged publishing
         run: |
           have="$(npm --version)"
           major="${have%%.*}"
@@ -250,17 +257,15 @@ jobs:
           if [ "${major}" -lt 11 ]; then
             too_old=1
           elif [ "${major}" -eq 11 ]; then
-            if [ "${minor}" -lt 5 ]; then
-              too_old=1
-            elif [ "${minor}" -eq 5 ] && [ "${patch}" -lt 1 ]; then
+            if [ "${minor}" -lt 21 ]; then
               too_old=1
             fi
           fi
           if [ "${too_old}" -ne 0 ]; then
-            echo "::error::npm ${have} cannot authenticate a publish with OIDC (need >= 11.5.1). Bump node-version in this workflow."
+            echo "::error::npm ${have} cannot stage a publish with OIDC (need >= 11.21.0). Bump the npm install in this workflow."
             exit 1
           fi
-          echo "npm ${have} supports OIDC publish"
+          echo "npm ${have} supports staged publishing"
 
       - name: Download platform binaries
         uses: actions/download-artifact@v8
@@ -300,7 +305,8 @@ jobs:
           chmod 0755 "$stage"/platforms/*/ofa
           echo "stage=$stage" >> "$GITHUB_OUTPUT"
 
-      - name: Publish to npm
+      - name: Stage to npm
+        id: stage
         env:
           STAGE: ${{ steps.layout.outputs.stage }}
           PKG: '@khaentertainment/ofa'
@@ -308,28 +314,46 @@ jobs:
         run: |
           cd "$STAGE"
 
-          # Idempotent: if this version is already on npm, there is
+          # Idempotent: if this version is already public, there is
           # nothing to do. (npm refuses to publish over an existing
           # version, and a re-run of the pipeline is the expected way
-          # to recover from a transient publish failure.)
+          # to recover from a transient failure.)
           if npm view "${PKG}@${PKG_VERSION}" version >/dev/null 2>&1; then
             echo "::notice::${PKG}@${PKG_VERSION} is already published — skipping."
             exit 0
           fi
 
-          # --provenance requires OIDC (id-token: write above). The npm
-          # package must have a Trusted Publisher configured to point at
-          # this workflow, otherwise publish fails with EOTP / no OIDC
-          # token. Configure once at:
-          #   https://www.npmjs.com/package/@khaentertainment/ofa/access
-          #     → Publishing access → Trusted Publishers → GitHub Actions
-          #       Organization or user: KHAEntertainment
-          #       Repository: ofa
-          #       Workflow filename: release.yml
-          #       Allowed actions: enable BOTH "publish" and "dist-tag"
-          #         (a publisher created after 2026-09-03 is granted
-          #          `npm stage publish` only, and `npm publish` needs
-          #          the publish + dist-tag permissions — without them
-          #          the registry answers 403 "OIDC permission denied
-          #          for this action").
-          npm publish --access public --provenance
+          # Staged publishing: the package goes to npm's staging area
+          # and a maintainer approves it with 2FA before it becomes
+          # public. The trusted publisher grants `npm stage publish`
+          # unconditionally — the "publish" permission stays unchecked
+          # so that direct publishing is not possible from CI.
+          #
+          # npm's docs: the trusted publisher must allow `npm stage
+          # publish` (always allowed) and, if CI is to move dist-tags
+          # itself, `npm dist-tag` (npm CLI >= 11.21.0).
+          #
+          # Staging deliberately bypasses 2FA — proof of presence is
+          # deferred to the approve step, which only a human can do.
+          output="$(npm stage publish --access public --provenance --tag latest 2>&1)" || {
+            echo "${output}"
+            exit 1
+          }
+          echo "${output}"
+
+          # npm prints: + @scope/name@version (staged with id <uuid>)
+          stage_id="$(printf '%s\n' "${output}" | grep -oE 'staged with id [^ ]+' | awk '{print $NF}' | tr -d '()' | tail -1)"
+          echo "stage_id=${stage_id}" >> "$GITHUB_OUTPUT"
+
+          {
+            echo "### npm staged — approval required"
+            echo
+            echo "\`${PKG}@${PKG_VERSION}\` is staged and **not yet public**."
+            echo
+            echo "- Stage id: \`${stage_id}\`"
+            echo "- Approve at https://www.npmjs.com/package/${PKG#/@}/staged"
+            echo "  (or locally: \`npm stage approve ${stage_id}\` — requires 2FA)"
+            echo
+            echo "The trusted publisher is configured with stage-publish only, so direct"
+            echo "\`npm publish\` from CI is deliberately not permitted."
+          } >> "$GITHUB_STEP_SUMMARY"
