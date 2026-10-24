@@ -5,6 +5,7 @@ import (
 	"flag"
 	"fmt"
 
+	"ofa/internal/detect"
 	"ofa/internal/state"
 )
 
@@ -24,20 +25,19 @@ func (a *App) scanCmd(args []string) ExitCode {
 	if code != ExitOK {
 		return code
 	}
-	insts, _, code := a.runPipeline(cat)
+	insts, _, failures, code := a.runPipeline(cat)
 	if code != ExitOK {
 		return code
 	}
-	current := state.FromInstances(insts, a.Now())
 	prev, code := a.loadState()
 	if code != ExitOK {
 		return code
 	}
-
+	current := reconcileDegraded(prev, state.FromInstances(insts, a.Now()), failures)
 	drift := state.Diff(prev, current)
 
 	if *jsonOut {
-		return a.printScanJSON(current, drift)
+		return a.printScanJSON(current, drift, failures)
 	}
 	return a.printScanHuman(current, prev, drift)
 }
@@ -58,7 +58,7 @@ func (a *App) printScanHuman(current *stateFile, prev *stateFile, drift state.Dr
 	return ExitOK
 }
 
-func (a *App) printScanJSON(current *stateFile, drift state.Drift) ExitCode {
+func (a *App) printScanJSON(current *stateFile, drift state.Drift, failures []detect.Failure) ExitCode {
 	type scanOut struct {
 		ScannedAt     string                 `json:"scanned_at"`
 		HarnessCount  int                    `json:"harness_count"`
@@ -66,6 +66,7 @@ func (a *App) printScanJSON(current *stateFile, drift state.Drift) ExitCode {
 		InitialScan   bool                   `json:"initial_scan"`
 		Harnesses     map[string]state.Harness `json:"harnesses"`
 		Drift         *driftJSON             `json:"drift,omitempty"`
+		Failures     []failureOut           `json:"failures,omitempty"`
 	}
 	out := scanOut{
 		ScannedAt:    current.ScannedAt,
@@ -74,6 +75,7 @@ func (a *App) printScanJSON(current *stateFile, drift state.Drift) ExitCode {
 		InitialScan:  false, // filled below
 		Harnesses:    current.Harnesses,
 		Drift:        driftJSONPtr(drift),
+		Failures:     failureOutList(failures),
 	}
 	enc := json.NewEncoder(a.Stdout)
 	enc.SetIndent("", "  ")

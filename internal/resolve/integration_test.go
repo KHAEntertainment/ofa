@@ -36,7 +36,7 @@ func liveScan(t *testing.T, cat []catalog.Harness) []detect.Instance {
 			t.Skipf("%s not on PATH: %v", bin, err)
 		}
 	}
-	insts, err := detect.Scan(cat, detect.DefaultRunner)
+	insts, _, err := detect.Scan(cat, detect.DefaultRunner)
 	if err != nil {
 		t.Fatalf("detect.Scan: %v", err)
 	}

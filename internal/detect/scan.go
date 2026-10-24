@@ -1,7 +1,6 @@
 package detect
 
 import (
-	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -10,27 +9,48 @@ import (
 	"ofa/internal/catalog"
 )
 
+// Failure records a registry detector that could not run, and why. A failure
+// degrades the scan instead of aborting it: other methods still report, and
+// the harnesses this method would have covered are surfaced as undetectable.
+type Failure struct {
+	Method string
+	Err    error
+}
+
+// Error renders the failure as "method: reason".
+func (f Failure) Error() string { return f.Method + ": " + f.Err.Error() }
+
 // Scan joins the catalog with what is installed, returning one Instance per
-// detected install with active/shadowed resolved.
-func Scan(harnesses []catalog.Harness, run Runner) ([]Instance, error) {
+// detected install with active/shadowed resolved, plus one Failure for each
+// registry method that exists but could not be queried.
+//
+// A detector that is present-but-broken (e.g. `brew list` exiting non-zero)
+// is recorded as a Failure and the loop continues, so one broken package
+// manager can no longer zero the whole scan. A package manager that is simply
+// not installed is an empty set, not a failure (see detectRegistry).
+//
+// A non-nil error is reserved for faults that leave nothing to report at all.
+func Scan(harnesses []catalog.Harness, run Runner) ([]Instance, []Failure, error) {
 	regs := map[string]registryInstalled{}
+	var failures []Failure
 	for _, method := range registryMethods {
 		if !usesRegistryMethod(harnesses, method) {
 			continue
 		}
 		reg, err := detectRegistry(method, run)
 		if err != nil {
-			return nil, fmt.Errorf("%s: %w", method, err)
+			failures = append(failures, Failure{Method: method, Err: err})
+			continue
 		}
 		regs[method] = reg
 	}
 
 	instances, err := buildInstances(harnesses, regs, run)
 	if err != nil {
-		return nil, err
+		return nil, failures, err
 	}
 	resolveShadowing(instances)
-	return instances, nil
+	return instances, failures, nil
 }
 
 func usesRegistryMethod(harnesses []catalog.Harness, method string) bool {

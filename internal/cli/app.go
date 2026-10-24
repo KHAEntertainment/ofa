@@ -65,7 +65,7 @@ type App struct {
 
 	// Pipeline functions. Defaults wire detect+resolve+update end-to-end;
 	// tests can stub any layer to skip the shell.
-	DetectFn  func(cat []catalog.Harness, run detect.Runner) ([]detect.Instance, error)
+	DetectFn  func(cat []catalog.Harness, run detect.Runner) ([]detect.Instance, []detect.Failure, error)
 	ResolveFn func(insts []detect.Instance, cat []catalog.Harness, run resolve.Runner, get resolve.Getter) []resolve.Resolution
 
 	// Runners default to real exec / HTTP.
@@ -174,17 +174,28 @@ func (a *App) loadCatalog() ([]catalog.Harness, ExitCode) {
 }
 
 // runPipeline is the shared scan+resolve step used by check, apply, and
-// scan (well, scan does only the detect half). Returns instances and
-// resolutions; either may be empty on error. Exits with ExitError on
-// detect failure so callers don't repeat the boilerplate.
-func (a *App) runPipeline(cat []catalog.Harness) ([]detect.Instance, []resolve.Resolution, ExitCode) {
-	insts, err := a.DetectFn(cat, a.DetectRunner)
+// scan (well, scan does only the detect half). Returns instances,
+// resolutions, and the detector failures that degraded the run; any of the
+// first two may be empty on error. Exits with ExitError only when detection
+// itself failed outright or when the failures left nothing at all to report,
+// so a single broken package manager cannot zero a scan that other detectors
+// could still answer for.
+func (a *App) runPipeline(cat []catalog.Harness) ([]detect.Instance, []resolve.Resolution, []detect.Failure, ExitCode) {
+	insts, failures, err := a.DetectFn(cat, a.DetectRunner)
 	if err != nil {
 		fmt.Fprintf(a.Stderr, "ofa: scan: %v\n", err)
-		return nil, nil, ExitError
+		return nil, nil, nil, ExitError
+	}
+	if len(failures) > 0 {
+		a.reportDetectionFailures(cat, insts, failures)
+		if len(insts) == 0 {
+			// Every result we would have shown came from a detector that
+			// failed, so an empty report would be a lie about this machine.
+			return nil, nil, failures, ExitError
+		}
 	}
 	res := a.ResolveFn(insts, cat, a.ResolveRunner, a.ResolveGetter)
-	return insts, res, ExitOK
+	return insts, res, failures, ExitOK
 }
 
 // loadState reads the state file via the state package. Returns nil +

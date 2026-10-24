@@ -23,7 +23,7 @@ func main() {
 		fmt.Fprintf(os.Stderr, "catalog: %v\n", err)
 		os.Exit(1)
 	}
-	insts, err := detect.Scan(cat, detect.DefaultRunner)
+	insts, _, err := detect.Scan(cat, detect.DefaultRunner)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "detect: %v\n", err)
 		os.Exit(1)

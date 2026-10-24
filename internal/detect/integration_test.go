@@ -17,7 +17,7 @@ func TestScanRealMachine(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	insts, err := Scan(hs, DefaultRunner)
+	insts, _, err := Scan(hs, DefaultRunner)
 	if err != nil {
 		t.Fatalf("Scan: %v", err)
 	}

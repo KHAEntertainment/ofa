@@ -41,7 +41,7 @@ func (a *App) applyCmd(args []string) ExitCode {
 	if code != ExitOK {
 		return code
 	}
-	_, resolutions, code := a.runPipeline(cat)
+	_, resolutions, _, code := a.runPipeline(cat)
 	if code != ExitOK {
 		return code
 	}

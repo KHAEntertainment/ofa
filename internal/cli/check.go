@@ -7,6 +7,7 @@ import (
 	"sort"
 
 	"ofa/internal/catalog"
+	"ofa/internal/detect"
 	"ofa/internal/resolve"
 	"ofa/internal/state"
 )
@@ -28,7 +29,7 @@ func (a *App) checkCmd(args []string) ExitCode {
 	if code != ExitOK {
 		return code
 	}
-	insts, resolutions, code := a.runPipeline(cat)
+	insts, resolutions, failures, code := a.runPipeline(cat)
 	if code != ExitOK {
 		return code
 	}
@@ -36,11 +37,11 @@ func (a *App) checkCmd(args []string) ExitCode {
 	if code != ExitOK {
 		return code
 	}
-	current := state.FromInstances(insts, a.Now())
+	current := reconcileDegraded(prev, state.FromInstances(insts, a.Now()), failures)
 	drift := state.Diff(prev, current)
 
 	if *jsonOut {
-		return a.printCheckJSON(cat, resolutions, current, drift, *only)
+		return a.printCheckJSON(cat, resolutions, current, drift, failures, *only)
 	}
 	return a.printCheckHuman(cat, resolutions, current, drift, *only)
 }
@@ -64,7 +65,7 @@ func (a *App) printCheckHuman(cat []catalog.Harness, resolutions []resolve.Resol
 	return ExitOK
 }
 
-func (a *App) printCheckJSON(cat []catalog.Harness, resolutions []resolve.Resolution, current *stateFile, drift state.Drift, only string) ExitCode {
+func (a *App) printCheckJSON(cat []catalog.Harness, resolutions []resolve.Resolution, current *stateFile, drift state.Drift, failures []detect.Failure, only string) ExitCode {
 	type installOut struct {
 		Method            string `json:"method"`
 		Package           string `json:"package,omitempty"`
@@ -83,12 +84,13 @@ func (a *App) printCheckJSON(cat []catalog.Harness, resolutions []resolve.Resolu
 		Installs []installOut `json:"installs"`
 	}
 	type checkOut struct {
-		ScannedAt    string                 `json:"scanned_at"`
-		HarnessCount int                    `json:"harness_count"`
-		InstallCount int                    `json:"install_count"`
-		UpdateCount  int                    `json:"update_count"`
-		Harnesses    map[string]harnessOut  `json:"harnesses"`
-		Drift        *driftJSON             `json:"drift,omitempty"`
+		ScannedAt    string                `json:"scanned_at"`
+		HarnessCount int                   `json:"harness_count"`
+		InstallCount int                   `json:"install_count"`
+		UpdateCount  int                   `json:"update_count"`
+		Harnesses    map[string]harnessOut `json:"harnesses"`
+		Drift        *driftJSON            `json:"drift,omitempty"`
+		Failures     []failureOut          `json:"failures,omitempty"`
 	}
 
 	byID := map[string]catalog.Harness{}
@@ -103,6 +105,7 @@ func (a *App) printCheckJSON(cat []catalog.Harness, resolutions []resolve.Resolu
 		UpdateCount:  countUpdates(filtered),
 		Harnesses:    map[string]harnessOut{},
 		Drift:        driftJSONPtr(drift),
+		Failures:     failureOutList(failures),
 	}
 	for _, r := range filtered {
 		h, ok := byID[r.HarnessID]
@@ -140,6 +143,7 @@ func (a *App) printCheckJSON(cat []catalog.Harness, resolutions []resolve.Resolu
 		UpdateCount  int                   `json:"update_count"`
 		Harnesses    map[string]harnessOut `json:"harnesses"`
 		Drift        *driftJSON            `json:"drift,omitempty"`
+		Failures     []failureOut          `json:"failures,omitempty"`
 	}{
 		ScannedAt:    out.ScannedAt,
 		HarnessCount: out.HarnessCount,
@@ -147,6 +151,7 @@ func (a *App) printCheckJSON(cat []catalog.Harness, resolutions []resolve.Resolu
 		UpdateCount:  out.UpdateCount,
 		Harnesses:    map[string]harnessOut{},
 		Drift:        out.Drift,
+		Failures:     out.Failures,
 	}
 	for _, id := range ids {
 		ordered.Harnesses[id] = out.Harnesses[id]

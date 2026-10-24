@@ -26,14 +26,16 @@ func mustTime(s string) time.Time {
 	return tt
 }
 
-// stubDetect is a DetectFn substitute. Returns the canned instances.
+// stubDetect is a DetectFn substitute. Returns the canned instances and the
+// detector failures to degrade with, if any.
 type stubDetect struct {
 	instances []detect.Instance
+	failures  []detect.Failure
 	err       error
 }
 
-func (s *stubDetect) Run(cat []catalog.Harness, run detect.Runner) ([]detect.Instance, error) {
-	return s.instances, s.err
+func (s *stubDetect) Run(cat []catalog.Harness, run detect.Runner) ([]detect.Instance, []detect.Failure, error) {
+	return s.instances, s.failures, s.err
 }
 
 // stubResolve returns canned resolutions.
