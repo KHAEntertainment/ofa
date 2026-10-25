@@ -86,6 +86,19 @@ func buildInstances(harnesses []catalog.Harness, regs map[string]registryInstall
 				if !found {
 					continue
 				}
+				// A self-updater rewrites its binary outside the package
+				// manager's knowledge — `copilot update` replaced the
+				// binary while npm's tree still recorded 1.0.80, so the
+				// registry value was wrong forever (issue #3). For those
+				// installs ask the binary itself; every other tier keeps
+				// the registry value, which is correct because the package
+				// manager performed the install. A failing version command
+				// falls back rather than losing the install.
+				if in.Latest == "self" {
+					if v, ok := runVersionCmd(in.Version, run); ok {
+						ver = v
+					}
+				}
 				out = append(out, Instance{
 					HarnessID: h.ID,
 					Method:    in.Method,
@@ -98,6 +111,34 @@ func buildInstances(harnesses []catalog.Harness, regs map[string]registryInstall
 		}
 	}
 	return out, nil
+}
+
+// runVersionCmd runs an install's declared version command and returns its
+// trimmed output. The catalog carries `version.cmd` for every install
+// (copilot, mmx, kimi, …) but it was only ever executed for method =
+// "native", so the field read as active config while doing nothing for the
+// other seven entries. Self-tier installs need it: their package manager's
+// record cannot be trusted, because the harness updates its own binary.
+//
+// Returns false when no command is declared or it fails, so callers keep the
+// registry value rather than losing the install entirely.
+func runVersionCmd(v catalog.CmdSpec, run Runner) (string, bool) {
+	if len(v.Cmd) == 0 {
+		return "", false
+	}
+	out, err := run(v.Cmd[0], v.Cmd[1:]...)
+	if err != nil {
+		return "", false
+	}
+	// Only the first line is the version. Some CLIs append a hint after it —
+	// `copilot --version` prints "Run 'copilot update' to check for updates."
+	// as line two — and printUpdateRow renders one resolution per line, so a
+	// bare TrimSpace would embed a newline and split the row in half.
+	line, _, _ := strings.Cut(out, "\n")
+	if s := strings.TrimSpace(line); s != "" {
+		return s, true
+	}
+	return "", false
 }
 
 func detectNative(h catalog.Harness, in catalog.Install, run Runner) (*Instance, bool, error) {
