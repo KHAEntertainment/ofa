@@ -219,13 +219,9 @@ v1 is macOS-only. The seam for cross-platform is the `Detector` interface — Wi
 
 ## Roadmap
 
-Tentative, in rough priority order. None of these are committed to a release date.
-
-### Near-term: distribution
-
-- **NPM packaging.** Publish `@khaentertainment/ofa` so `npm install -g @khaentertainment/ofa` works on any platform. The Go binary is the npm `bin`; no JS wrapper. Cross-compiled at build time for `darwin-arm64`, `darwin-amd64`, `linux-amd64`, `linux-arm64`.
-- **Homebrew tap.** `KHAEntertainment/homebrew-tap/ofa` for `brew install KHAEntertainment/tap/ofa`. Lower-friction install on macOS than the npm variant for users who don't already have Node.
-- **GitHub Releases + CI/CD.** Tagged releases (`vX.Y.Z`) trigger cross-compile + npm publish via GitHub Actions. Untaged pushes run `go build && go test` on PRs.
+Distribution is done: npm, the Homebrew tap, and tag-triggered releases all ship
+(see [Install](#install)). What follows is tentative, roughly in priority order,
+and uncommitted to any date.
 
 ### Medium-term: platform reach
 
@@ -236,15 +232,15 @@ Tentative, in rough priority order. None of these are committed to a release dat
 
 When a scan finds a binary on PATH that doesn't match any Catalog entry, or a Catalog entry fails to detect a known install, OFA needs help from a human-shaped intelligence to write the TOML. The design avoids any API key or rate-limit dependency on OFA's side:
 
-1. OFA writes the facts it knows into a shared context folder: `~/.ofa/CLAUDE.md` (always loaded by Claude Code), `~/.ofa/doctor-context.md` (per-invocation facts: which binary, its `--version` output, the gaps it fills).
-2. OFA spawns a headless session of an installed agent — e.g. `claude -p "Read ~/.ofa/CLAUDE.md and ~/.ofa/doctor-context.md. Draft a Catalog entry."` — whichever harness the user has installed. No model API, no vendor lock-in; OFA is the orchestrator, the agent does the thinking.
-3. The proposed TOML lands at `~/.ofa/doctor-history/<timestamp>/proposed-catalog.toml`. The user reviews it; if approved, copies it into the Catalog (`~/.local/share/ofa/catalog/<id>.toml` on macOS, or upstream via PR for shared coverage).
+1. OFA writes the facts it knows into a shared context folder under its config directory: `~/.config/ofa/doctor/CLAUDE.md` (always loaded by Claude Code), `~/.config/ofa/doctor/context.md` (per-invocation facts: which binary, its `--version` output, the gaps it fills).
+2. OFA spawns a headless session of an installed agent — e.g. `claude -p "Read ~/.config/ofa/doctor/CLAUDE.md and ~/.config/ofa/doctor/context.md. Draft a Catalog entry."` — whichever harness the user has installed. No model API, no vendor lock-in; OFA is the orchestrator, the agent does the thinking.
+3. The proposed TOML lands at `~/.config/ofa/doctor/history/<timestamp>/proposed-catalog.toml`. The user reviews it; if approved, copies it into the user Catalog (`~/.config/ofa/catalog/<id>.toml`) or upstream via PR for shared coverage.
 
-Doctor is opt-in (`ofa doctor` only) and never runs in the default `ofa` path. The `~/.ofa/` directory is created on first use, not at install.
+Doctor is opt-in (`ofa doctor` only) and never runs in the default `ofa` path. Its directory is created on first use, not at install.
 
 ### Open ideas (not scheduled)
 
-- **Pre-release filtering in version compare.** Currently `0.0.0-beta-18743` compares as `0.0.0` numerically — correct for our purpose but probably wrong semantically (a beta should yield to a stable release when both exist). Semver-aware compare with a `stable > pre-release` rule is the intended fix.
+- **Pre-release filtering in version compare.** The comparator only understands dotted numerics, so any version with a pre-release or suffixed segment (e.g. `0.0.0-beta-18743` or `2026.10.22-27dcf5f`) is conservatively treated as "not newer" and never reported as outdated. Semver-aware compare with numeric pre-release ordering and a `stable > pre-release` rule is the intended fix.
 - **Update hooks.** Run a shell command before/after each update (`~/.config/ofa/hooks.toml`).
 - **Version pinning.** Skip updates for harnesses the user wants frozen (`--pin <id>@<version>`).
 - **Schedule.** Optional cron-style background scan + report (no auto-apply — OFA never applies without explicit user action).
@@ -261,6 +257,9 @@ $ # open a PR
 ```
 
 If `ofa doctor` (see [Roadmap](#roadmap)) finds a binary on your machine that doesn't match a catalog entry, it drafts a TOML for you to review and contribute upstream. Doctor is an opt-in command — not part of the default `ofa` path.
+
+Cutting a release (version bump, tag, staged npm publish, Homebrew tap bump) is
+documented in [`docs/RELEASING.md`](./docs/RELEASING.md).
 
 ## License
 
