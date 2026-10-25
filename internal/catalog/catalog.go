@@ -27,7 +27,7 @@ type Harness struct {
 
 // Install is a single detectable install method for a harness.
 type Install struct {
-	Method  string   `toml:"method"`  // brew-formula | brew-cask | npm | pipx | uv | native | desktop-app
+	Method  string   `toml:"method"`  // brew-formula | brew-cask | npm | pipx | uv | native
 	Package string   `toml:"package"` // registry name: brew formula/cask, npm package, pipx/uv package; empty for native
 	Bin     string   `toml:"bin"`     // command name
 	Paths   []string `toml:"paths"`   // probe paths (native only)
@@ -41,8 +41,12 @@ type CmdSpec struct {
 	Cmd []string `toml:"cmd"`
 }
 
+// validMethods lists the implementable methods. It must stay in lockstep with
+// detect's registry switch (internal/detect/methods.go) and the native probe
+// (internal/detect/scan.go): a method accepted here that detect does not
+// implement would validate at load time and then silently detect nothing.
 var validMethods = map[string]bool{
-	"brew-formula": true, "brew-cask": true, "npm": true, "pipx": true, "uv": true, "native": true, "desktop-app": true,
+	"brew-formula": true, "brew-cask": true, "npm": true, "pipx": true, "uv": true, "native": true,
 }
 
 var validLatest = map[string]bool{
