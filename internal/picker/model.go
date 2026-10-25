@@ -5,7 +5,7 @@ import (
 	"strings"
 	"unicode/utf8"
 
-	tea "github.com/charmbracelet/bubbletea"
+	tea "charm.land/bubbletea/v2"
 
 	"ofa/internal/banner"
 )
@@ -31,10 +31,10 @@ func newModel(items []item) model {
 func (m model) Init() tea.Cmd { return nil }
 
 // Update routes messages to the right handler. Exported via the bubbletea
-// Model interface; tests drive it directly with tea.KeyMsg values.
+// Model interface; tests drive it directly with tea.KeyPressMsg values.
 func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
-	case tea.KeyMsg:
+	case tea.KeyPressMsg:
 		return m.handleKey(msg)
 	}
 	return m, nil
@@ -43,7 +43,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 // handleKey processes a single keystroke. The dispatch table is small
 // enough that one switch is clearer than a key map; if it grows past ~12
 // keys, split it.
-func (m model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+func (m model) handleKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 	switch msg.String() {
 	case "ctrl+c", "q":
 		m.quitting = true
@@ -59,7 +59,7 @@ func (m model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.cursor++
 		}
 		return m, nil
-	case " ":
+	case "space":
 		if m.selected[m.cursor] {
 			delete(m.selected, m.cursor)
 		} else {
@@ -197,9 +197,19 @@ func groupWidth(group []string) int {
 	return w
 }
 
-// View renders the picker. Returns empty string when quitting so the
-// alt-screen tears down cleanly.
-func (m model) View() string {
+// View renders the picker as a v2 tea.View. The frame is empty when
+// quitting so the alt-screen tears down cleanly. Alt screen is declared
+// here because bubbletea v2 dropped the WithAltScreen program option —
+// the view owns terminal modes. The picker is always full-screen.
+func (m model) View() tea.View {
+	v := tea.NewView(m.frame())
+	v.AltScreen = true
+	return v
+}
+
+// frame is the rendered picker body (banner, blurb, rows, footer), or
+// the empty string once quitting.
+func (m model) frame() string {
 	if m.quitting || len(m.items) == 0 {
 		return ""
 	}

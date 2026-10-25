@@ -11,7 +11,7 @@ package picker
 import (
 	"fmt"
 
-	tea "github.com/charmbracelet/bubbletea"
+	tea "charm.land/bubbletea/v2"
 
 	"ofa/internal/resolve"
 )
@@ -37,7 +37,9 @@ func Run(resolutions []resolve.Resolution) (Outcome, error) {
 		return Outcome{}, nil
 	}
 	m := newModel(items)
-	p := tea.NewProgram(m, tea.WithAltScreen())
+	// Alt screen is no longer a program option — bubbletea v2 made it a
+	// field the model declares in View(), so NewProgram takes no opts here.
+	p := tea.NewProgram(m)
 	final, err := p.Run()
 	if err != nil {
 		return Outcome{}, err

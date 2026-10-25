@@ -50,7 +50,7 @@ $ git clone https://github.com/KHAEntertainment/ofa
 $ cd ofa && go build -o ~/.local/bin/ofa ./cmd/ofa
 ```
 
-Go 1.25+ required.
+Go 1.26+ required.
 
 ### Verifying what you installed
 
@@ -269,5 +269,5 @@ MIT — see [LICENSE](./LICENSE).
 
 ## Acknowledgments
 
-- The [charmbracelet/bubbletea](https://github.com/charmbracelet/bubbletea) TUI framework powers the interactive picker.
+- The [bubbletea](https://github.com/charmbracelet/bubbletea) TUI framework (v2, imported as `charm.land/bubbletea/v2`) powers the interactive picker.
 - Each catalog entry is a thin pointer at the actual upstream tool that does the work. OFA is glue, not a reimplementation.
