@@ -1,6 +1,6 @@
 {
   "name": "@khaentertainment/ofa",
-  "version": "0.2.1",
+  "version": "0.2.2",
   "description": "One For All: detect and update every coding harness from a single CLI. https://github.com/KHAEntertainment/ofa",
   "license": "MIT",
   "repository": {
