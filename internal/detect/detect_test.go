@@ -107,6 +107,66 @@ func TestClassifyUnresolvable(t *testing.T) {
 	}
 }
 
+func TestClassifyNativeOwnsLivePath(t *testing.T) {
+	// A script-installed binary (opencode's curl installer) and an npm copy
+	// share the `opencode` bin. The live PATH binary is the native one, so
+	// the native install must be Active and the npm install Shadowed.
+	instances := []Instance{
+		{HarnessID: "opencode", Method: "npm", Package: "opencode-ai", Bin: "opencode", Version: "1.18.35", Status: Active},
+		{HarnessID: "opencode", Method: "native", Bin: "opencode", Path: "/home/x/.opencode/bin/opencode", Version: "1.19.0", Status: Active},
+	}
+	live := map[string]liveBin{
+		"opencode": {path: "/home/x/.opencode/bin/opencode", real: "/home/x/.opencode/bin/opencode"},
+	}
+	classify(instances, live)
+	if instances[0].Status != Shadowed || instances[0].Path != "" {
+		t.Errorf("npm install should be shadowed: %+v", instances[0])
+	}
+	if instances[1].Status != Active || instances[1].Path != "/home/x/.opencode/bin/opencode" {
+		t.Errorf("native install should be active: %+v", instances[1])
+	}
+}
+
+func TestClassifyNativeSingleKeepsPathWhenNotOnPath(t *testing.T) {
+	// A native binary exists at its probe path but is not on PATH. The
+	// install is still real; classify must not blank its path.
+	instances := []Instance{
+		{HarnessID: "claude", Method: "native", Bin: "claude", Path: "/home/x/.local/bin/claude"},
+	}
+	classify(instances, map[string]liveBin{"claude": {}})
+	if instances[0].Status != Active || instances[0].Path != "/home/x/.local/bin/claude" {
+		t.Errorf("native path should survive a failed LookPath: %+v", instances[0])
+	}
+}
+
+func TestClassifyNativeSymlinkOwnsRealPath(t *testing.T) {
+	dir := t.TempDir()
+	real := filepath.Join(dir, "claude-2.1.310")
+	if err := os.WriteFile(real, []byte("#!/bin/sh\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	link := filepath.Join(dir, "claude")
+	if err := os.Symlink(real, link); err != nil {
+		t.Fatal(err)
+	}
+	// lookUp always reports an EvalSymlinks-resolved real path; mirror that.
+	resolved, err := filepath.EvalSymlinks(real)
+	if err != nil {
+		t.Fatal(err)
+	}
+	instances := []Instance{
+		{HarnessID: "claude", Method: "native", Bin: "claude", Path: link},
+		{HarnessID: "claude", Method: "npm", Package: "@anthropic-ai/claude-code", Bin: "claude"},
+	}
+	classify(instances, map[string]liveBin{"claude": {path: link, real: resolved}})
+	if instances[0].Status != Active {
+		t.Errorf("native symlink should own the live path: %+v", instances[0])
+	}
+	if instances[1].Status != Shadowed {
+		t.Errorf("npm install should be shadowed: %+v", instances[1])
+	}
+}
+
 func TestOwnsReal(t *testing.T) {
 	cases := []struct {
 		inst Instance
@@ -120,6 +180,9 @@ func TestOwnsReal(t *testing.T) {
 		{Instance{Method: "uv", Package: "kimi-cli"}, "/Users/x/.local/share/uv/tools/kimi-cli/bin/kimi-cli", true},
 		{Instance{Method: "npm", Package: "opencode-ai"}, "/opt/homebrew/Cellar/opencode/1.19.0/bin/opencode", false},
 		{Instance{Method: "npm", Package: "opencode-ai"}, "", false},
+		{Instance{Method: "native", Path: "/home/x/.local/bin/claude"}, "/home/x/.local/bin/claude", true},
+		{Instance{Method: "native", Path: "/home/x/.local/bin/claude"}, "/opt/homebrew/bin/claude", false},
+		{Instance{Method: "native"}, "/home/x/.local/bin/claude", false},
 	}
 	for _, c := range cases {
 		if got := ownsReal(c.inst, c.real); got != c.want {

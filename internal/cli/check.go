@@ -215,15 +215,25 @@ func printUpdateRow(w interface{ Write([]byte) (int, error) }, r resolve.Resolut
 	switch {
 	case r.Outdated:
 		fmt.Fprintf(w, "  %-14s %-32s [%s]  %s → %s%s\n", r.HarnessID, r.Cur, r.Tier, r.Bin, r.Latest, suffix)
-	case r.Tier == "self":
+	case r.Tier == "self" && updaterReachable(r):
 		fmt.Fprintf(w, "  %-14s %-32s [self]  %s → updater available%s\n", r.HarnessID, r.Cur, r.Bin, suffix)
-	case r.Tier == "none":
+	case r.Tier == "none" || (r.Tier == "self" && !updaterReachable(r)):
 		fmt.Fprintf(w, "  %-14s %-32s [none]  %s → no update path%s\n", r.HarnessID, r.Cur, r.Bin, suffix)
 	case r.ResolverErr != "":
 		fmt.Fprintf(w, "  %-14s %-32s [%s]  %s → (resolver error: %s)%s\n", r.HarnessID, r.Cur, r.Tier, r.Bin, r.ResolverErr, suffix)
 	default:
 		fmt.Fprintf(w, "  %-14s %-32s [%s]  %s (at latest)%s\n", r.HarnessID, r.Cur, r.Tier, r.Bin, suffix)
 	}
+}
+
+// updaterReachable reports whether OFA can run an update that targets this
+// install. Registry updaters name their package (`brew upgrade <pkg>`,
+// `npm i -g <pkg>`, `uv tool upgrade <pkg>`), so they always reach the copy
+// they manage. Native updaters are `<bin> update`, resolved via PATH: for a
+// shadowed native install that runs the live copy instead, so the catalog
+// command cannot update the copy it claims to target.
+func updaterReachable(r resolve.Resolution) bool {
+	return !(r.Shadowed && r.Method == "native")
 }
 
 // statusString names an install the way state.json does, so `check --json`
@@ -278,7 +288,7 @@ func countUpdates(res []resolve.Resolution, pins map[string]bool) int {
 func countUpdaters(res []resolve.Resolution, pins map[string]bool) int {
 	n := 0
 	for _, r := range res {
-		if r.Tier == "self" && !pins[r.HarnessID] {
+		if r.Tier == "self" && !pins[r.HarnessID] && updaterReachable(r) {
 			n++
 		}
 	}

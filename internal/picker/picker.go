@@ -73,6 +73,9 @@ func buildItems(res []resolve.Resolution, pins map[string]bool) []item {
 		// reported by `ofa check` but not actionable here. Shadowed
 		// installs never appear — detect.Scan marks them but they have
 		// no path to be the live binary, so updating them is wasted work.
+		if r.Shadowed {
+			continue
+		}
 		if !r.Outdated && r.Tier != "self" {
 			continue
 		}

@@ -316,6 +316,32 @@ func TestCountUpdates(t *testing.T) {
 	}
 }
 
+func TestCountUpdaters_ShadowedNativeHasNoReachableUpdater(t *testing.T) {
+	res := []resolve.Resolution{
+		{HarnessID: "claude", Method: "native", Tier: "self"},
+		// A shadowed native install's "<bin> update" resolves via PATH to
+		// the live binary, so it cannot update this copy.
+		{HarnessID: "opencode", Method: "native", Tier: "self", Shadowed: true},
+	}
+	if got := countUpdaters(res, nil); got != 1 {
+		t.Errorf("countUpdaters = %d, want 1 (only the active native install)", got)
+	}
+}
+
+func TestBuildRequests_ShadowedNativeSkipped(t *testing.T) {
+	cat := testCatalog(t)
+	res := []resolve.Resolution{
+		{HarnessID: "claude", Method: "native", Bin: "claude", Tier: "self", Shadowed: true},
+	}
+	reqs, skip := buildRequests(cat, res, false, nil)
+	if len(reqs) != 0 {
+		t.Errorf("shadowed native install must not produce a request, got %d", len(reqs))
+	}
+	if _, ok := skip["claude (native)"]; !ok {
+		t.Errorf("shadowed native should be skipped with a reason, got %+v", skip)
+	}
+}
+
 func TestBuildRequests(t *testing.T) {
 	cat := testCatalog(t)
 	res := []resolve.Resolution{

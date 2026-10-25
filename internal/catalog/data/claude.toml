@@ -9,3 +9,11 @@ paths    = ["~/.local/bin/claude"]
 version  = { cmd = ["claude", "--version"] }
 latest   = "self"
 update   = { cmd = ["claude", "update"] }
+
+[[installs]]
+method   = "npm"
+package  = "@anthropic-ai/claude-code"
+bin      = "claude"
+version  = { cmd = ["claude", "--version"] }
+latest   = "npm"
+update   = { cmd = ["npm", "install", "-g", "@anthropic-ai/claude-code@latest"] }

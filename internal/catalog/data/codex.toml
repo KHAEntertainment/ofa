@@ -9,3 +9,11 @@ bin      = "codex"
 version  = { cmd = ["codex", "--version"] }
 latest   = "brew"
 update   = { cmd = ["brew", "upgrade", "--cask", "codex"] }
+
+[[installs]]
+method   = "npm"
+package  = "@openai/codex"
+bin      = "codex"
+version  = { cmd = ["codex", "--version"] }
+latest   = "npm"
+update   = { cmd = ["npm", "install", "-g", "@openai/codex@latest"] }

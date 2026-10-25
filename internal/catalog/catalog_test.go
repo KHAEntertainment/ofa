@@ -36,14 +36,20 @@ func assertCatalog(t *testing.T, hs []Harness) {
 			t.Errorf("missing harness %q", want)
 		}
 	}
-	if got := len(byID["opencode"].Installs); got != 3 {
-		t.Errorf("opencode installs = %d, want 3", got)
+	if got := len(byID["opencode"].Installs); got != 4 {
+		t.Errorf("opencode installs = %d, want 4", got)
 	}
 	if got := len(byID["qwen"].Installs); got != 2 {
 		t.Errorf("qwen installs = %d, want 2", got)
 	}
 	if got := len(byID["kimi"].Installs); got != 2 {
 		t.Errorf("kimi installs = %d, want 2", got)
+	}
+	if got := len(byID["claude"].Installs); got != 2 {
+		t.Errorf("claude installs = %d, want 2", got)
+	}
+	if got := len(byID["codex"].Installs); got != 2 {
+		t.Errorf("codex installs = %d, want 2", got)
 	}
 }
 

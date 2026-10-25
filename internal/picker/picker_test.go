@@ -66,6 +66,20 @@ func TestBuildItems_FiltersAtLatest(t *testing.T) {
 	}
 }
 
+func TestBuildItems_FiltersShadowed(t *testing.T) {
+	items := buildItems([]resolve.Resolution{
+		{HarnessID: "opencode", Method: "native", Tier: "self", Shadowed: true},              // shadowed → drop
+		{HarnessID: "qwen", Method: "npm", Outdated: true, Tier: "npm", Shadowed: true},      // shadowed → drop
+		{HarnessID: "claude", Method: "native", Tier: "self"},                                // include
+	}, nil)
+	if len(items) != 1 {
+		t.Fatalf("want 1 item (shadowed dropped), got %d: %+v", len(items), items)
+	}
+	if items[0].Resolution.HarnessID != "claude" {
+		t.Errorf("surviving item = %q, want claude", items[0].Resolution.HarnessID)
+	}
+}
+
 func TestRun_NoItemsReturnsEmptyOutcome(t *testing.T) {
 	out, err := Run(nil, nil)
 	if err != nil {
