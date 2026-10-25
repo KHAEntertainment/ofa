@@ -55,8 +55,8 @@ type Result struct {
 	SkippedReason string
 	Failed        bool
 	ExitCode      int
-	Err           error   // non-nil if the executor couldn't even start
-	OutputTail    string  // last N lines, populated on failure
+	Err           error  // non-nil if the executor couldn't even start
+	OutputTail    string // last N lines, populated on failure
 }
 
 // Executor runs one command and returns its Result. DefaultExecutor shells
@@ -233,7 +233,9 @@ func buildResult(req Request, err error, buf *safeBuffer) Result {
 }
 
 // safeBuffer accumulates teed output for tail capture. Writes are serialized
-// so concurrent stdout+stderr don't tear at byte boundaries.
+// so concurrent stdout+stderr don't tear at byte boundaries — and the
+// serialization covers the live mirror too (see teeWriter), so a sink
+// shared by both streams never sees concurrent writes either (issue #10).
 type safeBuffer struct {
 	mu  sync.Mutex
 	buf strings.Builder
@@ -246,6 +248,13 @@ func (b *safeBuffer) String() string {
 }
 
 // tee returns a writer that mirrors to w live and accumulates into b.
+//
+// All writers teed from the same safeBuffer serialize on b's mutex —
+// capture and mirror alike — which is what makes a shared sink safe:
+// exec.Cmd copies stdout and stderr in separate goroutines, and
+// DefaultExecutor points both at one sink. The sink must not write back
+// into the same safeBuffer (it can't: announcePair builds it before the
+// buffer exists), or the shared mutex would deadlock.
 func (b *safeBuffer) tee(w io.Writer) io.Writer {
 	return &teeWriter{b: b, w: w}
 }
@@ -255,10 +264,13 @@ type teeWriter struct {
 	w io.Writer
 }
 
+// Write holds b's mutex across BOTH the capture and the mirror. The
+// original unlocked before t.w.Write, leaving the shared sink (issue
+// #10's data race) — and the test's strings.Builder sink — unprotected.
 func (t *teeWriter) Write(p []byte) (int, error) {
 	t.b.mu.Lock()
+	defer t.b.mu.Unlock()
 	t.b.buf.Write(p)
-	t.b.mu.Unlock()
 	return t.w.Write(p)
 }
 
