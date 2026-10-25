@@ -5,15 +5,29 @@ import (
 	"testing"
 	"unicode/utf8"
 
-	tea "github.com/charmbracelet/bubbletea"
+	tea "charm.land/bubbletea/v2"
 
 	"ofa/internal/resolve"
 )
 
 // keyMsg is a tiny helper so tests read like "press space" rather than
-// constructing a bubbletea KeyMsg literal each time.
-func keyMsg(s string) tea.KeyMsg {
-	return tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune(s)}
+// constructing a bubbletea v2 KeyPressMsg literal each time. Special
+// keys map to their v2 Code constants; everything else is a printable
+// keystroke whose Text drives String(). The default branch assumes a
+// single-rune key — multi-rune cases would need their own mapping.
+func keyMsg(s string) tea.KeyPressMsg {
+	switch s {
+	case "up":
+		return tea.KeyPressMsg{Code: tea.KeyUp}
+	case "down":
+		return tea.KeyPressMsg{Code: tea.KeyDown}
+	case "enter":
+		return tea.KeyPressMsg{Code: tea.KeyEnter}
+	case " ":
+		return tea.KeyPressMsg{Code: tea.KeySpace, Text: " "}
+	default:
+		return tea.KeyPressMsg{Code: rune(s[0]), Text: s}
+	}
 }
 
 // updateKey drives the model through one keystroke and returns the
@@ -202,7 +216,7 @@ func TestModel_QuitReturnsQuitOutcome(t *testing.T) {
 
 func TestModel_CtrlCQuits(t *testing.T) {
 	m := fixture()
-	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyCtrlC})
+	updated, _ := m.Update(tea.KeyPressMsg{Code: 'c', Mod: tea.ModCtrl})
 	got := updated.(model)
 	if !got.outcome.Quit {
 		t.Error("ctrl+c should set Quit")
@@ -224,7 +238,7 @@ func TestModel_UnknownKeyIsNoop(t *testing.T) {
 
 func TestView_ContainsItemsAndFooter(t *testing.T) {
 	m := fixture()
-	v := m.View()
+	v := m.View().Content
 	for _, want := range []string{"claude", "qwen", "navigate", "space toggle", "apply", "quit"} {
 		if !contains(v, want) {
 			t.Errorf("View missing %q\n%s", want, v)
@@ -237,7 +251,7 @@ func TestView_ContainsItemsAndFooter(t *testing.T) {
 
 func TestView_HeaderIsBanner(t *testing.T) {
 	m := fixture()
-	v := m.View()
+	v := m.View().Content
 	// The banner is baked with SGR 24-bit color escapes (the orange→blue
 	// fade). Its presence in the View is the contract: every refresh of
 	// the picker re-emits it above the rows.
@@ -257,14 +271,29 @@ func TestView_HeaderIsBanner(t *testing.T) {
 func TestView_QuittingReturnsEmpty(t *testing.T) {
 	m := fixture()
 	m.quitting = true
-	if v := m.View(); v != "" {
+	if v := m.View().Content; v != "" {
 		t.Errorf("quitting View = %q, want empty", v)
+	}
+}
+
+// TestView_UsesAltScreen pins the v2 migration contract: bubbletea v2
+// removed the WithAltScreen program option, so the model must declare
+// alt screen on every view itself or the picker loses its full-screen
+// takeover (and the startup transcript below it).
+func TestView_UsesAltScreen(t *testing.T) {
+	m := fixture()
+	if !m.View().AltScreen {
+		t.Error("View should set AltScreen = true (v2 replaced WithAltScreen)")
+	}
+	m.quitting = true
+	if !m.View().AltScreen {
+		t.Error("quitting View should keep AltScreen until teardown")
 	}
 }
 
 func TestView_CursorMarkOnFirstByDefault(t *testing.T) {
 	m := fixture()
-	v := m.View()
+	v := m.View().Content
 	if !contains(v, ">") {
 		t.Errorf("View should mark cursor with '>', got:\n%s", v)
 	}
@@ -311,7 +340,7 @@ func TestLabelFor(t *testing.T) {
 // blurb text survives wrapping intact (trimmed lines rejoin to tagline).
 func TestView_BlurbBetweenBannerAndFirstRow(t *testing.T) {
 	m := fixture()
-	v := m.View()
+	v := m.View().Content
 	lines := viewLines(v)
 	start, end := blurbBlock(t, v)
 
@@ -350,7 +379,7 @@ func TestView_BlurbBetweenBannerAndFirstRow(t *testing.T) {
 // rows are padded to. A line longer than maxWidth would drift off-center.
 func TestView_BlurbLinesFitFrame(t *testing.T) {
 	m := fixture()
-	v := m.View()
+	v := m.View().Content
 	lines := viewLines(v)
 	start, end := blurbBlock(t, v)
 
@@ -375,7 +404,7 @@ func TestView_BlurbLinesFitFrame(t *testing.T) {
 // baked 24-bit colors.
 func TestView_BlurbHasNoSGR(t *testing.T) {
 	m := fixture()
-	v := m.View()
+	v := m.View().Content
 	_, end := blurbBlock(t, v)
 	lines := viewLines(v)
 	for i := range lines {
