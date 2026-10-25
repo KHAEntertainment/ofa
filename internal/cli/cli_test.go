@@ -1077,3 +1077,64 @@ func TestCheckCmd_MalformedConfigIsError(t *testing.T) {
 		t.Errorf("stderr = %q, want a config error", stderr.String())
 	}
 }
+
+func TestCheckCmd_ReportsShadowedInstalls(t *testing.T) {
+	a, stdout, _, sd, sr, _ := newTestApp(t, []string{"check"}, nil)
+	sd.instances = []detect.Instance{
+		{HarnessID: "opencode", Method: "npm", Package: "opencode-ai", Bin: "opencode", Version: "1.18.35", Status: detect.Active},
+		{HarnessID: "opencode", Method: "brew-formula", Package: "opencode", Bin: "opencode", Version: "1.19.0", Status: detect.Shadowed},
+	}
+	sr.res = []resolve.Resolution{
+		{HarnessID: "opencode", Method: "npm", Package: "opencode-ai", Bin: "opencode", Cur: "1.18.35", Tier: "npm", Latest: "1.19.1", Outdated: true},
+		{HarnessID: "opencode", Method: "brew-formula", Package: "opencode", Bin: "opencode", Cur: "1.19.0", Tier: "brew", Shadowed: true},
+	}
+
+	a.Run()
+
+	lines := strings.Split(stdout.String(), "\n")
+	var shadowed, active int
+	for _, l := range lines {
+		switch {
+		case strings.Contains(l, "[brew]") && strings.Contains(l, "(shadowed)"):
+			shadowed++
+		case strings.Contains(l, "[npm]") && !strings.Contains(l, "(shadowed)"):
+			active++
+		}
+	}
+	if shadowed != 1 || active != 1 {
+		t.Errorf("want one shadowed and one unmarked row, got %d/%d:\n%s", shadowed, active, stdout.String())
+	}
+}
+
+func TestCheckCmd_JSONReportsShadowedStatus(t *testing.T) {
+	a, stdout, _, sd, sr, _ := newTestApp(t, []string{"check", "--json"}, nil)
+	sd.instances = []detect.Instance{
+		{HarnessID: "opencode", Method: "npm", Package: "opencode-ai", Bin: "opencode", Version: "1.18.35", Status: detect.Active},
+		{HarnessID: "opencode", Method: "brew-formula", Package: "opencode", Bin: "opencode", Version: "1.19.0", Status: detect.Shadowed},
+	}
+	sr.res = []resolve.Resolution{
+		{HarnessID: "opencode", Method: "npm", Package: "opencode-ai", Bin: "opencode", Cur: "1.18.35", Tier: "npm"},
+		{HarnessID: "opencode", Method: "brew-formula", Package: "opencode", Bin: "opencode", Cur: "1.19.0", Tier: "brew", Shadowed: true},
+	}
+
+	a.Run()
+
+	var out struct {
+		Harnesses map[string]struct {
+			Installs []struct {
+				Method string `json:"method"`
+				Status string `json:"status"`
+			} `json:"installs"`
+		} `json:"harnesses"`
+	}
+	if err := json.Unmarshal(stdout.Bytes(), &out); err != nil {
+		t.Fatalf("json: %v\n%s", err, stdout.String())
+	}
+	got := map[string]string{}
+	for _, in := range out.Harnesses["opencode"].Installs {
+		got[in.Method] = in.Status
+	}
+	if got["npm"] != "active" || got["brew-formula"] != "shadowed" {
+		t.Errorf("statuses = %v, want npm=active brew-formula=shadowed", got)
+	}
+}

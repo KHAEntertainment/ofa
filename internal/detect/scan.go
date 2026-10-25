@@ -199,9 +199,42 @@ func runVersionCmd(v catalog.CmdSpec, run Runner) (string, bool) {
 	// bare TrimSpace would embed a newline and split the row in half.
 	line, _, _ := strings.Cut(out, "\n")
 	if s := strings.TrimSpace(line); s != "" {
-		return s, true
+		return versionToken(s), true
 	}
 	return "", false
+}
+
+// versionToken extracts the version from a harness's raw `--version` output,
+// which is frequently decorated:
+//
+//	"GitHub Copilot CLI 1.0.103."   -> "1.0.103"
+//	"devin 3000.11.92 (7f4e6498)"   -> "3000.11.92"
+//	"claude 2.1.310 (Claude Code)"  -> "2.1.310"
+//
+// A single token that already starts with a digit is kept whole, so
+// date-shaped and hash-suffixed versions survive intact
+// ("2026.10.22-27dcf5f"). Otherwise the first whitespace-separated token that
+// starts with a digit wins, with trailing sentence punctuation trimmed.
+// Anything without such a token is returned trimmed but otherwise untouched:
+// showing what the tool actually printed beats inventing a version.
+func versionToken(s string) string {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return s
+	}
+	if !strings.ContainsAny(s, " \t") && startsDigit(s) {
+		return strings.TrimRight(s, ".")
+	}
+	for _, f := range strings.Fields(s) {
+		if startsDigit(f) {
+			return strings.TrimRight(f, ".,;:")
+		}
+	}
+	return s
+}
+
+func startsDigit(s string) bool {
+	return s != "" && s[0] >= '0' && s[0] <= '9'
 }
 
 func detectNative(h catalog.Harness, in catalog.Install, run Runner) (*Instance, bool, error) {
@@ -220,7 +253,7 @@ func detectNative(h catalog.Harness, in catalog.Install, run Runner) (*Instance,
 		}
 		return &Instance{
 			HarnessID: h.ID, Method: in.Method, Bin: in.Bin,
-			Path: expanded, Version: strings.TrimSpace(out), Status: Active,
+			Path: expanded, Version: versionToken(out), Status: Active,
 		}, true, nil
 	}
 	return nil, false, nil

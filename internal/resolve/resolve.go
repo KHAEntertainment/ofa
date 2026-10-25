@@ -36,6 +36,7 @@ type Resolution struct {
 	Latest      string // empty for self/none, and for brew when not outdated
 	Outdated    bool   // true iff Latest != "" and cur differs from latest
 	Tier        string // "self" | "brew" | "npm" | "pypi" | "none"
+	Shadowed    bool   // this install is not the live binary on PATH
 	ResolverErr string // non-empty when latest lookup failed; resolution continues
 
 	// Stale marks a latest version served from cache because a refresh
@@ -114,6 +115,7 @@ func Resolve(insts []detect.Instance, harnesses []catalog.Harness, run Runner, g
 			Bin:       inst.Bin,
 			Cur:       inst.Version,
 			Tier:      in.Latest,
+			Shadowed:  inst.Status == detect.Shadowed,
 		}
 		if res.Tier == "" {
 			res.Tier = "self" // default for catalog entries that omit it
