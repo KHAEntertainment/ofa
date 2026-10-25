@@ -21,7 +21,7 @@ scan: 13 harnesses, 0 with updates, 8 updaters available
   mmx          1.0.25         [self]    mmx → updater available
 ```
 
-Exit code is `1` if any install is **known to be outdated**, `0` otherwise — pipe it into your shell scripts. An available updater (a self-tier harness with no version to compare) is reported separately and deliberately does **not** make the exit code `1`, so `ofa check && …` fires when nothing is actually pending.
+Exit code is `1` if any install is **known to be outdated** (and not [pinned](#freezing-a-harness)), `0` otherwise — pipe it into your shell scripts. An available updater (a self-tier harness with no version to compare) is reported separately and deliberately does **not** make the exit code `1`, so `ofa check && …` fires when nothing is actually pending.
 
 ## Why
 
