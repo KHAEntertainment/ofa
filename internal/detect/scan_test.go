@@ -2,9 +2,11 @@ package detect
 
 import (
 	"errors"
+	"fmt"
 	"os/exec"
 	"strings"
 	"testing"
+	"time"
 
 	"ofa/internal/catalog"
 )
@@ -99,5 +101,68 @@ func TestFailureErrorMessage(t *testing.T) {
 	f := Failure{Method: "brew-formula", Err: errors.New("exit status 1")}
 	if got, want := f.Error(), "brew-formula: exit status 1"; got != want {
 		t.Errorf("Failure.Error() = %q, want %q", got, want)
+	}
+}
+
+// TestScan_OutputOrderSurvivesLatencyReordering (issue #8): the parallel
+// version probes must not reorder output. The runner sleeps longest for
+// the earliest installs, so completion order is overwhelmingly inverted
+// relative to catalog order — the assertions pin that instances still
+// come back in catalog order with each probe's own version.
+func TestScan_OutputOrderSurvivesLatencyReordering(t *testing.T) {
+	const n = 8
+	harnesses := make([]catalog.Harness, 0, n)
+	for i := 0; i < n; i++ {
+		bin := fmt.Sprintf("b%d", i)
+		harnesses = append(harnesses, catalog.Harness{
+			ID:   fmt.Sprintf("h%d", i),
+			Name: bin,
+			Installs: []catalog.Install{{
+				Method:  "brew-formula",
+				Package: fmt.Sprintf("p%d", i),
+				Bin:     bin,
+				Latest:  "self", // self-tier → per-install version probe
+				Version: catalog.CmdSpec{Cmd: []string{bin, "--version"}},
+			}},
+		})
+	}
+
+	run := func(name string, args ...string) (string, error) {
+		if name == "brew" && len(args) >= 2 && args[0] == "list" {
+			var b strings.Builder
+			for i := 0; i < n; i++ {
+				fmt.Fprintf(&b, "p%d 1.0.0\n", i)
+			}
+			return b.String(), nil
+		}
+		if len(args) == 1 && args[0] == "--version" {
+			var i int
+			if _, err := fmt.Sscanf(name, "b%d", &i); err != nil {
+				return "", fmt.Errorf("unexpected version probe %q", name)
+			}
+			// First install sleeps longest → finishes last.
+			time.Sleep(time.Duration(n-i) * 4 * time.Millisecond)
+			return fmt.Sprintf("v%d\n", i), nil
+		}
+		return "", fmt.Errorf("unexpected command %s %v", name, args)
+	}
+
+	insts, failures, err := Scan(harnesses, run)
+	if err != nil {
+		t.Fatalf("Scan: %v", err)
+	}
+	if len(failures) != 0 {
+		t.Fatalf("failures = %v, want none", failures)
+	}
+	if len(insts) != n {
+		t.Fatalf("got %d instances, want %d", len(insts), n)
+	}
+	for i, inst := range insts {
+		if want := fmt.Sprintf("h%d", i); inst.HarnessID != want {
+			t.Errorf("instance %d = %s, want %s (output order changed under concurrency)", i, inst.HarnessID, want)
+		}
+		if want := fmt.Sprintf("v%d", i); inst.Version != want {
+			t.Errorf("instance %d version = %q, want %q (slot collision under concurrency)", i, inst.Version, want)
+		}
 	}
 }

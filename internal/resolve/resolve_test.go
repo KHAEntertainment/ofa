@@ -651,6 +651,9 @@ func TestResolve_CacheFreshHitSkipsNetwork(t *testing.T) {
 // TestResolve_CacheExpiredRefetchesAndStores: past the TTL the entry is
 // re-queried and the refreshed answer is written back with the run's clock.
 func TestResolve_CacheExpiredRefetchesAndStores(t *testing.T) {
+	// Pin the default registry so a machine-level custom registry can't
+	// flip this test onto the spawn path (failRunner asserts no spawn).
+	t.Setenv("npm_config_registry", "https://registry.npmjs.org")
 	now := time.Date(2026, 10, 25, 12, 0, 0, 0, time.UTC)
 	key := CacheKey("npm", "@qwen-code/qwen-code")
 	c := newMemCache()
@@ -674,6 +677,9 @@ func TestResolve_CacheExpiredRefetchesAndStores(t *testing.T) {
 // kept for the CLI's stderr warning. ResolverErr stays empty: the
 // resolution is usable, not failed.
 func TestResolve_StaleCacheServedWhenRefreshFails(t *testing.T) {
+	// Pin the default registry: the refresh failure below must come from
+	// the getter, not from a registry-config spawn on some dev machine.
+	t.Setenv("npm_config_registry", "https://registry.npmjs.org")
 	now := time.Date(2026, 10, 25, 12, 0, 0, 0, time.UTC)
 	cachedAt := now.Add(-DefaultTTL - time.Hour)
 	key := CacheKey("npm", "@qwen-code/qwen-code")
@@ -709,6 +715,9 @@ func TestResolve_StaleCacheServedWhenRefreshFails(t *testing.T) {
 // TestResolve_RefreshBypassesFreshCache: --ignore-the-cache still reads
 // through on failure but always queries, and stores the fresh answer.
 func TestResolve_RefreshBypassesFreshCache(t *testing.T) {
+	// Pin the default registry so --refresh queries over HTTP (the fetch
+	// below) rather than spawning on a custom-registry machine.
+	t.Setenv("npm_config_registry", "https://registry.npmjs.org")
 	now := time.Date(2026, 10, 25, 12, 0, 0, 0, time.UTC)
 	key := CacheKey("npm", "@qwen-code/qwen-code")
 	c := newMemCache()

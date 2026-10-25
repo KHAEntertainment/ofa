@@ -145,9 +145,10 @@ func (a *App) Run() ExitCode {
 	case "apply", "update":
 		return a.applyCmd(a.Args[1:])
 	case "--refresh", "-refresh":
-		// Bare picker with the one flag it accepts; everything else
-		// is parsed (or rejected) by pickerCmd's own FlagSet.
-		return a.pickerCmd(a.Args[1:])
+		// Bare picker with the one flag it accepts. Pass the whole
+		// argv (flag included) so pickerCmd's FlagSet actually parses
+		// it — stripping it first made `ofa --refresh` a silent no-op.
+		return a.pickerCmd(a.Args)
 	default:
 		fmt.Fprintf(a.Stderr, "ofa: unknown command %q\n", a.Args[0])
 		a.usage()

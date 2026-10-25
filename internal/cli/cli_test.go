@@ -851,13 +851,17 @@ func TestScan_CarriesLatestCache(t *testing.T) {
 }
 
 // TestRun_RefreshDispatchesToPicker: `ofa --refresh` reaches the picker
-// (which parses the flag) instead of falling through to "unknown
-// command". Tests have no TTY, so the picker bails at its own guard —
-// which is exactly the evidence dispatch worked.
+// AND the flag takes effect (it must survive dispatch into pickerCmd's
+// FlagSet — the original PR stripped it, making the flag a silent
+// no-op). Tests have no TTY, so the picker bails at its own guard after
+// the flag is parsed — which is exactly the evidence dispatch worked.
 func TestRun_RefreshDispatchesToPicker(t *testing.T) {
 	a, _, stderr, _, _, _ := newTestApp(t, []string{"--refresh"}, nil)
 	if code := a.Run(); code != ExitError {
 		t.Errorf("exit = %d, want %d (no TTY)", code, ExitError)
+	}
+	if !a.Refresh {
+		t.Error("--refresh did not survive dispatch: a.Refresh = false, want true")
 	}
 	out := stderr.String()
 	if !strings.Contains(out, "no TTY") {

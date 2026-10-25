@@ -97,7 +97,10 @@ func PrefetchBrew(run Runner) *BrewFuture {
 }
 
 // wait blocks for the query. Resolve calls it at most once, and only
-// when brew-tier installs exist — at most one consumer per future.
+// when brew-tier installs exist — at most one consumer per future. The
+// channel is drained by that read: sharing one Config.Prefetch across
+// two Resolve calls would deadlock the second waiter, which is why the
+// CLI builds a fresh future per invocation and never reuses it.
 func (f *BrewFuture) wait() (*brewResolver, error) {
 	o := <-f.ch
 	return o.res, o.err
@@ -112,6 +115,10 @@ func (f *BrewFuture) wait() (*brewResolver, error) {
 //     the resolution outright,
 //   - a failed fetch with no cache returns the error, exactly as an
 //     uncached run would.
+//
+// A resolved_at in the future (wall clock stepped back between runs)
+// counts as fresh until the clock passes it plus the TTL; --refresh is
+// the deliberate escape hatch rather than negative-age clamping.
 func fetchLatest(cfg Config, tier, pkg string, fetch func() (string, error)) (latest string, stale bool, cachedAt time.Time, err error) {
 	key := CacheKey(tier, pkg)
 	now := cfg.Now()
