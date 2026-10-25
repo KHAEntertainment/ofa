@@ -49,4 +49,6 @@ jobs:
           fi
 
       - name: go test
-        run: go test ./...
+        # -race: issue #10's data race (teeWriter vs shared sink) shipped
+        # green because CI ran without the detector. Keep it on.
+        run: go test -race ./...

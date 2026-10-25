@@ -246,10 +246,10 @@ func TestTailLines(t *testing.T) {
 		want string
 	}{
 		{"", 5, ""},
-		{"a\nb\nc", 5, "a\nb\nc"},                // fewer than n lines: return all
-		{"a\nb\nc\nd\ne", 3, "c\nd\ne"},          // exactly tail
-		{"a\nb\nc\nd\ne", 2, "d\ne"},             // exact n
-		{"a\nb\nc\n", 5, "a\nb\nc"},              // trailing newline trimmed
+		{"a\nb\nc", 5, "a\nb\nc"},       // fewer than n lines: return all
+		{"a\nb\nc\nd\ne", 3, "c\nd\ne"}, // exactly tail
+		{"a\nb\nc\nd\ne", 2, "d\ne"},    // exact n
+		{"a\nb\nc\n", 5, "a\nb\nc"},     // trailing newline trimmed
 	}
 	for _, c := range cases {
 		if got := tailLines(c.in, c.n); got != c.want {
@@ -259,9 +259,12 @@ func TestTailLines(t *testing.T) {
 }
 
 func TestSafeBuffer_ConcurrentWritesAreSerialized(t *testing.T) {
-	// Sanity: concurrent writes through the teed writer don't tear.
+	// Sanity: concurrent writes through the teed writer don't tear —
+	// neither in the captured buffer nor in the shared live sink (issue
+	// #10: the mirror used to be written outside the lock).
 	var b safeBuffer
-	w := b.tee(&strings.Builder{})
+	sink := &strings.Builder{}
+	w := b.tee(sink)
 	done := make(chan struct{}, 2)
 	go func() {
 		for i := 0; i < 1000; i++ {
@@ -280,6 +283,9 @@ func TestSafeBuffer_ConcurrentWritesAreSerialized(t *testing.T) {
 	got := b.String()
 	if lines := strings.Count(got, "\n"); lines != 2000 {
 		t.Errorf("got %d newlines, want 2000", lines)
+	}
+	if lines := strings.Count(sink.String(), "\n"); lines != 2000 {
+		t.Errorf("sink got %d newlines, want 2000 (mirror writes must serialize too)", lines)
 	}
 }
 
