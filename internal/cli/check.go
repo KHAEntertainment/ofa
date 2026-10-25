@@ -31,6 +31,10 @@ func (a *App) checkCmd(args []string) ExitCode {
 	if code != ExitOK {
 		return code
 	}
+	if code := a.loadConfig(); code != ExitOK {
+		return code
+	}
+	a.warnUnknownPins(cat)
 	insts, resolutions, failures, code := a.runPipeline(cat)
 	if code != ExitOK {
 		return code
@@ -50,8 +54,8 @@ func (a *App) checkCmd(args []string) ExitCode {
 
 func (a *App) printCheckHuman(cat []catalog.Harness, resolutions []resolve.Resolution, current *stateFile, drift state.Drift, only string) ExitCode {
 	filtered := filterByHarness(resolutions, only)
-	updateCount := countUpdates(filtered)
-	updaterCount := countUpdaters(filtered)
+	updateCount := countUpdates(filtered, a.Pins)
+	updaterCount := countUpdaters(filtered, a.Pins)
 
 	// Both counts are always printed so the line keeps a fixed shape for
 	// scripts. Only `updateCount` is known-pending, so only it decides the
@@ -64,7 +68,7 @@ func (a *App) printCheckHuman(cat []catalog.Harness, resolutions []resolve.Resol
 	}
 	fmt.Fprintln(a.Stdout)
 	for _, r := range filtered {
-		printUpdateRow(a.Stdout, r)
+		printUpdateRow(a.Stdout, r, a.Pins[r.HarnessID])
 	}
 	if updateCount > 0 {
 		return ExitUpdatesPending
@@ -84,6 +88,7 @@ func (a *App) printCheckJSON(cat []catalog.Harness, resolutions []resolve.Resolu
 		Latest           string `json:"latest,omitempty"`
 		Outdated         bool   `json:"outdated"`
 		UpdaterAvailable bool   `json:"updater_available"`
+		Pinned           bool   `json:"pinned,omitempty"`
 		ResolverErr      string `json:"resolver_error,omitempty"`
 	}
 	type harnessOut struct {
@@ -110,8 +115,8 @@ func (a *App) printCheckJSON(cat []catalog.Harness, resolutions []resolve.Resolu
 		ScannedAt:    current.ScannedAt,
 		HarnessCount: harnessCount(current),
 		InstallCount: installCount(current),
-		UpdateCount:  countUpdates(filtered),
-		UpdaterCount: countUpdaters(filtered),
+		UpdateCount:  countUpdates(filtered, a.Pins),
+		UpdaterCount: countUpdaters(filtered, a.Pins),
 		Harnesses:    map[string]harnessOut{},
 		Drift:        driftJSONPtr(drift),
 		Failures:     failureOutList(failures),
@@ -134,6 +139,7 @@ func (a *App) printCheckJSON(cat []catalog.Harness, resolutions []resolve.Resolu
 			Latest:           r.Latest,
 			Outdated:         r.Outdated,
 			UpdaterAvailable: r.Tier == "self",
+			Pinned:           a.Pins[r.HarnessID],
 			ResolverErr:      r.ResolverErr,
 		})
 		out.Harnesses[r.HarnessID] = ho
@@ -194,12 +200,18 @@ func (a *App) printCheckJSON(cat []catalog.Harness, resolutions []resolve.Resolu
 // cursor-agent) embed extra context after the version, which a fixed
 // width would clip or wrap. The slight ragged right edge is the
 // trade-off for keeping the version visible in full.
-func printUpdateRow(w interface{ Write([]byte) (int, error) }, r resolve.Resolution) {
+func printUpdateRow(w interface{ Write([]byte) (int, error) }, r resolve.Resolution, pinned bool) {
+	// Only annotate rows where the pin actually suppresses something; an
+	// at-latest row says nothing about a pin either way.
+	suffix := ""
+	if pinned && (r.Outdated || r.Tier == "self") {
+		suffix = " (pinned)"
+	}
 	switch {
 	case r.Outdated:
-		fmt.Fprintf(w, "  %-14s %-32s [%s]  %s → %s\n", r.HarnessID, r.Cur, r.Tier, r.Bin, r.Latest)
+		fmt.Fprintf(w, "  %-14s %-32s [%s]  %s → %s%s\n", r.HarnessID, r.Cur, r.Tier, r.Bin, r.Latest, suffix)
 	case r.Tier == "self":
-		fmt.Fprintf(w, "  %-14s %-32s [self]  %s → updater available\n", r.HarnessID, r.Cur, r.Bin)
+		fmt.Fprintf(w, "  %-14s %-32s [self]  %s → updater available%s\n", r.HarnessID, r.Cur, r.Bin, suffix)
 	case r.Tier == "none":
 		fmt.Fprintf(w, "  %-14s %-32s [none]  %s → no update path\n", r.HarnessID, r.Cur, r.Bin)
 	case r.ResolverErr != "":
@@ -231,10 +243,13 @@ func filterByHarness(res []resolve.Resolution, only string) []resolve.Resolution
 //
 // Self-tier installs are deliberately excluded: they carry no Latest, so
 // Outdated is always false for them. See countUpdaters.
-func countUpdates(res []resolve.Resolution) int {
+func countUpdates(res []resolve.Resolution, pins map[string]bool) int {
 	n := 0
 	for _, r := range res {
-		if r.Outdated {
+		// A pinned harness's update is known but deliberately declined, so
+		// it must not set the exit code. That is the whole point of a pin:
+		// scripts keep seeing 0 while the harness is held back.
+		if r.Outdated && !pins[r.HarnessID] {
 			n++
 		}
 	}
@@ -246,10 +261,10 @@ func countUpdates(res []resolve.Resolution) int {
 // these as a pending update is what made `ofa check` say "8 with updates"
 // immediately after a fully successful apply; the two facts are now counted
 // and reported separately.
-func countUpdaters(res []resolve.Resolution) int {
+func countUpdaters(res []resolve.Resolution, pins map[string]bool) int {
 	n := 0
 	for _, r := range res {
-		if r.Tier == "self" {
+		if r.Tier == "self" && !pins[r.HarnessID] {
 			n++
 		}
 	}

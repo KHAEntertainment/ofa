@@ -51,7 +51,7 @@ func fixture() model {
 		{HarnessID: "claude", Method: "native", Bin: "claude", Cur: "2.1.300", Tier: "self"},
 		{HarnessID: "qwen", Method: "npm", Package: "@qwen-code/qwen-code", Bin: "qwen", Cur: "0.22.1", Latest: "0.25.2", Outdated: true, Tier: "npm"},
 		{HarnessID: "codex", Method: "brew-cask", Package: "codex", Bin: "codex", Cur: "0.162.1", Tier: "brew"}, // at-latest → dropped
-	})
+	}, nil)
 	return newModel(items)
 }
 
@@ -60,25 +60,25 @@ func TestBuildItems_FiltersAtLatest(t *testing.T) {
 		{HarnessID: "codex", Tier: "brew"},                  // at-latest
 		{HarnessID: "claude", Tier: "self"},                  // include (updater available)
 		{HarnessID: "qwen", Outdated: true, Tier: "npm"},    // include (outdated)
-	})
+	}, nil)
 	if len(items) != 2 {
 		t.Errorf("want 2 items (at-latest dropped), got %d", len(items))
 	}
 }
 
 func TestRun_NoItemsReturnsEmptyOutcome(t *testing.T) {
-	out, err := Run(nil)
+	out, err := Run(nil, nil)
 	if err != nil {
-		t.Fatalf("Run(nil) err = %v", err)
+		t.Fatalf("Run(nil, nil) err = %v", err)
 	}
 	if out.Quit || out.Apply || len(out.Selected) != 0 {
-		t.Errorf("Run(nil) outcome = %+v, want empty", out)
+		t.Errorf("Run(nil, nil) outcome = %+v, want empty", out)
 	}
 }
 
 func TestRun_AllAtLatestReturnsEmptyOutcome(t *testing.T) {
 	res := []resolve.Resolution{{HarnessID: "x", Tier: "brew"}}
-	out, err := Run(res)
+	out, err := Run(res, nil)
 	if err != nil {
 		t.Fatalf("Run: %v", err)
 	}
@@ -508,4 +508,63 @@ func indexOf(s, sub string) int {
 		}
 	}
 	return -1
+}
+
+func TestBuildItems_MarksPinned(t *testing.T) {
+	items := buildItems([]resolve.Resolution{
+		{HarnessID: "qwen", Outdated: true, Tier: "npm"},
+		{HarnessID: "claude", Tier: "self"},
+	}, map[string]bool{"qwen": true})
+	if len(items) != 2 {
+		t.Fatalf("items = %d, want 2 (pinned rows stay visible)", len(items))
+	}
+	if !items[0].Pinned {
+		t.Error("qwen should be marked pinned")
+	}
+	if items[1].Pinned {
+		t.Error("claude should not be marked pinned")
+	}
+}
+
+func TestModel_PinnedRowsAreNotSelectable(t *testing.T) {
+	m := newModel(buildItems([]resolve.Resolution{
+		{HarnessID: "qwen", Outdated: true, Tier: "npm"},
+		{HarnessID: "claude", Tier: "self"},
+	}, map[string]bool{"qwen": true}))
+
+	// The cursor starts on the first selectable row, skipping the pin.
+	if m.cursor != 1 {
+		t.Fatalf("cursor = %d, want 1 (first unpinned row)", m.cursor)
+	}
+
+	m = updateKey(t, m, "k")
+	if m.cursor != 1 {
+		t.Errorf("up from the first unpinned row moved to %d, want to stay at 1", m.cursor)
+	}
+
+	m = updateKey(t, m, "a")
+	if len(m.SelectedIndices()) != 1 || !m.selected[1] {
+		t.Errorf("a should select only the unpinned row, got %v", m.SelectedIndices())
+	}
+
+	// A space while a pinned row is somehow highlighted is a no-op.
+	m2 := newModel(buildItems([]resolve.Resolution{
+		{HarnessID: "qwen", Outdated: true, Tier: "npm"},
+	}, map[string]bool{"qwen": true}))
+	m2 = updateKey(t, m2, " ")
+	if len(m2.SelectedIndices()) != 0 {
+		t.Errorf("space selected a pinned row: %v", m2.SelectedIndices())
+	}
+}
+
+func TestView_PinnedRowIsAnnotated(t *testing.T) {
+	m := newModel(buildItems([]resolve.Resolution{
+		{HarnessID: "qwen", Bin: "qwen", Cur: "0.22.1", Latest: "0.25.2", Outdated: true, Tier: "npm"},
+		{HarnessID: "claude", Tier: "self"},
+	}, map[string]bool{"qwen": true}))
+
+	v := m.View().Content
+	if !contains(v, "(pinned)") {
+		t.Errorf("View should annotate the pinned row, got:\n%s", v)
+	}
 }

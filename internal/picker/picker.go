@@ -29,8 +29,11 @@ type Outcome struct {
 
 // Run opens the picker over the given resolutions. It blocks until the
 // user quits or applies. The Outcome tells the caller what to do next.
-func Run(resolutions []resolve.Resolution) (Outcome, error) {
-	items := buildItems(resolutions)
+//
+// pins names harness ids the user froze: those rows are still shown (so the
+// screen matches `ofa check`) but are dimmed and cannot be selected.
+func Run(resolutions []resolve.Resolution, pins map[string]bool) (Outcome, error) {
+	items := buildItems(resolutions, pins)
 	if len(items) == 0 {
 		// Nothing to do — short-circuit so the caller doesn't have to
 		// spin up a TUI just to display "nothing to apply".
@@ -57,9 +60,12 @@ func Run(resolutions []resolve.Resolution) (Outcome, error) {
 type item struct {
 	Resolution resolve.Resolution
 	Label      string
+	// Pinned marks a harness frozen in the user config. Kept as a row so
+	// the picker shows the same set as `ofa check`, but never selectable.
+	Pinned bool
 }
 
-func buildItems(res []resolve.Resolution) []item {
+func buildItems(res []resolve.Resolution, pins map[string]bool) []item {
 	out := make([]item, 0, len(res))
 	for _, r := range res {
 		// Only items with an update available appear in the picker. At-
@@ -70,7 +76,7 @@ func buildItems(res []resolve.Resolution) []item {
 		if !r.Outdated && r.Tier != "self" {
 			continue
 		}
-		out = append(out, item{Resolution: r, Label: labelFor(r)})
+		out = append(out, item{Resolution: r, Label: labelFor(r), Pinned: pins[r.HarnessID]})
 	}
 	return out
 }

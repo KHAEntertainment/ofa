@@ -15,15 +15,36 @@ import (
 // invariants (selected only indexes existing items) enforceable.
 type model struct {
 	items    []item
-	cursor   int            // index of the highlighted row
-	selected map[int]bool   // selection set, keyed by row index
-	quitting bool           // true once user has chosen to leave
-	outcome  Outcome        // what Run() should return
+	cursor   int          // index of the highlighted row
+	selected map[int]bool // selection set, keyed by row index
+	quitting bool         // true once user has chosen to leave
+	outcome  Outcome      // what Run() should return
 }
 
-// newModel builds an empty-selection model for the given items.
+// newModel builds an empty-selection model for the given items, with the
+// cursor on the first selectable (unpinned) row.
 func newModel(items []item) model {
-	return model{items: items, selected: map[int]bool{}}
+	m := model{items: items, selected: map[int]bool{}}
+	for i, it := range items {
+		if !it.Pinned {
+			m.cursor = i
+			break
+		}
+	}
+	return m
+}
+
+// nextSelectable moves the cursor by delta until it lands on an unpinned row.
+// It is a no-op when there is nothing selectable in that direction, so the
+// cursor never rests on a pinned row.
+func (m model) nextSelectable(delta int) model {
+	for i := m.cursor + delta; i >= 0 && i < len(m.items); i += delta {
+		if !m.items[i].Pinned {
+			m.cursor = i
+			return m
+		}
+	}
+	return m
 }
 
 // Init returns the initial command. Nothing to do — the picker is
@@ -50,16 +71,13 @@ func (m model) handleKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 		m.outcome = Outcome{Quit: true}
 		return m, tea.Quit
 	case "up", "k":
-		if m.cursor > 0 {
-			m.cursor--
-		}
-		return m, nil
+		return m.nextSelectable(-1), nil
 	case "down", "j":
-		if m.cursor < len(m.items)-1 {
-			m.cursor++
-		}
-		return m, nil
+		return m.nextSelectable(1), nil
 	case "space":
+		if m.items[m.cursor].Pinned {
+			return m, nil
+		}
 		if m.selected[m.cursor] {
 			delete(m.selected, m.cursor)
 		} else {
@@ -67,17 +85,25 @@ func (m model) handleKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 		}
 		return m, nil
 	case "a":
-		// Toggle: if every row is selected, clear all; otherwise select all.
-		// Three-state would be confusing here; the user can always space
-		// individual rows off after `a`.
-		allSelected := len(m.items) > 0
-		for i := range m.items {
+		// Toggle: if every selectable row is selected, clear all; otherwise
+		// select all. Three-state would be confusing here; the user can
+		// always space individual rows off after `a`. Pinned rows are
+		// neither selected nor cleared — they have no checkbox state.
+		allSelected := false
+		for i, it := range m.items {
+			if it.Pinned {
+				continue
+			}
+			allSelected = true
 			if !m.selected[i] {
 				allSelected = false
 				break
 			}
 		}
-		for i := range m.items {
+		for i, it := range m.items {
+			if it.Pinned {
+				continue
+			}
 			m.selected[i] = !allSelected
 		}
 		return m, nil
@@ -223,6 +249,9 @@ func (m model) frame() string {
 	maxWidth := 0
 	for _, it := range m.items {
 		w := 6 + utf8.RuneCountInString(it.Label)
+		if it.Pinned {
+			w += len(" (pinned)")
+		}
 		if w > maxWidth {
 			maxWidth = w
 		}
@@ -266,7 +295,13 @@ func (m model) frame() string {
 		if m.selected[i] {
 			check = "x"
 		}
-		fmt.Fprintf(&b, "%s[%s] %s\n", cursor, check, it.Label)
+		label := it.Label
+		if it.Pinned {
+			// Dim + explicit suffix: the row matches `ofa check` instead of
+			// vanishing, and explains why space does nothing.
+			label = "\x1b[2m" + label + " (pinned)\x1b[0m"
+		}
+		fmt.Fprintf(&b, "%s[%s] %s\n", cursor, check, label)
 	}
 	b.WriteString("\n↑/↓ navigate · space toggle · a all · enter apply · q quit\n")
 	return b.String()
