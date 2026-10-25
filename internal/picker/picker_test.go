@@ -13,7 +13,8 @@ import (
 // keyMsg is a tiny helper so tests read like "press space" rather than
 // constructing a bubbletea v2 KeyPressMsg literal each time. Special
 // keys map to their v2 Code constants; everything else is a printable
-// keystroke whose Text drives String().
+// keystroke whose Text drives String(). The default branch assumes a
+// single-rune key — multi-rune cases would need their own mapping.
 func keyMsg(s string) tea.KeyPressMsg {
 	switch s {
 	case "up":
