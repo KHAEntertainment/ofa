@@ -2,6 +2,10 @@
 
 A single command to detect, version-check, and update every coding harness on your machine.
 
+<p align="center">
+  <img src="./docs/screenshot.png" alt="The OFA interactive picker listing installed harnesses and their available updates" width="638">
+</p>
+
 `ofa` knows about Claude Code, Codex, opencode, Kimi, Cursor's agent, GitHub Copilot, Antigravity (`agy`), Devin, CodeRabbit, and the rest of the popular CLI harnesses. It scans what's installed, asks each package manager / self-updater whether anything's available, and runs the update — interactive picker or one-shot.
 
 ```
