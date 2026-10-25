@@ -134,7 +134,7 @@ func (a *App) printCheckJSON(cat []catalog.Harness, resolutions []resolve.Resolu
 			Package:          r.Package,
 			Bin:              r.Bin,
 			Version:          r.Cur,
-			Status:           "active", // resolutions don't carry shadow; left for v2
+			Status:           statusString(r),
 			Tier:             r.Tier,
 			Latest:           r.Latest,
 			Outdated:         r.Outdated,
@@ -204,8 +204,13 @@ func printUpdateRow(w interface{ Write([]byte) (int, error) }, r resolve.Resolut
 	// Only annotate rows where the pin actually suppresses something; an
 	// at-latest row says nothing about a pin either way.
 	suffix := ""
+	// Shadowed is a fact about the install, so it is always marked; the pin
+	// is only worth marking where it suppresses something.
+	if r.Shadowed {
+		suffix += " (shadowed)"
+	}
 	if pinned && (r.Outdated || r.Tier == "self") {
-		suffix = " (pinned)"
+		suffix += " (pinned)"
 	}
 	switch {
 	case r.Outdated:
@@ -213,12 +218,21 @@ func printUpdateRow(w interface{ Write([]byte) (int, error) }, r resolve.Resolut
 	case r.Tier == "self":
 		fmt.Fprintf(w, "  %-14s %-32s [self]  %s → updater available%s\n", r.HarnessID, r.Cur, r.Bin, suffix)
 	case r.Tier == "none":
-		fmt.Fprintf(w, "  %-14s %-32s [none]  %s → no update path\n", r.HarnessID, r.Cur, r.Bin)
+		fmt.Fprintf(w, "  %-14s %-32s [none]  %s → no update path%s\n", r.HarnessID, r.Cur, r.Bin, suffix)
 	case r.ResolverErr != "":
-		fmt.Fprintf(w, "  %-14s %-32s [%s]  %s → (resolver error: %s)\n", r.HarnessID, r.Cur, r.Tier, r.Bin, r.ResolverErr)
+		fmt.Fprintf(w, "  %-14s %-32s [%s]  %s → (resolver error: %s)%s\n", r.HarnessID, r.Cur, r.Tier, r.Bin, r.ResolverErr, suffix)
 	default:
-		fmt.Fprintf(w, "  %-14s %-32s [%s]  %s (at latest)\n", r.HarnessID, r.Cur, r.Tier, r.Bin)
+		fmt.Fprintf(w, "  %-14s %-32s [%s]  %s (at latest)%s\n", r.HarnessID, r.Cur, r.Tier, r.Bin, suffix)
 	}
+}
+
+// statusString names an install the way state.json does, so `check --json`
+// and the state file agree on "active" vs "shadowed".
+func statusString(r resolve.Resolution) string {
+	if r.Shadowed {
+		return "shadowed"
+	}
+	return "active"
 }
 
 // filterByHarness filters resolutions to those matching the given harness id.

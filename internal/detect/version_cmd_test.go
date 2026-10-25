@@ -49,7 +49,10 @@ func TestBuildInstances_SelfTierAsksTheBinary(t *testing.T) {
 	if len(insts) != 1 {
 		t.Fatalf("instances = %d, want 1", len(insts))
 	}
-	if got, want := insts[0].Version, "GitHub Copilot CLI 1.0.103."; got != want {
+	// The binary's answer, normalized to the version token: the raw string is
+	// "GitHub Copilot CLI 1.0.103." and publishing that verbatim breaks both
+	// column alignment and any consumer parsing `version`.
+	if got, want := insts[0].Version, "1.0.103"; got != want {
 		t.Errorf("version = %q, want %q (the binary's answer, not npm's stale record)", got, want)
 	}
 	if strings.Contains(insts[0].Version, "1.0.80") {
@@ -158,7 +161,30 @@ func TestRunVersionCmd_UsesFirstLineOnly(t *testing.T) {
 	if strings.ContainsAny(got, "\n\r") {
 		t.Errorf("version contains a newline: %q", got)
 	}
-	if got != "GitHub Copilot CLI 1.0.103." {
-		t.Errorf("got %q, want only the first line", got)
+	if got != "1.0.103" {
+		t.Errorf("got %q, want the version token from the first line", got)
+	}
+}
+
+func TestVersionToken(t *testing.T) {
+	cases := []struct{ in, want string }{
+		// decorated real-world outputs
+		{"GitHub Copilot CLI 1.0.103.", "1.0.103"},
+		{"devin 3000.11.92 (7f4e64980e22)", "3000.11.92"},
+		{"claude 2.1.310 (Claude Code)", "2.1.310"},
+		{"mmx 1.0.25", "1.0.25"},
+		{"kimi version 2.3.1\nsome hint", "2.3.1"},
+		// already-clean single tokens survive intact
+		{"1.19.4", "1.19.4"},
+		{"2026.10.22-27dcf5f", "2026.10.22-27dcf5f"},
+		{"0.0.0-beta-18743", "0.0.0-beta-18743"},
+		// nothing version-shaped: keep what the tool said
+		{"no version here", "no version here"},
+		{"", ""},
+	}
+	for _, c := range cases {
+		if got := versionToken(c.in); got != c.want {
+			t.Errorf("versionToken(%q) = %q, want %q", c.in, got, c.want)
+		}
 	}
 }

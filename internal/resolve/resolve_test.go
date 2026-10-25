@@ -827,3 +827,24 @@ func TestNpmrcRegistryParsing(t *testing.T) {
 		t.Error("missing file should not report a registry")
 	}
 }
+
+func TestResolve_CarriesShadowStatus(t *testing.T) {
+	insts := []detect.Instance{
+		{HarnessID: "x", Method: "native", Bin: "x", Version: "1.0", Status: detect.Active},
+		{HarnessID: "x", Method: "naitve2", Bin: "x2", Version: "2.0", Status: detect.Shadowed},
+	}
+	cat := []catalog.Harness{{ID: "x", Installs: []catalog.Install{
+		{Method: "native", Bin: "x", Latest: "none"},
+		{Method: "naitve2", Bin: "x2", Latest: "none"},
+	}}}
+	got := Resolve(insts, cat, nil, nil, Config{})
+	if len(got) != 2 {
+		t.Fatalf("resolutions = %d, want 2", len(got))
+	}
+	if got[0].Shadowed {
+		t.Error("first resolution should be active")
+	}
+	if !got[1].Shadowed {
+		t.Error("second resolution should be shadowed")
+	}
+}

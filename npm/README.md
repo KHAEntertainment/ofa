@@ -200,7 +200,7 @@ Two-layer registry:
 1. **Catalog** — a directory of TOML files, one per harness, embedded into the binary at build time. Adding a new harness is adding a file.
 2. **State** — `~/.config/ofa/state.json`, the result of the last scan on this machine, used to compute drift (added / removed / changed).
 
-Detection is deterministic. Each install method (`brew-formula`, `brew-cask`, `npm`, `pipx`, `uv`, `native`) has its own backend behind a `Detector` interface; new methods add a backend, not new code in the resolver.
+Detection is deterministic. Each install method (`brew-formula`, `brew-cask`, `npm`, `pipx`, `uv`, `native`) is a labeled branch in `internal/detect/methods.go` that shells out and parses the package manager's own output, plus a catalog `method` value on the entries that use it. Adding a method means a parser, a `latest` tier, and catalog rows — no change to the resolver.
 
 Resolution is per-tier and runs concurrently: the single `brew outdated --json` call overlaps the per-package lookups instead of queueing behind them. `npm` queries the public registry's JSON API directly — one HTTP GET per package, no `npm view` process spawn — and falls back to `npm view <pkg> version` only when a custom registry is configured in `.npmrc`/env, where npm itself must apply the config. `pypi` resolves via the PyPI JSON API; `self` reports "updater available" without fabricating a version diff; `none` is report-only.
 
@@ -214,9 +214,12 @@ Updates are delegated to native updaters. `ofa apply` never reimplements an upda
 
 ```
 $ ofa check
-  opencode     1.18.35       [npm]  opencode → 1.19.1        (active, stale)
-  opencode     1.19.0        [brew] opencode (at latest)      (shadowed)
+  opencode       1.18.35                          [npm]   opencode → 1.19.1
+  opencode       1.19.0                           [brew]  opencode (at latest) (shadowed)
 ```
+
+The shadowed row is marked in the table, and `check --json` carries
+`"status": "shadowed"` for it, so scripts can see which copy is live.
 
 ## Supported harnesses
 
@@ -240,7 +243,7 @@ Adding a harness is a PR with a TOML file. See [`internal/catalog/data/agy.toml`
 
 ## Platform
 
-v1 is macOS-only. The seam for cross-platform is the `Detector` interface — Windows (WSL) and Linux are additive, not a rewrite. The `update.cmd` field is data, not code, so a Linux update path is a new field on the same catalog entry.
+v1 is macOS-only. Cross-platform is additive by design, with two seams that already exist: install methods are a catalog `method` value plus a small parser in `internal/detect/methods.go` (not a plugin interface), and `update.cmd` is data, so a Linux update path is a new field on the same catalog entry rather than new code.
 
 ## Roadmap
 
@@ -250,7 +253,7 @@ and uncommitted to any date.
 
 ### Medium-term: platform reach
 
-- **Linux detector backends.** `apt`, `dnf`, `snap`, plus the existing npm/pipx/uv/native ones. The `Detector` interface is already the seam; new backends add a file, not a rewrite.
+- **Linux detector backends.** `apt`, `dnf`, `snap`, plus the existing npm/pipx/uv/native ones. Each is a parser branch in `internal/detect/methods.go` plus a `latest` tier and catalog rows — additive, but not a one-file drop-in.
 - **Windows (WSL) and native Windows.** WSL reuses the Linux backends; native Windows adds `scoop`, `winget`, and Windows registry probing for native installs.
 
 ### Long-term: agent-assisted Catalog (`ofa doctor`)
