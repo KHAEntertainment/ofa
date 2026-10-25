@@ -93,6 +93,110 @@ func (m model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	return m, nil
 }
 
+// tagline is the centered blurb under the OFA banner. The lowercase "a"
+// is deliberate: the key handler binds case "a" only, and the footer
+// reads "a all" — uppercase A does nothing.
+const tagline = "One-For-All. Harness Updater. Choose which harnesses to update or press a to update all at once."
+
+// centerWrap wraps text into lines no wider than width columns, then
+// pads every line to exactly width with the same left-biased padding
+// the banner rows use ((extra+1)/2 left), so the blurb sits
+// symmetrically in the same frame as the logomark. Breaking prefers
+// sentence boundaries (readable prose), falling back to greedy word
+// wrap within a sentence that cannot fit the frame; breaks only ever
+// land on spaces. Padding is plain spaces only — no SGR escapes — so
+// the terminal background shows through and the banner's baked colors
+// stay intact.
+func centerWrap(text string, width int) []string {
+	var lines []string
+	var cur []string
+	curW := 0
+	flush := func() {
+		if len(cur) > 0 {
+			lines = append(lines, padCenter(strings.Join(cur, " "), width))
+			cur, curW = nil, 0
+		}
+	}
+	addWord := func(word string) {
+		w := utf8.RuneCountInString(word)
+		if curW > 0 && curW+1+w > width {
+			flush()
+		}
+		if curW > 0 {
+			curW++ // the joining space
+		}
+		cur = append(cur, word)
+		curW += w
+	}
+	for _, group := range sentenceGroups(text) {
+		gw := groupWidth(group)
+		if curW > 0 && curW+1+gw > width {
+			flush()
+		}
+		if curW == 0 && gw > width {
+			// The sentence alone overflows the frame; word-wrap it.
+			for _, w := range group {
+				addWord(w)
+			}
+			continue
+		}
+		if curW > 0 {
+			curW++
+		}
+		cur = append(cur, group...)
+		curW += gw
+	}
+	flush()
+	return lines
+}
+
+// padCenter pads s to exactly width columns of plain spaces, biased
+// (extra+1)/2 to the left — the same frame the banner rows use. Content
+// already at or beyond width is returned unpadded: strings.Repeat panics
+// on a negative count, and breaking an over-long line is centerWrap's
+// job, not the pad's.
+func padCenter(s string, width int) string {
+	extra := width - utf8.RuneCountInString(s)
+	if extra <= 0 {
+		return s
+	}
+	left := strings.Repeat(" ", (extra+1)/2)
+	return left + s + strings.Repeat(" ", extra-len(left))
+}
+
+// sentenceGroups splits words into sentence-sized groups: a group closes
+// after a word ending in '.', '!' or '?' (or when the input runs out).
+// A single unwrapped sentence is one group, so short text yields one
+// line and blank input yields none.
+func sentenceGroups(text string) [][]string {
+	var groups [][]string
+	var cur []string
+	for _, w := range strings.Fields(text) {
+		cur = append(cur, w)
+		if strings.HasSuffix(w, ".") || strings.HasSuffix(w, "!") || strings.HasSuffix(w, "?") {
+			groups = append(groups, cur)
+			cur = nil
+		}
+	}
+	if len(cur) > 0 {
+		groups = append(groups, cur)
+	}
+	return groups
+}
+
+// groupWidth is the rune width of a sentence group including its
+// internal joining spaces.
+func groupWidth(group []string) int {
+	w := 0
+	for i, word := range group {
+		if i > 0 {
+			w++
+		}
+		w += utf8.RuneCountInString(word)
+	}
+	return w
+}
+
 // View renders the picker. Returns empty string when quitting so the
 // alt-screen tears down cleanly.
 func (m model) View() string {
@@ -137,6 +241,10 @@ func (m model) View() string {
 	}
 	for _, line := range strings.Split(banner.Art, "\n") {
 		fmt.Fprintf(&b, "%s%s%s\n", leftPad, line, rightPad)
+	}
+	b.WriteString("\n")
+	for _, line := range centerWrap(tagline, maxWidth) {
+		fmt.Fprintln(&b, line)
 	}
 	b.WriteString("\n")
 	for i, it := range m.items {

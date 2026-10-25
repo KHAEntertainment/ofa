@@ -1,7 +1,9 @@
 package picker
 
 import (
+	"strings"
 	"testing"
+	"unicode/utf8"
 
 	tea "github.com/charmbracelet/bubbletea"
 
@@ -304,8 +306,156 @@ func TestLabelFor(t *testing.T) {
 	}
 }
 
-// contains is a tiny strings.Contains shim so we don't have to import
-// "strings" in this file just for that.
+// TestView_BlurbBetweenBannerAndFirstRow pins the stack order:
+// banner → blank → blurb → blank → rows → blank → footer, and checks the
+// blurb text survives wrapping intact (trimmed lines rejoin to tagline).
+func TestView_BlurbBetweenBannerAndFirstRow(t *testing.T) {
+	m := fixture()
+	v := m.View()
+	lines := viewLines(v)
+	start, end := blurbBlock(t, v)
+
+	bannerLine := -1
+	rowLine := -1
+	for i, l := range lines {
+		if bannerLine < 0 && strings.Contains(l, "\x1b[38;2;") {
+			bannerLine = i
+		}
+		if rowLine < 0 && strings.Contains(l, "[ ] claude") {
+			rowLine = i
+		}
+	}
+	if bannerLine < 0 || bannerLine >= start {
+		t.Errorf("banner (line %d) should end before blurb starts (line %d)\n%s", bannerLine, start, v)
+	}
+	if start == 0 || lines[start-1] != "" {
+		t.Errorf("blurb should be preceded by a blank separator, got %q\n%s", lines[start-1], v)
+	}
+	if end+1 >= len(lines) || lines[end+1] != "" {
+		t.Errorf("blurb should be followed by a blank separator\n%s", v)
+	}
+	if rowLine != end+2 {
+		t.Errorf("first harness row at line %d, want %d (right after blurb + blank)\n%s", rowLine, end+2, v)
+	}
+	// No words lost or invented by the wrap: the trimmed blurb lines
+	// rejoin (whitespace-normalized) to the exact tagline constant.
+	joined := strings.Join(strings.Fields(strings.Join(lines[start:end+1], " ")), " ")
+	if joined != tagline {
+		t.Errorf("blurb text = %q, want %q", joined, tagline)
+	}
+}
+
+// TestView_BlurbLinesFitFrame checks centering: every blurb line's total
+// width (padding included) equals maxWidth, the same frame the banner
+// rows are padded to. A line longer than maxWidth would drift off-center.
+func TestView_BlurbLinesFitFrame(t *testing.T) {
+	m := fixture()
+	v := m.View()
+	lines := viewLines(v)
+	start, end := blurbBlock(t, v)
+
+	width := 0
+	for _, it := range m.items {
+		if w := 6 + utf8.RuneCountInString(it.Label); w > width {
+			width = w
+		}
+	}
+	if end == start {
+		t.Errorf("tagline (%d runes) should wrap to >1 line within a %d-col frame", utf8.RuneCountInString(tagline), width)
+	}
+	for i := start; i <= end; i++ {
+		if got := utf8.RuneCountInString(lines[i]); got != width {
+			t.Errorf("blurb line %d width = %d, want maxWidth %d: %q", i-start+1, got, width, lines[i])
+		}
+	}
+}
+
+// TestView_BlurbHasNoSGR: the blurb must be plain spaces + text. An SGR
+// escape would recolor the rest of the line and clash with the banner's
+// baked 24-bit colors.
+func TestView_BlurbHasNoSGR(t *testing.T) {
+	m := fixture()
+	v := m.View()
+	_, end := blurbBlock(t, v)
+	lines := viewLines(v)
+	for i := range lines {
+		if i > end {
+			break
+		}
+		if strings.HasPrefix(strings.TrimLeft(lines[i], " "), "One-For-All.") || strings.HasPrefix(strings.TrimLeft(lines[i], " "), "Choose which harnesses") {
+			if strings.Contains(lines[i], "\x1b") {
+				t.Errorf("blurb line %q contains an SGR escape", lines[i])
+			}
+		}
+	}
+}
+
+// blurbBlock returns the [start, end] line indexes of the blurb inside a
+// rendered View: the first line containing the tagline's opening, through
+// consecutive non-blank lines.
+func blurbBlock(t *testing.T, v string) (int, int) {
+	t.Helper()
+	lines := viewLines(v)
+	start := -1
+	for i, l := range lines {
+		if strings.Contains(l, "One-For-All. Harness Updater.") {
+			start = i
+			break
+		}
+	}
+	if start < 0 {
+		t.Fatalf("View missing tagline line 1:\n%s", v)
+	}
+	end := start
+	for end+1 < len(lines) && lines[end+1] != "" {
+		end++
+	}
+	return start, end
+}
+
+// TestCenterWrap_NarrowWidthDoesNotPanic: when a single unbreakable word
+// exceeds the frame (narrow terminal / long label), greedy wrapping
+// cannot break it — padCenter must clamp instead of passing a negative
+// count to strings.Repeat (which panics), and the wrapper must still
+// return non-empty lines.
+func TestCenterWrap_NarrowWidthDoesNotPanic(t *testing.T) {
+	lines := centerWrap(tagline, 5) // narrower than "One-For-All."
+	if len(lines) == 0 {
+		t.Fatal("centerWrap at width 5 returned no lines")
+	}
+	for i, l := range lines {
+		if l == "" {
+			t.Errorf("line %d is empty: %q", i, lines)
+		}
+	}
+}
+
+// TestCenterWrap_ShortTextIsOneLine: text already inside the frame comes
+// back as exactly one padded line — no trailing blank line.
+func TestCenterWrap_ShortTextIsOneLine(t *testing.T) {
+	lines := centerWrap("One-For-All. Harness Updater.", 81)
+	if len(lines) != 1 {
+		t.Fatalf("want exactly 1 line, got %d: %q", len(lines), lines)
+	}
+	if got := utf8.RuneCountInString(lines[0]); got != 81 {
+		t.Errorf("padded line width = %d, want 81: %q", got, lines[0])
+	}
+}
+
+// TestCenterWrap_BlankReturnsNoLines: blank input must yield zero lines,
+// not one empty padded line.
+func TestCenterWrap_BlankReturnsNoLines(t *testing.T) {
+	for _, in := range []string{"", "   ", "\t\n "} {
+		if lines := centerWrap(in, 81); len(lines) != 0 {
+			t.Errorf("centerWrap(%q) = %q, want no lines", in, lines)
+		}
+	}
+}
+
+// viewLines splits a rendered View into lines.
+func viewLines(v string) []string { return strings.Split(v, "\n") }
+
+// contains is a tiny strings.Contains shim retained for the tests below.
 func contains(s, sub string) bool {
 	if len(sub) == 0 {
 		return true
