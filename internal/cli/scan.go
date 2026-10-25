@@ -25,7 +25,9 @@ func (a *App) scanCmd(args []string) ExitCode {
 	if code != ExitOK {
 		return code
 	}
-	insts, _, failures, code := a.runPipeline(cat)
+	// Detect only — scan answers "what's installed?", and resolving here
+	// would run every registry query for results scan discards (issue #8).
+	insts, failures, code := a.runDetect(cat)
 	if code != ExitOK {
 		return code
 	}
@@ -34,6 +36,12 @@ func (a *App) scanCmd(args []string) ExitCode {
 		return code
 	}
 	current := reconcileDegraded(prev, state.FromInstances(insts, a.Now()), failures)
+	// Carry the latest-version cache forward: detect doesn't refresh it
+	// (resolve does), so a scan rewrite must not drop what check/picker
+	// cached.
+	if prev != nil {
+		current.Latest = prev.Latest
+	}
 	drift := state.Diff(prev, current)
 
 	if *jsonOut {
@@ -60,13 +68,13 @@ func (a *App) printScanHuman(current *stateFile, prev *stateFile, drift state.Dr
 
 func (a *App) printScanJSON(current *stateFile, drift state.Drift, failures []detect.Failure) ExitCode {
 	type scanOut struct {
-		ScannedAt     string                 `json:"scanned_at"`
-		HarnessCount  int                    `json:"harness_count"`
-		InstallCount  int                    `json:"install_count"`
-		InitialScan   bool                   `json:"initial_scan"`
-		Harnesses     map[string]state.Harness `json:"harnesses"`
-		Drift         *driftJSON             `json:"drift,omitempty"`
-		Failures     []failureOut           `json:"failures,omitempty"`
+		ScannedAt    string                   `json:"scanned_at"`
+		HarnessCount int                      `json:"harness_count"`
+		InstallCount int                      `json:"install_count"`
+		InitialScan  bool                     `json:"initial_scan"`
+		Harnesses    map[string]state.Harness `json:"harnesses"`
+		Drift        *driftJSON               `json:"drift,omitempty"`
+		Failures     []failureOut             `json:"failures,omitempty"`
 	}
 	out := scanOut{
 		ScannedAt:    current.ScannedAt,

@@ -32,9 +32,9 @@ import (
 type ExitCode int
 
 const (
-	ExitOK              ExitCode = 0
-	ExitUpdatesPending  ExitCode = 1
-	ExitError           ExitCode = 2
+	ExitOK             ExitCode = 0
+	ExitUpdatesPending ExitCode = 1
+	ExitError          ExitCode = 2
 )
 
 // version is the build version. It is a var, not a const, so the
@@ -66,7 +66,7 @@ type App struct {
 	// Pipeline functions. Defaults wire detect+resolve+update end-to-end;
 	// tests can stub any layer to skip the shell.
 	DetectFn  func(cat []catalog.Harness, run detect.Runner) ([]detect.Instance, []detect.Failure, error)
-	ResolveFn func(insts []detect.Instance, cat []catalog.Harness, run resolve.Runner, get resolve.Getter) []resolve.Resolution
+	ResolveFn func(insts []detect.Instance, cat []catalog.Harness, run resolve.Runner, get resolve.Getter, cfg resolve.Config) []resolve.Resolution
 
 	// Runners default to real exec / HTTP.
 	DetectRunner  detect.Runner
@@ -76,6 +76,11 @@ type App struct {
 
 	// State file path. Default = config.StatePath().
 	StatePath string
+
+	// Refresh forces resolve to re-query package registries instead of
+	// serving fresh cached latest versions (issue #8). Set by --refresh
+	// on check/apply/picker; default false.
+	Refresh bool
 
 	// Now is injected so tests can pin timestamps.
 	Now func() time.Time
@@ -139,6 +144,10 @@ func (a *App) Run() ExitCode {
 		return a.checkCmd(a.Args[1:])
 	case "apply", "update":
 		return a.applyCmd(a.Args[1:])
+	case "--refresh", "-refresh":
+		// Bare picker with the one flag it accepts; everything else
+		// is parsed (or rejected) by pickerCmd's own FlagSet.
+		return a.pickerCmd(a.Args[1:])
 	default:
 		fmt.Fprintf(a.Stderr, "ofa: unknown command %q\n", a.Args[0])
 		a.usage()
@@ -157,6 +166,8 @@ Usage:
                       --dry-run/--plan prints without executing, --verbose
                       streams installer output; default shows progress lines)
   ofa check --json    machine-readable variant
+  --refresh           re-query registries instead of cached latest versions
+                      (accepted by: ofa, ofa check, ofa apply)
   ofa --version       print version
   ofa --help          this message`)
 }
@@ -173,29 +184,101 @@ func (a *App) loadCatalog() ([]catalog.Harness, ExitCode) {
 	return cat, ExitOK
 }
 
-// runPipeline is the shared scan+resolve step used by check, apply, and
-// scan (well, scan does only the detect half). Returns instances,
-// resolutions, and the detector failures that degraded the run; any of the
-// first two may be empty on error. Exits with ExitError only when detection
-// itself failed outright or when the failures left nothing at all to report,
-// so a single broken package manager cannot zero a scan that other detectors
-// could still answer for.
-func (a *App) runPipeline(cat []catalog.Harness) ([]detect.Instance, []resolve.Resolution, []detect.Failure, ExitCode) {
+// runDetect is the detect half of the pipeline, shared by check/apply/
+// picker (via runPipeline) and by scan (which never resolves — issue #8).
+// Detects installs, reports degraded detectors, and exits ExitError only
+// when detection failed outright or when the failures left nothing at
+// all to report, so a single broken package manager cannot zero a scan
+// that other detectors could still answer for.
+func (a *App) runDetect(cat []catalog.Harness) ([]detect.Instance, []detect.Failure, ExitCode) {
 	insts, failures, err := a.DetectFn(cat, a.DetectRunner)
 	if err != nil {
 		fmt.Fprintf(a.Stderr, "ofa: scan: %v\n", err)
-		return nil, nil, nil, ExitError
+		return nil, nil, ExitError
 	}
 	if len(failures) > 0 {
 		a.reportDetectionFailures(cat, insts, failures)
 		if len(insts) == 0 {
 			// Every result we would have shown came from a detector that
 			// failed, so an empty report would be a lie about this machine.
-			return nil, nil, failures, ExitError
+			return nil, failures, ExitError
 		}
 	}
-	res := a.ResolveFn(insts, cat, a.ResolveRunner, a.ResolveGetter)
+	return insts, failures, ExitOK
+}
+
+// runPipeline is the shared detect+resolve step used by check, apply, and
+// the picker. Returns instances, resolutions, and the detector failures
+// that degraded the run; any of the first two may be empty on error.
+//
+// Before detection it starts `brew outdated` in the background (issue
+// #8): brew is the slowest single query in the pipeline, and overlapping
+// it with the registry sweeps hides most of its cost. Resolution reads
+// and refreshes the latest-version cache in the state file; a changed
+// cache is written back only when a state file already exists — the
+// state file is the scan record, and a latest-only file would corrupt
+// drift.
+func (a *App) runPipeline(cat []catalog.Harness) ([]detect.Instance, []resolve.Resolution, []detect.Failure, ExitCode) {
+	var prefetch *resolve.BrewFuture
+	if catHasBrewTier(cat) {
+		prefetch = resolve.PrefetchBrew(a.ResolveRunner)
+	}
+
+	insts, failures, code := a.runDetect(cat)
+	if code != ExitOK {
+		// The prefetch completes into its own buffer and is collected.
+		return nil, nil, failures, code
+	}
+
+	// Cache load is best-effort: a corrupt state file surfaces through
+	// the commands' own loadState() exactly as it did before the cache
+	// existed, while resolve itself degrades to uncached lookups.
+	prev, _ := loadStateFile(a.StatePath)
+	cache := newLatestCache(prev)
+	res := a.ResolveFn(insts, cat, a.ResolveRunner, a.ResolveGetter, resolve.Config{
+		Cache:    cache,
+		Now:      a.Now,
+		Refresh:  a.Refresh,
+		Prefetch: prefetch,
+	})
+	a.warnStale(res)
+	if prev != nil && cache.isDirty() {
+		prev.Latest = cache.snapshot()
+		if err := saveStateFile(a.StatePath, prev); err != nil {
+			fmt.Fprintf(a.Stderr, "ofa: warning: could not cache latest versions: %v\n", err)
+		}
+	}
 	return insts, res, failures, ExitOK
+}
+
+// catHasBrewTier reports whether the catalog has any brew-tier install,
+// i.e. whether Resolve will need a `brew outdated` query at all — so a
+// brew-less catalog never spawns one, prefetch or not.
+func catHasBrewTier(cat []catalog.Harness) bool {
+	for _, h := range cat {
+		for _, in := range h.Installs {
+			if in.Latest == "brew" {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// warnStale reports resolutions served from cache because a refresh
+// failed (issue #8). Stderr only, so check --json consumers stay clean.
+func (a *App) warnStale(res []resolve.Resolution) {
+	for _, r := range res {
+		if !r.Stale {
+			continue
+		}
+		age := a.Now().Sub(r.CachedAt)
+		if age < 0 {
+			age = 0
+		}
+		fmt.Fprintf(a.Stderr, "warning: %s latest for %s served from cache (%s old, fetched %s); refresh failed: %s\n",
+			r.Tier, r.Package, age.Round(time.Minute), r.CachedAt.Format(time.RFC3339), r.RefreshErr)
+	}
 }
 
 // loadState reads the state file via the state package. Returns nil +

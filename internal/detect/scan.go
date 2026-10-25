@@ -5,9 +5,15 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 
 	"ofa/internal/catalog"
 )
+
+// detectConcurrency bounds the parallel registry sweeps and per-install
+// version probes (issue #8). Eight matches resolve's cap: enough to keep
+// every subprocess in flight on a typical machine without a burst.
+const detectConcurrency = 8
 
 // Failure records a registry detector that could not run, and why. A failure
 // degrades the scan instead of aborting it: other methods still report, and
@@ -30,19 +36,46 @@ func (f Failure) Error() string { return f.Method + ": " + f.Err.Error() }
 // not installed is an empty set, not a failure (see detectRegistry).
 //
 // A non-nil error is reserved for faults that leave nothing to report at all.
+//
+// Registry sweeps run concurrently (issue #8): the package-manager
+// queries are independent, so the stage costs the slowest sweep instead
+// of their sum. Failures are collected in registryMethods order, so
+// reports stay deterministic regardless of completion order.
 func Scan(harnesses []catalog.Harness, run Runner) ([]Instance, []Failure, error) {
+	methods := make([]string, 0, len(registryMethods))
+	for _, m := range registryMethods {
+		if usesRegistryMethod(harnesses, m) {
+			methods = append(methods, m)
+		}
+	}
+
+	type regResult struct {
+		reg registryInstalled
+		err error
+	}
+	results := make([]regResult, len(methods))
+	var wg sync.WaitGroup
+	sem := make(chan struct{}, detectConcurrency)
+	for i, method := range methods {
+		wg.Add(1)
+		go func(i int, method string) {
+			defer wg.Done()
+			sem <- struct{}{}
+			defer func() { <-sem }()
+			reg, err := detectRegistry(method, run)
+			results[i] = regResult{reg: reg, err: err}
+		}(i, method)
+	}
+	wg.Wait()
+
 	regs := map[string]registryInstalled{}
 	var failures []Failure
-	for _, method := range registryMethods {
-		if !usesRegistryMethod(harnesses, method) {
+	for i, method := range methods {
+		if results[i].err != nil {
+			failures = append(failures, Failure{Method: method, Err: results[i].err})
 			continue
 		}
-		reg, err := detectRegistry(method, run)
-		if err != nil {
-			failures = append(failures, Failure{Method: method, Err: err})
-			continue
-		}
-		regs[method] = reg
+		regs[method] = results[i].reg
 	}
 
 	instances, err := buildInstances(harnesses, regs, run)
@@ -65,52 +98,82 @@ func usesRegistryMethod(harnesses []catalog.Harness, method string) bool {
 }
 
 func buildInstances(harnesses []catalog.Harness, regs map[string]registryInstalled, run Runner) ([]Instance, error) {
-	var out []Instance
+	// One job per (harness, install) pair, evaluated concurrently — this
+	// is where the per-binary `--version` spawns live (issue #8). Slots
+	// keep catalog order, so output (and any first error) is deterministic.
+	type slot struct {
+		inst *Instance
+		err  error
+	}
+	n := 0
+	for _, h := range harnesses {
+		n += len(h.Installs)
+	}
+	slots := make([]slot, n)
+	var wg sync.WaitGroup
+	sem := make(chan struct{}, detectConcurrency)
+	i := 0
 	for _, h := range harnesses {
 		for _, in := range h.Installs {
-			switch in.Method {
-			case "native":
-				inst, ok, err := detectNative(h, in, run)
-				if err != nil {
-					return nil, err
-				}
-				if ok {
-					out = append(out, *inst)
-				}
-			default:
-				reg, ok := regs[in.Method]
-				if !ok {
-					continue
-				}
-				ver, found := reg[in.Package]
-				if !found {
-					continue
-				}
-				// A self-updater rewrites its binary outside the package
-				// manager's knowledge — `copilot update` replaced the
-				// binary while npm's tree still recorded 1.0.80, so the
-				// registry value was wrong forever (issue #3). For those
-				// installs ask the binary itself; every other tier keeps
-				// the registry value, which is correct because the package
-				// manager performed the install. A failing version command
-				// falls back rather than losing the install.
-				if in.Latest == "self" {
-					if v, ok := runVersionCmd(in.Version, run); ok {
-						ver = v
-					}
-				}
-				out = append(out, Instance{
-					HarnessID: h.ID,
-					Method:    in.Method,
-					Package:   in.Package,
-					Bin:       in.Bin,
-					Version:   ver,
-					Status:    Active,
-				})
-			}
+			wg.Add(1)
+			go func(i int, h catalog.Harness, in catalog.Install) {
+				defer wg.Done()
+				sem <- struct{}{}
+				defer func() { <-sem }()
+				inst, _, err := instanceFor(h, in, regs, run)
+				slots[i] = slot{inst: inst, err: err}
+			}(i, h, in)
+			i++
+		}
+	}
+	wg.Wait()
+
+	var out []Instance
+	for _, s := range slots {
+		if s.err != nil {
+			return nil, s.err
+		}
+		if s.inst != nil {
+			out = append(out, *s.inst)
 		}
 	}
 	return out, nil
+}
+
+// instanceFor computes one (harness, install) instance — the body of the
+// old serial buildInstances loop, unchanged in behavior: native installs
+// probe their binary, registry installs take the package manager's value,
+// and self-tier installs ask the binary itself because its updater
+// rewrites it behind the registry's back (issue #3: `copilot update`
+// replaced the binary while npm still recorded the old version). A
+// failing version command falls back rather than losing the install.
+func instanceFor(h catalog.Harness, in catalog.Install, regs map[string]registryInstalled, run Runner) (*Instance, bool, error) {
+	switch in.Method {
+	case "native":
+		return detectNative(h, in, run)
+	default:
+		reg, ok := regs[in.Method]
+		if !ok {
+			return nil, false, nil
+		}
+		ver, found := reg[in.Package]
+		if !found {
+			return nil, false, nil
+		}
+		if in.Latest == "self" {
+			if v, ok := runVersionCmd(in.Version, run); ok {
+				ver = v
+			}
+		}
+		return &Instance{
+			HarnessID: h.ID,
+			Method:    in.Method,
+			Package:   in.Package,
+			Bin:       in.Bin,
+			Version:   ver,
+			Status:    Active,
+		}, true, nil
+	}
 }
 
 // runVersionCmd runs an install's declared version command and returns its

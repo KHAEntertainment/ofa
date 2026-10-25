@@ -139,6 +139,7 @@ First run on a machine with no `~/.config/ofa/state.json` auto-scans first, so t
 ```sh
 $ ofa check             # what's outdated? exit 1 if anything pending
 $ ofa check --json      # jq-friendly
+$ ofa check --refresh   # bypass cached latest versions (--refresh also on apply and `ofa`)
 $ ofa apply --dry-run   # show the plan without running
 $ ofa apply --yes       # run all available updates
 $ ofa apply --only pi   # narrow to one harness
@@ -180,7 +181,9 @@ Two-layer registry:
 
 Detection is deterministic. Each install method (`brew-formula`, `brew-cask`, `npm`, `pipx`, `uv`, `native`) has its own backend behind a `Detector` interface; new methods add a backend, not new code in the resolver.
 
-Resolution is per-tier. `brew` resolves via `brew outdated --json`; `npm` via `npm view <pkg> version`; `pypi` (covers `pipx` and `uv`) via the PyPI JSON API; `self` reports "updater available" without fabricating a version diff; `none` is report-only.
+Resolution is per-tier and runs concurrently: the single `brew outdated --json` call overlaps the per-package lookups instead of queueing behind them. `npm` queries the public registry's JSON API directly — one HTTP GET per package, no `npm view` process spawn — and falls back to `npm view <pkg> version` only when a custom registry is configured in `.npmrc`/env, where npm itself must apply the config. `pypi` resolves via the PyPI JSON API; `self` reports "updater available" without fabricating a version diff; `none` is report-only.
+
+Resolved latest versions are cached in `state.json` for 12 hours, so a warm `ofa check` re-answers from cache instead of re-querying six registries. `--refresh` (accepted by `ofa`, `ofa check`, `ofa apply`) bypasses fresh entries, and when a refresh fails offline the stale cached answer is served with a warning on stderr — never a hard failure.
 
 Updates are delegated to native updaters. `ofa apply` never reimplements an update — it runs `brew upgrade <name>`, `npm install -g <pkg>@latest`, or `<bin> update` and reports the outcome.
 

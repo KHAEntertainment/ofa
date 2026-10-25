@@ -29,7 +29,7 @@ func main() {
 		os.Exit(1)
 	}
 	t0 := time.Now()
-	res := resolve.Resolve(insts, cat, resolve.DefaultRunner, resolve.DefaultGetter)
+	res := resolve.Resolve(insts, cat, resolve.DefaultRunner, resolve.DefaultGetter, resolve.Config{})
 	fmt.Printf("Resolved %d installs in %s\n\n", len(res), time.Since(t0).Truncate(time.Millisecond))
 	for _, r := range res {
 		row := fmt.Sprintf("  %-12s %-12s %-22s %-10s", r.HarnessID, r.Method, label(r.Package, r.Bin), r.Tier)
