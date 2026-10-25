@@ -259,7 +259,7 @@ $ # open a PR
 If `ofa doctor` (see [Roadmap](#roadmap)) finds a binary on your machine that doesn't match a catalog entry, it drafts a TOML for you to review and contribute upstream. Doctor is an opt-in command — not part of the default `ofa` path.
 
 Cutting a release (version bump, tag, staged npm publish, Homebrew tap bump) is
-documented in [`docs/RELEASING.md`](./docs/RELEASING.md).
+documented in [`docs/RELEASING.md`](https://github.com/KHAEntertainment/ofa/blob/main/docs/RELEASING.md).
 
 ## License
 

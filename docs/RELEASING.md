@@ -64,8 +64,15 @@ In `KHAEntertainment/homebrew-tap`, edit `Formula/ofa.rb`:
 - `sha256` → checksum of that tarball:
 
 ```sh
-curl -sL https://github.com/KHAEntertainment/ofa/archive/refs/tags/vX.Y.Z.tar.gz | shasum -a 256
+tmp=$(mktemp)
+trap 'rm -f "$tmp"' EXIT
+curl -fsSL --retry 3 -o "$tmp" \
+  https://github.com/KHAEntertainment/ofa/archive/refs/tags/vX.Y.Z.tar.gz
+shasum -a 256 "$tmp"
 ```
+
+`-f` matters: without it `curl` writes an HTTP error body to the file and the
+checksum is of that body, which would publish a formula that can never install.
 
 Then commit and push the tap. Verify with `brew update && brew info ofa`.
 
