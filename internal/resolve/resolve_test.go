@@ -403,10 +403,35 @@ func TestIsNewer(t *testing.T) {
 		// padded zeros: 1.2 → 1.2.0 is not newer
 		{"1.2", "1.2.0", false},
 		{"1.2", "1.3", true},
+		// pre-release build numbers advance numerically (issue #12 follow-up,
+		// seen live as opencode2's 0.0.0-beta-N)
+		{"0.0.0-beta-17823", "0.0.0-beta-18743", true},
+		{"0.0.0-beta-18743", "0.0.0-beta-17823", false},
+		{"1.2.3-rc.1", "1.2.3-rc.2", true},
+		{"1.2.3-rc.2", "1.2.3-rc.1", false},
+		{"1.2.3-beta", "1.2.3-beta.2", true},
+		{"1.2.3-beta.2", "1.2.3-beta", false},
+		// a stable release outranks a pre-release of the same core
+		{"1.2.3-rc.1", "1.2.3", true},
+		{"1.2.3", "1.2.3-rc.1", false},
+		{"0.0.0-beta-18743", "0.0.0", true},
+		{"0.0.0", "0.0.0-beta-18743", false},
+		// build metadata carries no precedence
+		{"1.2.3+build1", "1.2.3", false},
+		{"1.2.3", "1.2.4+abc123", true},
+		{"1.2.3-beta+sha", "1.2.3-beta", false},
+		// date-shaped versions with a build hash: core still decides
+		{"2026.10.22-27dcf5f", "2026.10.29-abc1234", true},
+		{"2026.10.22-27dcf5f", "2026.10.22-abc1234", false},
+		// inconclusive pre-release pairs stay conservative: tag names and
+		// build hashes do not order meaningfully for this purpose
+		{"1.2.3-alpha", "1.2.3-beta", false},
+		{"1.2.3-beta", "1.2.3-alpha", false},
 		// unparseable: conservative no
 		{"foo", "1.0", false},
 		{"", "1.0", false},
 		{"1.0", "", false},
+		{"1.0.0-", "1.0.0", false},
 	}
 	for _, c := range cases {
 		if got := isNewer(c.cur, c.latest); got != c.want {

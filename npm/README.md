@@ -240,7 +240,6 @@ Doctor is opt-in (`ofa doctor` only) and never runs in the default `ofa` path. I
 
 ### Open ideas (not scheduled)
 
-- **Pre-release filtering in version compare.** The comparator only understands dotted numerics, so any version with a pre-release or suffixed segment (e.g. `0.0.0-beta-18743` or `2026.10.22-27dcf5f`) is conservatively treated as "not newer" and never reported as outdated. Semver-aware compare with numeric pre-release ordering and a `stable > pre-release` rule is the intended fix.
 - **Update hooks.** Run a shell command before/after each update (`~/.config/ofa/hooks.toml`).
 - **Version pinning.** Skip updates for harnesses the user wants frozen (`--pin <id>@<version>`).
 - **Schedule.** Optional cron-style background scan + report (no auto-apply — OFA never applies without explicit user action).
