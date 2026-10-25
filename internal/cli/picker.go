@@ -4,9 +4,13 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"os"
 
+	"ofa/internal/catalog"
 	"ofa/internal/picker"
+	"ofa/internal/resolve"
+	"ofa/internal/spinner"
 	"ofa/internal/update"
 )
 
@@ -28,6 +32,39 @@ func isTerminal(f *os.File) bool {
 	return (info.Mode() & os.ModeCharDevice) != 0
 }
 
+// stderrIsTTY is the default StderrIsTTY gate for the picker's loading
+// indicator. It reuses the same cheap ModeCharDevice check as isTerminal, so
+// piped and redirect-to-file stderr get zero spinner bytes. (A character
+// device like /dev/null also passes, which is harmless: the writes vanish.)
+func stderrIsTTY(w io.Writer) bool {
+	f, ok := w.(*os.File)
+	return ok && isTerminal(f)
+}
+
+// pickerPipeline runs detect+resolve with the loading indicator up (issue
+// #12). The indicator writes to stderr, never stdout, and only when stderr is
+// a terminal, so piped/CI runs stay byte-identical. It is stopped — clearing
+// its line — before the caller opens the picker's alt screen, and on every
+// early return via defer.
+//
+// runPipeline reports detection failures, stale caches, and save problems on
+// a.Stderr mid-flight; those writes are routed through the spinner so they
+// erase the indicator line instead of landing on top of it.
+func (a *App) pickerPipeline(cat []catalog.Harness) ([]resolve.Resolution, ExitCode) {
+	var sp *spinner.Spinner
+	if a.StderrIsTTY(a.Stderr) {
+		sp = spinner.Start(a.Stderr, "scanning harnesses", spinner.DefaultTicker)
+	}
+	defer sp.Stop() // nil-safe
+
+	prev := a.Stderr
+	a.Stderr = sp.Writer(prev)
+	defer func() { a.Stderr = prev }()
+
+	_, resolutions, _, code := a.runPipeline(cat)
+	return resolutions, code
+}
+
 // pickerCmd is the interactive default: `ofa` (no subcommand). On a
 // machine with no state.json it auto-scans first (per cli-surface spec)
 // so the very first run still works without a separate `ofa scan` step.
@@ -37,7 +74,8 @@ func isTerminal(f *os.File) bool {
 //  1. If state file is missing → run scan to populate it. The scan's
 //     human output goes to stderr so it isn't erased when the alt-screen
 //     picker takes over.
-//  2. Detect + resolve against the catalog.
+//  2. Detect + resolve against the catalog, with a loading indicator on
+//     stderr when it is a terminal (cleared before the alt screen).
 //  3. Hand resolutions to the picker TUI.
 //  4. If the user pressed Enter on a selection → run update.Apply with
 //     the chosen items and return its exit code.
@@ -81,7 +119,7 @@ func (a *App) pickerCmd(args []string) ExitCode {
 	if code != ExitOK {
 		return code
 	}
-	_, resolutions, _, code := a.runPipeline(cat)
+	resolutions, code := a.pickerPipeline(cat)
 	if code != ExitOK {
 		return code
 	}

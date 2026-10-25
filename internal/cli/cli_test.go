@@ -175,6 +175,93 @@ func TestPickerCmd_AutoScansOnMissingState(t *testing.T) {
 	}
 }
 
+// --- picker loading indicator (issue #12) ---
+
+// stagePicker stubs a minimal one-install pipeline and returns the app plus
+// its stderr buffer.
+func stagePicker(t *testing.T) (*App, *bytes.Buffer, *stubDetect, *stubResolve) {
+	t.Helper()
+	a, _, stderr, sd, sr, _ := newTestApp(t, nil, nil)
+	sd.instances = []detect.Instance{
+		{HarnessID: "claude", Method: "native", Bin: "claude", Version: "2.1.300", Status: detect.Active},
+	}
+	sr.res = []resolve.Resolution{{HarnessID: "claude", Tier: "self"}}
+	return a, stderr, sd, sr
+}
+
+func TestPickerPipeline_NonTTYEmitsNoSpinnerBytes(t *testing.T) {
+	a, stderr, _, _ := stagePicker(t)
+	a.StderrIsTTY = func(io.Writer) bool { return false }
+
+	res, code := a.pickerPipeline(testCatalog(t))
+	if code != ExitOK {
+		t.Fatalf("pickerPipeline exit = %d, want %d", code, ExitOK)
+	}
+	if len(res) != 1 {
+		t.Fatalf("resolutions = %d, want 1", len(res))
+	}
+	if stderr.Len() != 0 {
+		t.Errorf("stderr = %q, want zero bytes with a non-TTY gate", stderr.String())
+	}
+}
+
+func TestPickerPipeline_TTYDrawsAndClearsSpinner(t *testing.T) {
+	a, stderr, _, _ := stagePicker(t)
+	a.StderrIsTTY = func(io.Writer) bool { return true }
+
+	if _, code := a.pickerPipeline(testCatalog(t)); code != ExitOK {
+		t.Fatalf("pickerPipeline exit = %d, want %d", code, ExitOK)
+	}
+
+	got := stderr.String()
+	if !strings.Contains(got, "⠋") {
+		t.Errorf("stderr = %q, want a braille spinner frame", got)
+	}
+	if !strings.Contains(got, "scanning harnesses") {
+		t.Errorf("stderr = %q, want the spinner caption", got)
+	}
+	// The line must be erased before the picker takes the alt screen; Stop
+	// is the last writer, so the capture ends on the clear sequence.
+	if !strings.HasSuffix(got, "\r\033[2K") {
+		t.Errorf("stderr ends with %q, want the spinner line cleared", got)
+	}
+}
+
+func TestStderrIsTTY(t *testing.T) {
+	if stderrIsTTY(&bytes.Buffer{}) {
+		t.Error("bytes.Buffer must not be treated as a TTY")
+	}
+	f, err := os.CreateTemp(t.TempDir(), "out")
+	if err != nil {
+		t.Fatalf("CreateTemp: %v", err)
+	}
+	defer f.Close()
+	if stderrIsTTY(f) {
+		t.Error("a regular file must not be treated as a TTY")
+	}
+}
+
+// TestSubcommands_EmitNoSpinnerBytes pins the other half of the issue's
+// contract: the loading indicator is picker-only, so script-facing
+// subcommands must never emit carriage returns or braille frames.
+func TestSubcommands_EmitNoSpinnerBytes(t *testing.T) {
+	for _, cmd := range []string{"check", "scan"} {
+		t.Run(cmd, func(t *testing.T) {
+			a, _, stderr, sd, sr, _ := newTestApp(t, []string{cmd}, nil)
+			sd.instances = []detect.Instance{
+				{HarnessID: "claude", Method: "native", Bin: "claude", Version: "2.1.300", Status: detect.Active},
+			}
+			sr.res = []resolve.Resolution{{HarnessID: "claude", Tier: "self"}}
+
+			a.Run()
+
+			if got := stderr.String(); strings.ContainsAny(got, "\r⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏") {
+				t.Errorf("%s stderr = %q, want no spinner bytes", cmd, got)
+			}
+		})
+	}
+}
+
 // --- filterByHarness / countUpdates / buildRequests ---
 
 func TestFilterByHarness(t *testing.T) {

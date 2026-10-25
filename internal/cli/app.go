@@ -84,6 +84,12 @@ type App struct {
 
 	// Now is injected so tests can pin timestamps.
 	Now func() time.Time
+
+	// StderrIsTTY reports whether the picker may animate its loading
+	// indicator (issue #12). The default reuses the stat-based isTerminal
+	// check; tests override it to exercise both gates without needing a
+	// real terminal.
+	StderrIsTTY func(io.Writer) bool
 }
 
 // New constructs an App with defaults wired.
@@ -116,6 +122,7 @@ func New(args []string, stdin io.Reader, stdout, stderr io.Writer) *App {
 		UpdateExec:    update.DefaultExecutor,
 		StatePath:     config.StatePath(),
 		Now:           time.Now,
+		StderrIsTTY:   stderrIsTTY,
 	}
 }
 
