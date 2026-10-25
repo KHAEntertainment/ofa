@@ -162,6 +162,31 @@ $ ofa scan              # detect + write state, report drift since last scan
 }
 ```
 
+### Freezing a harness
+
+Pin a harness in `~/.config/ofa/config.toml` (create it yourself; OFA never
+writes it) to hold it at its installed version:
+
+```toml
+# Harness ids to freeze. Updates are never offered or applied for these.
+pins = ["opencode"]
+```
+
+A pinned harness still shows up in `ofa check` and the picker, marked
+`(pinned)`, but it no longer counts toward the exit code — so scripts keep
+seeing `0` while it is held back. `ofa apply --only <pinned-id>` also skips it:
+the pin is authoritative. Remove the id to update again.
+
+Two limits worth knowing:
+
+- **Freezing, not version targeting.** OFA delegates every update to the
+  harness's own updater (`brew upgrade`, `npm i -g …@latest`), which cannot
+  install an arbitrary version. A pin means "do not update", not "stay on
+  exactly 1.2.3".
+- **Typos are visible, not silent.** An unknown key fails the command, and a pin
+  id that is not in the Catalog produces a warning — so a misspelled pin cannot
+  look like it worked while OFA updates the harness anyway.
+
 ## How it works
 
 ```
@@ -241,7 +266,6 @@ Doctor is opt-in (`ofa doctor` only) and never runs in the default `ofa` path. I
 ### Open ideas (not scheduled)
 
 - **Update hooks.** Run a shell command before/after each update (`~/.config/ofa/hooks.toml`).
-- **Version pinning.** Skip updates for harnesses the user wants frozen (`--pin <id>@<version>`).
 - **Schedule.** Optional cron-style background scan + report (no auto-apply — OFA never applies without explicit user action).
 
 ## Contributing

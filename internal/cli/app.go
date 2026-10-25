@@ -90,6 +90,15 @@ type App struct {
 	// check; tests override it to exercise both gates without needing a
 	// real terminal.
 	StderrIsTTY func(io.Writer) bool
+
+	// ConfigLoader reads the user config (~/.config/ofa/config.toml).
+	// Defaults to config.Load; tests override so they never read the
+	// developer's real config.
+	ConfigLoader func() (config.Config, error)
+
+	// Pins is the pin set from the loaded config: harness ids the user
+	// froze. Nil when nothing is pinned, and nil-safe to index.
+	Pins map[string]bool
 }
 
 // New constructs an App with defaults wired.
@@ -123,6 +132,7 @@ func New(args []string, stdin io.Reader, stdout, stderr io.Writer) *App {
 		StatePath:     config.StatePath(),
 		Now:           time.Now,
 		StderrIsTTY:   stderrIsTTY,
+		ConfigLoader:  config.Load,
 	}
 }
 
@@ -178,6 +188,41 @@ Usage:
                       (accepted by: ofa, ofa check, ofa apply)
   ofa --version       print version
   ofa --help          this message`)
+}
+
+// loadConfig reads the user config and records its pins on the App. A
+// malformed config is a hard error rather than a silent default: ignoring a
+// broken pin would let OFA update something the user meant to freeze.
+func (a *App) loadConfig() ExitCode {
+	cfg, err := a.ConfigLoader()
+	if err != nil {
+		fmt.Fprintf(a.Stderr, "ofa: config: %v\n", err)
+		return ExitError
+	}
+	a.Pins = cfg.PinSet()
+	return ExitOK
+}
+
+// warnUnknownPins flags pin ids that do not exist in the catalog, so a typo
+// does not silently pin nothing.
+func (a *App) warnUnknownPins(cat []catalog.Harness) {
+	if len(a.Pins) == 0 {
+		return
+	}
+	known := make(map[string]bool, len(cat))
+	for _, h := range cat {
+		known[h.ID] = true
+	}
+	var unknown []string
+	for id := range a.Pins {
+		if !known[id] {
+			unknown = append(unknown, id)
+		}
+	}
+	sortStrings(unknown)
+	for _, id := range unknown {
+		fmt.Fprintf(a.Stderr, "ofa: warning: config pins %q, which is not in the catalog\n", id)
+	}
 }
 
 // loadCatalog is a thin wrapper that prints the error and returns a

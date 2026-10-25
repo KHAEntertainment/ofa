@@ -43,12 +43,16 @@ func (a *App) applyCmd(args []string) ExitCode {
 	if code != ExitOK {
 		return code
 	}
+	if code := a.loadConfig(); code != ExitOK {
+		return code
+	}
+	a.warnUnknownPins(cat)
 	_, resolutions, _, code := a.runPipeline(cat)
 	if code != ExitOK {
 		return code
 	}
 
-	requests, skipReasons := buildRequests(cat, filterByHarness(resolutions, *only), *verbose)
+	requests, skipReasons := buildRequests(cat, filterByHarness(resolutions, *only), *verbose, a.Pins)
 	for label, reason := range skipReasons {
 		fmt.Fprintf(a.Stderr, "ofa: skip %s: %s\n", label, reason)
 	}
@@ -99,7 +103,7 @@ func (a *App) applyCmd(args []string) ExitCode {
 // update.cmd. Resolutions whose harness isn't in the catalog or whose
 // update.cmd is empty are dropped (with a reason) — shouldn't happen in
 // practice, but a stray catalog entry shouldn't crash the run.
-func buildRequests(cat []catalog.Harness, resolutions []resolve.Resolution, verbose bool) ([]update.Request, map[string]string) {
+func buildRequests(cat []catalog.Harness, resolutions []resolve.Resolution, verbose bool, pins map[string]bool) ([]update.Request, map[string]string) {
 	byID := map[string]catalog.Harness{}
 	for _, h := range cat {
 		byID[h.ID] = h
@@ -110,6 +114,13 @@ func buildRequests(cat []catalog.Harness, resolutions []resolve.Resolution, verb
 		// Only outdated + self-tier have updates to apply. Tier=none and
 		// at-latest installs are reported by check but skipped here.
 		if !(r.Outdated || r.Tier == "self") {
+			continue
+		}
+		// A pin is authoritative: it suppresses the update even under
+		// --only, so `ofa apply --only <pinned>` cannot quietly ignore a
+		// freeze. Unpin in the config to update.
+		if pins[r.HarnessID] {
+			skipReasons[labelFor(r)] = "pinned in config"
 			continue
 		}
 		h, ok := byID[r.HarnessID]

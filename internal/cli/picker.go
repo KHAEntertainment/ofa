@@ -119,12 +119,16 @@ func (a *App) pickerCmd(args []string) ExitCode {
 	if code != ExitOK {
 		return code
 	}
+	if code := a.loadConfig(); code != ExitOK {
+		return code
+	}
+	a.warnUnknownPins(cat)
 	resolutions, code := a.pickerPipeline(cat)
 	if code != ExitOK {
 		return code
 	}
 
-	outcome, err := picker.Run(resolutions)
+	outcome, err := picker.Run(resolutions, a.Pins)
 	if err != nil {
 		fmt.Fprintf(a.Stderr, "ofa: picker: %v\n", err)
 		return ExitError
@@ -138,7 +142,7 @@ func (a *App) pickerCmd(args []string) ExitCode {
 		return ExitOK
 	}
 
-	requests, skip := buildRequests(cat, outcome.Selected, false /* picker is always quiet */)
+	requests, skip := buildRequests(cat, outcome.Selected, false /* picker is always quiet */, a.Pins)
 	for label, reason := range skip {
 		fmt.Fprintf(a.Stderr, "ofa: skip %s: %s\n", label, reason)
 	}

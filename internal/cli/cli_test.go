@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"ofa/internal/catalog"
+	"ofa/internal/config"
 	"ofa/internal/detect"
 	"ofa/internal/resolve"
 	"ofa/internal/state"
@@ -110,6 +111,9 @@ func newTestApp(t *testing.T, args []string, stdin io.Reader) (*App, *bytes.Buff
 	a.ResolveGetter = noopGetter
 	a.UpdateExec = se.Fn
 	a.StatePath = t.TempDir() + "/state.json"
+	// Never read the developer's real ~/.config/ofa/config.toml; a pin on
+	// this machine would otherwise change test behavior.
+	a.ConfigLoader = func() (config.Config, error) { return config.Config{}, nil }
 	return a, stdout, stderr, sd, sr, se
 }
 
@@ -293,12 +297,12 @@ func TestCountUpdates(t *testing.T) {
 		{HarnessID: "no-update", Tier: "none"},
 	}
 	// Only a verified newer version counts as pending.
-	if got := countUpdates(res); got != 1 {
+	if got := countUpdates(res, nil); got != 1 {
 		t.Errorf("countUpdates = %d, want 1 (qwen only)", got)
 	}
 	// Self-tier is counted separately: an available updater is not an
 	// outstanding update.
-	if got := countUpdaters(res); got != 2 {
+	if got := countUpdaters(res, nil); got != 2 {
 		t.Errorf("countUpdaters = %d, want 2 (claude, kimi)", got)
 	}
 	// Nothing outdated at all -> 0, even though two updaters exist. This is
@@ -307,7 +311,7 @@ func TestCountUpdates(t *testing.T) {
 		{HarnessID: "claude", Tier: "self"},
 		{HarnessID: "agy", Tier: "self"},
 	}
-	if got := countUpdates(onlySelf); got != 0 {
+	if got := countUpdates(onlySelf, nil); got != 0 {
 		t.Errorf("countUpdates with only self-tier = %d, want 0", got)
 	}
 }
@@ -326,7 +330,7 @@ func TestBuildRequests(t *testing.T) {
 		// unknown harness → skipReasons
 		{HarnessID: "ghost", Method: "native", Bin: "ghost", Tier: "self"},
 	}
-	reqs, skip := buildRequests(cat, res, false)
+	reqs, skip := buildRequests(cat, res, false, nil)
 	if len(reqs) != 3 {
 		t.Errorf("want 3 requests, got %d: %+v", len(reqs), reqs)
 	}
@@ -352,7 +356,7 @@ func TestBuildRequests_NoCmdSkipped(t *testing.T) {
 	res := []resolve.Resolution{
 		{HarnessID: "manual", Method: "native", Bin: "manual-bin", Tier: "self"},
 	}
-	reqs, skip := buildRequests(cat, res, false)
+	reqs, skip := buildRequests(cat, res, false, nil)
 	if len(reqs) != 0 {
 		t.Errorf("want 0 requests (no update cmd), got %d", len(reqs))
 	}
@@ -956,5 +960,120 @@ func TestRun_RefreshDispatchesToPicker(t *testing.T) {
 	}
 	if strings.Contains(out, "unknown command") {
 		t.Errorf("--refresh was not dispatched to the picker:\n%s", out)
+	}
+}
+
+// --- pins (config) ---
+
+// pinnedQwen stages an outdated npm install of qwen, the harness the pin
+// tests freeze.
+func pinnedQwen(t *testing.T, args []string) (*App, *bytes.Buffer, *bytes.Buffer, *stubExec) {
+	t.Helper()
+	a, stdout, stderr, sd, sr, se := newTestApp(t, args, nil)
+	a.ConfigLoader = func() (config.Config, error) {
+		return config.Config{Pins: []string{"qwen"}}, nil
+	}
+	sd.instances = []detect.Instance{{
+		HarnessID: "qwen", Method: "npm", Package: "@qwen-code/qwen-code",
+		Bin: "qwen", Version: "0.22.1", Status: detect.Active,
+	}}
+	sr.res = []resolve.Resolution{{
+		HarnessID: "qwen", Method: "npm", Package: "@qwen-code/qwen-code",
+		Bin: "qwen", Cur: "0.22.1", Latest: "0.25.2", Outdated: true, Tier: "npm",
+	}}
+	return a, stdout, stderr, se
+}
+
+func TestCheckCmd_PinAnnotatesAndExitsZero(t *testing.T) {
+	a, stdout, stderr, _ := pinnedQwen(t, []string{"check"})
+
+	if code := a.Run(); code != ExitOK {
+		t.Fatalf("check with a pinned update exit = %d, want %d", code, ExitOK)
+	}
+	got := stdout.String()
+	if !strings.Contains(got, "0 with updates") {
+		t.Errorf("headline should count 0 updates (pinned), got:\n%s", got)
+	}
+	if !strings.Contains(got, "qwen → 0.25.2 (pinned)") {
+		t.Errorf("row should be annotated (pinned), got:\n%s", got)
+	}
+	if stderr.Len() != 0 {
+		t.Errorf("stderr = %q, want no warnings for a known pin", stderr.String())
+	}
+}
+
+func TestCheckCmd_PinJSONMarksInstall(t *testing.T) {
+	a, stdout, _, _ := pinnedQwen(t, []string{"check", "--json"})
+
+	if code := a.Run(); code != ExitOK {
+		t.Fatalf("check --json with a pinned update exit = %d, want %d", code, ExitOK)
+	}
+	var out struct {
+		UpdateCount int `json:"update_count"`
+		Harnesses   map[string]struct {
+			Installs []struct {
+				Outdated bool `json:"outdated"`
+				Pinned   bool `json:"pinned"`
+			} `json:"installs"`
+		} `json:"harnesses"`
+	}
+	if err := json.Unmarshal(stdout.Bytes(), &out); err != nil {
+		t.Fatalf("json: %v\n%s", err, stdout.String())
+	}
+	if out.UpdateCount != 0 {
+		t.Errorf("update_count = %d, want 0 (pinned)", out.UpdateCount)
+	}
+	installs := out.Harnesses["qwen"].Installs
+	if len(installs) != 1 {
+		t.Fatalf("qwen installs = %d, want 1", len(installs))
+	}
+	if !installs[0].Pinned || !installs[0].Outdated {
+		t.Errorf("install = %+v, want pinned and outdated both true", installs[0])
+	}
+}
+
+func TestApplyCmd_PinSkipsExecution(t *testing.T) {
+	a, stdout, stderr, se := pinnedQwen(t, []string{"apply", "--yes"})
+
+	if code := a.Run(); code != ExitOK {
+		t.Fatalf("apply with only pinned updates exit = %d, want %d", code, ExitOK)
+	}
+	if len(se.calls) != 0 {
+		t.Errorf("executed %d update(s), want none: %+v", len(se.calls), se.calls)
+	}
+	if !strings.Contains(stdout.String(), "nothing to apply") {
+		t.Errorf("stdout = %q, want 'nothing to apply'", stdout.String())
+	}
+	if !strings.Contains(stderr.String(), "pinned in config") {
+		t.Errorf("stderr = %q, want the pin skip reason", stderr.String())
+	}
+}
+
+func TestCheckCmd_UnknownPinWarns(t *testing.T) {
+	a, _, stderr, sd, sr, _ := newTestApp(t, []string{"check"}, nil)
+	a.ConfigLoader = func() (config.Config, error) {
+		return config.Config{Pins: []string{"ghost"}}, nil
+	}
+	sd.instances = []detect.Instance{}
+	sr.res = nil
+
+	a.Run()
+
+	if !strings.Contains(stderr.String(), `config pins "ghost", which is not in the catalog`) {
+		t.Errorf("stderr = %q, want the unknown-pin warning", stderr.String())
+	}
+}
+
+func TestCheckCmd_MalformedConfigIsError(t *testing.T) {
+	a, _, stderr, _, _, _ := newTestApp(t, []string{"check"}, nil)
+	a.ConfigLoader = func() (config.Config, error) {
+		return config.Config{}, errors.New("config.toml: unknown key(s): pin")
+	}
+
+	if code := a.Run(); code != ExitError {
+		t.Fatalf("check with a broken config exit = %d, want %d", code, ExitError)
+	}
+	if !strings.Contains(stderr.String(), "ofa: config:") {
+		t.Errorf("stderr = %q, want a config error", stderr.String())
 	}
 }
