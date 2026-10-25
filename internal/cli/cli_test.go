@@ -13,6 +13,7 @@ import (
 	"ofa/internal/catalog"
 	"ofa/internal/detect"
 	"ofa/internal/resolve"
+	"ofa/internal/state"
 	"ofa/internal/update"
 )
 
@@ -38,12 +39,15 @@ func (s *stubDetect) Run(cat []catalog.Harness, run detect.Runner) ([]detect.Ins
 	return s.instances, s.failures, s.err
 }
 
-// stubResolve returns canned resolutions.
+// stubResolve returns canned resolutions. It also records the Config it
+// was handed so tests can assert cache/refresh/prefetch wiring.
 type stubResolve struct {
-	res []resolve.Resolution
+	res  []resolve.Resolution
+	cfgs []resolve.Config
 }
 
-func (s *stubResolve) Run(insts []detect.Instance, cat []catalog.Harness, run resolve.Runner, get resolve.Getter) []resolve.Resolution {
+func (s *stubResolve) Run(insts []detect.Instance, cat []catalog.Harness, run resolve.Runner, get resolve.Getter, cfg resolve.Config) []resolve.Resolution {
+	s.cfgs = append(s.cfgs, cfg)
 	return s.res
 }
 
@@ -356,11 +360,11 @@ func TestCheckCmd_JSON(t *testing.T) {
 		Harnesses    map[string]struct {
 			Name     string `json:"name"`
 			Installs []struct {
-				Method  string `json:"method"`
-				Bin     string `json:"bin"`
-				Version string `json:"version"`
-				Tier    string `json:"tier"`
-				Outdated bool  `json:"outdated"`
+				Method   string `json:"method"`
+				Bin      string `json:"bin"`
+				Version  string `json:"version"`
+				Tier     string `json:"tier"`
+				Outdated bool   `json:"outdated"`
 			} `json:"installs"`
 		} `json:"harnesses"`
 	}
@@ -638,11 +642,11 @@ func TestApplyCmd_FailureExits1(t *testing.T) {
 		{HarnessID: "claude", Method: "native", Bin: "claude", Cur: "2.1.300", Tier: "self"},
 	}
 	exec.results["claude (native)"] = update.Result{
-		Label: "claude (native)",
-		Cmd:   update.CmdSpec{Cmd: []string{"claude", "update"}},
-		Failed: true,
+		Label:    "claude (native)",
+		Cmd:      update.CmdSpec{Cmd: []string{"claude", "update"}},
+		Failed:   true,
 		ExitCode: 1,
-		Err: errors.New("exit 1"),
+		Err:      errors.New("exit 1"),
 	}
 	if code := a.Run(); code != ExitUpdatesPending {
 		// update.ExitCode() returns 1 for failure; we map to ExitUpdatesPending
@@ -726,5 +730,144 @@ func TestFindInstall(t *testing.T) {
 	}
 	if _, ok := findInstall(h, resolve.Resolution{Method: "pipx", Package: "opencode", Bin: "opencode"}); ok {
 		t.Error("pipx should not match")
+	}
+}
+
+// ---- issue #8: latest-version cache wiring, --refresh, stale warnings ----
+
+// TestCheck_RefreshFlagReachesResolve: --refresh must arrive in the
+// resolve.Config, and the default (no flag) must be false.
+func TestCheck_RefreshFlagReachesResolve(t *testing.T) {
+	for _, tc := range []struct {
+		args []string
+		want bool
+	}{
+		{[]string{"check"}, false},
+		{[]string{"check", "--refresh"}, true},
+	} {
+		a, _, _, _, sr, _ := newTestApp(t, tc.args, nil)
+		if code := a.Run(); code != ExitOK {
+			t.Errorf("%v: exit = %d, want 0", tc.args, code)
+		}
+		if len(sr.cfgs) != 1 {
+			t.Fatalf("%v: resolve called %d times, want 1", tc.args, len(sr.cfgs))
+		}
+		if sr.cfgs[0].Refresh != tc.want {
+			t.Errorf("%v: cfg.Refresh = %v, want %v", tc.args, sr.cfgs[0].Refresh, tc.want)
+		}
+		if sr.cfgs[0].Cache == nil {
+			t.Errorf("%v: resolve must always get a cache (may be read-through)", tc.args)
+		}
+	}
+}
+
+// TestCheck_PersistsLatestCache: a resolving run writes refreshed
+// entries back into an existing state file.
+func TestCheck_PersistsLatestCache(t *testing.T) {
+	a, _, _, _, _, _ := newTestApp(t, []string{"check"}, nil)
+	if err := saveStateFile(a.StatePath, state.FromInstances(nil, time.Now())); err != nil {
+		t.Fatal(err)
+	}
+	a.ResolveFn = func(insts []detect.Instance, cat []catalog.Harness, run resolve.Runner, get resolve.Getter, cfg resolve.Config) []resolve.Resolution {
+		cfg.Cache.Put(resolve.CacheKey("npm", "@x/y"), resolve.CacheEntry{Version: "9.9.9", ResolvedAt: a.Now()})
+		return nil
+	}
+	if code := a.Run(); code != ExitOK {
+		t.Fatalf("check exit = %d, want 0", code)
+	}
+	f, err := loadStateFile(a.StatePath)
+	if err != nil || f == nil {
+		t.Fatalf("load state: %v (f=%v)", err, f)
+	}
+	e, ok := f.Latest[resolve.CacheKey("npm", "@x/y")]
+	if !ok || e.Version != "9.9.9" {
+		t.Errorf("state latest = %+v (ok=%v), want npm:@x/y = 9.9.9", e, ok)
+	}
+}
+
+// TestCheck_NoStateFileCreatesNoCacheFile: without a scan record the
+// cache must not create one — a latest-only state file would corrupt
+// drift detection.
+func TestCheck_NoStateFileCreatesNoCacheFile(t *testing.T) {
+	a, _, _, _, _, _ := newTestApp(t, []string{"check"}, nil)
+	a.ResolveFn = func(insts []detect.Instance, cat []catalog.Harness, run resolve.Runner, get resolve.Getter, cfg resolve.Config) []resolve.Resolution {
+		cfg.Cache.Put(resolve.CacheKey("npm", "@x/y"), resolve.CacheEntry{Version: "9.9.9", ResolvedAt: a.Now()})
+		return nil
+	}
+	if code := a.Run(); code != ExitOK {
+		t.Fatalf("check exit = %d, want 0", code)
+	}
+	if _, err := os.Stat(a.StatePath); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("state file created without a scan (err=%v); cache must be read-through only", err)
+	}
+}
+
+// TestRunPipeline_WarnsOnStaleCacheServe: a stale fallback goes to
+// stderr with the refresh error, never to stdout (JSON stays clean).
+func TestRunPipeline_WarnsOnStaleCacheServe(t *testing.T) {
+	a, stdout, stderr, _, _, _ := newTestApp(t, []string{"check"}, nil)
+	a.ResolveFn = func(insts []detect.Instance, cat []catalog.Harness, run resolve.Runner, get resolve.Getter, cfg resolve.Config) []resolve.Resolution {
+		return []resolve.Resolution{{
+			HarnessID: "x", Tier: "npm", Package: "@x/y", Bin: "x",
+			Cur: "1.0.0", Latest: "2.0.0", Outdated: true,
+			Stale: true, CachedAt: a.Now().Add(-13 * time.Hour), RefreshErr: "network down",
+		}}
+	}
+	// Outdated=true on the stale answer → check reports pending updates,
+	// which is the point of serving the stale entry at all.
+	if code := a.Run(); code != ExitUpdatesPending {
+		t.Fatalf("check exit = %d, want %d (updates pending)", code, ExitUpdatesPending)
+	}
+	errOut := stderr.String()
+	if !strings.Contains(errOut, "served from cache") || !strings.Contains(errOut, "network down") {
+		t.Errorf("stderr missing stale warning, got:\n%s", errOut)
+	}
+	if strings.Contains(stdout.String(), "served from cache") {
+		t.Errorf("stale warning leaked to stdout:\n%s", stdout.String())
+	}
+}
+
+// TestScan_CarriesLatestCache: scan rewrites the state file for drift —
+// it must not drop the latest-version cache it didn't refresh.
+func TestScan_CarriesLatestCache(t *testing.T) {
+	a, _, _, _, _, _ := newTestApp(t, []string{"scan"}, nil)
+	seed := state.FromInstances(nil, time.Now())
+	seed.Latest = map[string]state.LatestEntry{
+		resolve.CacheKey("npm", "@x/y"): {Version: "9.9.9", ResolvedAt: time.Now().Format(time.RFC3339)},
+	}
+	if err := saveStateFile(a.StatePath, seed); err != nil {
+		t.Fatal(err)
+	}
+	if code := a.Run(); code != ExitOK {
+		t.Fatalf("scan exit = %d, want 0", code)
+	}
+	f, err := loadStateFile(a.StatePath)
+	if err != nil || f == nil {
+		t.Fatalf("load state: %v (f=%v)", err, f)
+	}
+	if e, ok := f.Latest[resolve.CacheKey("npm", "@x/y")]; !ok || e.Version != "9.9.9" {
+		t.Errorf("latest cache lost across scan: %+v", f.Latest)
+	}
+}
+
+// TestRun_RefreshDispatchesToPicker: `ofa --refresh` reaches the picker
+// AND the flag takes effect (it must survive dispatch into pickerCmd's
+// FlagSet — the original PR stripped it, making the flag a silent
+// no-op). Tests have no TTY, so the picker bails at its own guard after
+// the flag is parsed — which is exactly the evidence dispatch worked.
+func TestRun_RefreshDispatchesToPicker(t *testing.T) {
+	a, _, stderr, _, _, _ := newTestApp(t, []string{"--refresh"}, nil)
+	if code := a.Run(); code != ExitError {
+		t.Errorf("exit = %d, want %d (no TTY)", code, ExitError)
+	}
+	if !a.Refresh {
+		t.Error("--refresh did not survive dispatch: a.Refresh = false, want true")
+	}
+	out := stderr.String()
+	if !strings.Contains(out, "no TTY") {
+		t.Errorf("expected picker's no-TTY bail-out, got:\n%s", out)
+	}
+	if strings.Contains(out, "unknown command") {
+		t.Errorf("--refresh was not dispatched to the picker:\n%s", out)
 	}
 }

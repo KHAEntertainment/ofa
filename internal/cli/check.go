@@ -21,9 +21,11 @@ func (a *App) checkCmd(args []string) ExitCode {
 	fs.SetOutput(a.Stderr)
 	jsonOut := fs.Bool("json", false, "emit JSON on stdout")
 	only := fs.String("only", "", "limit output to one harness id")
+	refresh := fs.Bool("refresh", false, "bypass cached latest versions; re-query registries")
 	if err := fs.Parse(args); err != nil {
 		return ExitError
 	}
+	a.Refresh = *refresh
 
 	cat, code := a.loadCatalog()
 	if code != ExitOK {
@@ -72,17 +74,17 @@ func (a *App) printCheckHuman(cat []catalog.Harness, resolutions []resolve.Resol
 
 func (a *App) printCheckJSON(cat []catalog.Harness, resolutions []resolve.Resolution, current *stateFile, drift state.Drift, failures []detect.Failure, only string) ExitCode {
 	type installOut struct {
-		Method            string `json:"method"`
-		Package           string `json:"package,omitempty"`
-		Bin               string `json:"bin"`
-		Path              string `json:"path,omitempty"`
-		Version           string `json:"version"`
-		Status            string `json:"status"`
-		Tier              string `json:"tier"`
-		Latest            string `json:"latest,omitempty"`
-		Outdated          bool   `json:"outdated"`
-		UpdaterAvailable  bool   `json:"updater_available"`
-		ResolverErr       string `json:"resolver_error,omitempty"`
+		Method           string `json:"method"`
+		Package          string `json:"package,omitempty"`
+		Bin              string `json:"bin"`
+		Path             string `json:"path,omitempty"`
+		Version          string `json:"version"`
+		Status           string `json:"status"`
+		Tier             string `json:"tier"`
+		Latest           string `json:"latest,omitempty"`
+		Outdated         bool   `json:"outdated"`
+		UpdaterAvailable bool   `json:"updater_available"`
+		ResolverErr      string `json:"resolver_error,omitempty"`
 	}
 	type harnessOut struct {
 		Name     string       `json:"name,omitempty"`

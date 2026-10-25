@@ -3,9 +3,6 @@ package resolve
 import (
 	"encoding/json"
 	"fmt"
-	"io"
-	"net/http"
-	"time"
 )
 
 // pypiBaseURL is the PyPI JSON API endpoint. Pulled out as a var so tests
@@ -33,21 +30,4 @@ func resolvePypi(pkg string, get Getter) (string, error) {
 		return "", fmt.Errorf("pypi %s: empty version", pkg)
 	}
 	return parsed.Info.Version, nil
-}
-
-// httpGetter is the production HTTP GET. Wrapped here so tests can swap in
-// a fake without touching net/http.DefaultClient.
-func httpGetter() Getter {
-	c := &http.Client{Timeout: 10 * time.Second}
-	return func(url string) ([]byte, error) {
-		resp, err := c.Get(url)
-		if err != nil {
-			return nil, err
-		}
-		defer resp.Body.Close()
-		if resp.StatusCode >= 400 {
-			return nil, fmt.Errorf("pypi: %s", resp.Status)
-		}
-		return io.ReadAll(resp.Body)
-	}
 }

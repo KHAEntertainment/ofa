@@ -30,9 +30,11 @@ func (a *App) applyCmd(args []string) ExitCode {
 	// semantics to --dry-run.
 	plan := fs.Bool("plan", false, "alias for --dry-run")
 	verbose := fs.Bool("verbose", false, "stream installer output; default is progress lines only")
+	refresh := fs.Bool("refresh", false, "bypass cached latest versions; re-query registries")
 	if err := fs.Parse(args); err != nil {
 		return ExitError
 	}
+	a.Refresh = *refresh
 	if *plan {
 		*dryRun = true
 	}

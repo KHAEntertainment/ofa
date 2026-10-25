@@ -2,6 +2,7 @@ package cli
 
 import (
 	"errors"
+	"flag"
 	"fmt"
 	"os"
 
@@ -46,6 +47,16 @@ func isTerminal(f *os.File) bool {
 // isn't a TTY, the bubbletea program will fail to start; we surface a
 // clear "use a subcommand instead" message.
 func (a *App) pickerCmd(args []string) ExitCode {
+	// The bare picker accepts only --refresh (issue #8); anything else is
+	// a usage error, matching the subcommand FlagSets.
+	fs := flag.NewFlagSet("ofa", flag.ContinueOnError)
+	fs.SetOutput(a.Stderr)
+	refresh := fs.Bool("refresh", false, "bypass cached latest versions; re-query registries")
+	if err := fs.Parse(args); err != nil {
+		return ExitError
+	}
+	a.Refresh = *refresh
+
 	// First-run auto-scan. Run scan only if there's no state file; the
 	// scan writes the file as a side effect, so subsequent runs skip.
 	// This runs even when stdin is not a TTY — a user piping `ofa` into

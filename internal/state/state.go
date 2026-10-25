@@ -13,6 +13,17 @@ import (
 type File struct {
 	ScannedAt string             `json:"scanned_at"`
 	Harnesses map[string]Harness `json:"harnesses"`
+	// Latest is the resolved-latest-version cache (issue #8), keyed by
+	// resolve.CacheKey ("tier:package"). Written by resolve via check/
+	// apply/picker runs; carried forward by scan. Absent until the first
+	// resolving run, and omitted from JSON when empty.
+	Latest map[string]LatestEntry `json:"latest,omitempty"`
+}
+
+// LatestEntry is one cached latest version.
+type LatestEntry struct {
+	Version    string `json:"version"`
+	ResolvedAt string `json:"resolved_at"` // RFC3339
 }
 
 // Harness holds the installs detected for one harness.

@@ -47,7 +47,7 @@ func TestIntegration_BrewOutdatedHasRealDiff(t *testing.T) {
 	cat := liveCatalog(t)
 	insts := liveScan(t, cat)
 
-	got := Resolve(insts, cat, DefaultRunner, DefaultGetter)
+	got := Resolve(insts, cat, DefaultRunner, DefaultGetter, Config{})
 	byID := map[string]Resolution{}
 	for _, r := range got {
 		byID[r.HarnessID+"|"+r.Method+"|"+r.Package] = r
@@ -73,7 +73,7 @@ func TestIntegration_NpmResolvesToNonEmpty(t *testing.T) {
 	cat := liveCatalog(t)
 	insts := liveScan(t, cat)
 
-	got := Resolve(insts, cat, DefaultRunner, DefaultGetter)
+	got := Resolve(insts, cat, DefaultRunner, DefaultGetter, Config{})
 	for _, r := range got {
 		if r.Tier != "npm" {
 			continue
@@ -91,7 +91,7 @@ func TestIntegration_PypiResolvesKimi(t *testing.T) {
 	cat := liveCatalog(t)
 	insts := liveScan(t, cat)
 
-	got := Resolve(insts, cat, DefaultRunner, DefaultGetter)
+	got := Resolve(insts, cat, DefaultRunner, DefaultGetter, Config{})
 	var kimi *Resolution
 	for i, r := range got {
 		if r.HarnessID == "kimi" && r.Method == "uv" {
@@ -117,7 +117,7 @@ func TestIntegration_SelfTierHasNoLatest(t *testing.T) {
 	cat := liveCatalog(t)
 	insts := liveScan(t, cat)
 
-	got := Resolve(insts, cat, DefaultRunner, DefaultGetter)
+	got := Resolve(insts, cat, DefaultRunner, DefaultGetter, Config{})
 	for _, r := range got {
 		if r.Tier != "self" {
 			continue
@@ -139,7 +139,7 @@ func TestIntegration_DoesNotMutateCatalog(t *testing.T) {
 	snapshot := make([]catalog.Harness, len(cat))
 	copy(snapshot, cat)
 
-	_ = Resolve(insts, cat, DefaultRunner, DefaultGetter)
+	_ = Resolve(insts, cat, DefaultRunner, DefaultGetter, Config{})
 
 	if len(cat) != len(snapshot) {
 		t.Fatalf("catalog length changed: %d -> %d", len(snapshot), len(cat))
