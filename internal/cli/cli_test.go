@@ -201,8 +201,23 @@ func TestCountUpdates(t *testing.T) {
 		{HarnessID: "kimi", Tier: "self"},
 		{HarnessID: "no-update", Tier: "none"},
 	}
-	if got := countUpdates(res); got != 3 {
-		t.Errorf("countUpdates = %d, want 3 (claude self, qwen outdated, kimi self)", got)
+	// Only a verified newer version counts as pending.
+	if got := countUpdates(res); got != 1 {
+		t.Errorf("countUpdates = %d, want 1 (qwen only)", got)
+	}
+	// Self-tier is counted separately: an available updater is not an
+	// outstanding update.
+	if got := countUpdaters(res); got != 2 {
+		t.Errorf("countUpdaters = %d, want 2 (claude, kimi)", got)
+	}
+	// Nothing outdated at all -> 0, even though two updaters exist. This is
+	// the whole point of issue #4.
+	onlySelf := []resolve.Resolution{
+		{HarnessID: "claude", Tier: "self"},
+		{HarnessID: "agy", Tier: "self"},
+	}
+	if got := countUpdates(onlySelf); got != 0 {
+		t.Errorf("countUpdates with only self-tier = %d, want 0", got)
 	}
 }
 
@@ -273,22 +288,24 @@ func TestCheckCmd_NoUpdatesExits0(t *testing.T) {
 	}
 }
 
+// A verified newer version is what makes an update "pending": only then does
+// check exit 1. (Self-tier alone exits 0 — see TestCheckCmd_SelfTierAloneExits0.)
 func TestCheckCmd_WithUpdatesExits1(t *testing.T) {
 	a, out, _, sd, sr, _ := newTestApp(t, []string{"check"}, nil)
 	sd.instances = []detect.Instance{
-		{HarnessID: "claude", Method: "native", Bin: "claude", Version: "2.1.300", Status: detect.Active},
+		{HarnessID: "qwen", Method: "npm", Package: "@qwen-code/qwen-code", Bin: "qwen", Version: "0.22.1", Status: detect.Active},
 	}
 	sr.res = []resolve.Resolution{
-		{HarnessID: "claude", Method: "native", Bin: "claude", Cur: "2.1.300", Tier: "self"},
+		{HarnessID: "qwen", Method: "npm", Package: "@qwen-code/qwen-code", Bin: "qwen", Cur: "0.22.1", Latest: "0.25.2", Outdated: true, Tier: "npm"},
 	}
 	if code := a.Run(); code != ExitUpdatesPending {
-		t.Errorf("check with self-tier update exit = %d, want %d", code, ExitUpdatesPending)
+		t.Errorf("check with a real version diff exit = %d, want %d", code, ExitUpdatesPending)
 	}
 	if !strings.Contains(out.String(), "1 with updates") {
 		t.Errorf("output should report 1 update, got %q", out.String())
 	}
-	if !strings.Contains(out.String(), "updater available") {
-		t.Errorf("output should mention updater available, got %q", out.String())
+	if !strings.Contains(out.String(), "0 updaters available") {
+		t.Errorf("output should report no self-tier updaters, got %q", out.String())
 	}
 }
 
@@ -302,8 +319,10 @@ func TestCheckCmd_OnlyFilter(t *testing.T) {
 		{HarnessID: "claude", Method: "native", Bin: "claude", Cur: "2.1.300", Tier: "self"},
 		{HarnessID: "qwen", Method: "npm", Package: "@qwen-code/qwen-code", Bin: "qwen", Cur: "0.22.1", Latest: "0.25.2", Outdated: true, Tier: "npm"},
 	}
-	if code := a.Run(); code != ExitUpdatesPending {
-		t.Errorf("--only claude exit = %d, want %d", code, ExitUpdatesPending)
+	// claude is self-tier, and the filter drops the outdated qwen, so
+	// nothing verifiable is pending — exit 0, not 1.
+	if code := a.Run(); code != ExitOK {
+		t.Errorf("--only claude (self-tier) exit = %d, want %d", code, ExitOK)
 	}
 	if strings.Contains(out.String(), "qwen") {
 		t.Errorf("--only claude output should not mention qwen, got %q", out.String())
@@ -333,6 +352,7 @@ func TestCheckCmd_JSON(t *testing.T) {
 		HarnessCount int    `json:"harness_count"`
 		InstallCount int    `json:"install_count"`
 		UpdateCount  int    `json:"update_count"`
+		UpdaterCount int    `json:"updater_available_count"`
 		Harnesses    map[string]struct {
 			Name     string `json:"name"`
 			Installs []struct {
@@ -347,8 +367,12 @@ func TestCheckCmd_JSON(t *testing.T) {
 	if err := json.Unmarshal(out.Bytes(), &parsed); err != nil {
 		t.Fatalf("JSON output did not parse: %v\noutput: %s", err, out.String())
 	}
-	if parsed.UpdateCount != 2 {
-		t.Errorf("update_count = %d, want 2", parsed.UpdateCount)
+	// update_count must count only verified diffs (qwen), not self-tier.
+	if parsed.UpdateCount != 1 {
+		t.Errorf("update_count = %d, want 1 (qwen only)", parsed.UpdateCount)
+	}
+	if parsed.UpdaterCount != 1 {
+		t.Errorf("updater_available_count = %d, want 1 (claude)", parsed.UpdaterCount)
 	}
 	if _, ok := parsed.Harnesses["claude"]; !ok {
 		t.Error("claude missing from JSON output")
@@ -368,6 +392,33 @@ func TestCheckCmd_OnlyUnknownNoError(t *testing.T) {
 	}
 	if !strings.Contains(out.String(), "0 with updates") {
 		t.Errorf("--only ghost output should report 0 updates, got %q", out.String())
+	}
+}
+
+// A machine whose only actionable installs are self-tier must exit 0: the
+// README promises exit 1 means something is *pending*, and an updater with
+// no comparable version is not a pending update. Before issue #4 this exited
+// 1 forever, which made `ofa check` unusable as a script gate.
+func TestCheckCmd_SelfTierAloneExits0(t *testing.T) {
+	a, out, _, sd, sr, _ := newTestApp(t, []string{"check"}, nil)
+	sd.instances = []detect.Instance{
+		{HarnessID: "claude", Method: "native", Bin: "claude", Version: "2.1.300", Status: detect.Active},
+	}
+	sr.res = []resolve.Resolution{
+		{HarnessID: "claude", Method: "native", Bin: "claude", Cur: "2.1.300", Tier: "self"},
+	}
+	if code := a.Run(); code != ExitOK {
+		t.Errorf("self-tier only check exit = %d, want %d (ExitOK)", code, ExitOK)
+	}
+	if !strings.Contains(out.String(), "0 with updates") {
+		t.Errorf("output should report 0 updates, got %q", out.String())
+	}
+	// The updater must stay visible rather than disappear.
+	if !strings.Contains(out.String(), "1 updaters available") {
+		t.Errorf("output should report the available updater, got %q", out.String())
+	}
+	if !strings.Contains(out.String(), "updater available") {
+		t.Errorf("row should still mention updater available, got %q", out.String())
 	}
 }
 

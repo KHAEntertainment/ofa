@@ -49,8 +49,13 @@ func (a *App) checkCmd(args []string) ExitCode {
 func (a *App) printCheckHuman(cat []catalog.Harness, resolutions []resolve.Resolution, current *stateFile, drift state.Drift, only string) ExitCode {
 	filtered := filterByHarness(resolutions, only)
 	updateCount := countUpdates(filtered)
+	updaterCount := countUpdaters(filtered)
 
-	fmt.Fprintf(a.Stdout, "scan: %d harnesses, %d with updates\n", harnessCount(current), updateCount)
+	// Both counts are always printed so the line keeps a fixed shape for
+	// scripts. Only `updateCount` is known-pending, so only it decides the
+	// exit code: an available updater is an offer, not an outstanding update.
+	fmt.Fprintf(a.Stdout, "scan: %d harnesses, %d with updates, %d updaters available\n",
+		harnessCount(current), updateCount, updaterCount)
 	if len(drift.Added)+len(drift.Removed)+len(drift.Changed) > 0 {
 		fmt.Fprintln(a.Stdout)
 		printDrift(a.Stdout, drift)
@@ -88,6 +93,7 @@ func (a *App) printCheckJSON(cat []catalog.Harness, resolutions []resolve.Resolu
 		HarnessCount int                   `json:"harness_count"`
 		InstallCount int                   `json:"install_count"`
 		UpdateCount  int                   `json:"update_count"`
+		UpdaterCount int                   `json:"updater_available_count"`
 		Harnesses    map[string]harnessOut `json:"harnesses"`
 		Drift        *driftJSON            `json:"drift,omitempty"`
 		Failures     []failureOut          `json:"failures,omitempty"`
@@ -103,6 +109,7 @@ func (a *App) printCheckJSON(cat []catalog.Harness, resolutions []resolve.Resolu
 		HarnessCount: harnessCount(current),
 		InstallCount: installCount(current),
 		UpdateCount:  countUpdates(filtered),
+		UpdaterCount: countUpdaters(filtered),
 		Harnesses:    map[string]harnessOut{},
 		Drift:        driftJSONPtr(drift),
 		Failures:     failureOutList(failures),
@@ -141,6 +148,7 @@ func (a *App) printCheckJSON(cat []catalog.Harness, resolutions []resolve.Resolu
 		HarnessCount int                   `json:"harness_count"`
 		InstallCount int                   `json:"install_count"`
 		UpdateCount  int                   `json:"update_count"`
+		UpdaterCount int                   `json:"updater_available_count"`
 		Harnesses    map[string]harnessOut `json:"harnesses"`
 		Drift        *driftJSON            `json:"drift,omitempty"`
 		Failures     []failureOut          `json:"failures,omitempty"`
@@ -149,6 +157,7 @@ func (a *App) printCheckJSON(cat []catalog.Harness, resolutions []resolve.Resolu
 		HarnessCount: out.HarnessCount,
 		InstallCount: out.InstallCount,
 		UpdateCount:  out.UpdateCount,
+		UpdaterCount: out.UpdaterCount,
 		Harnesses:    map[string]harnessOut{},
 		Drift:        out.Drift,
 		Failures:     out.Failures,
@@ -213,12 +222,32 @@ func filterByHarness(res []resolve.Resolution, only string) []resolve.Resolution
 	return out
 }
 
-// countUpdates returns how many resolutions have an update available —
-// i.e. Outdated=true or Tier=self. Tier=none never counts.
+// countUpdates returns how many resolutions are known to be outdated —
+// i.e. a package manager reported a newer version than what is installed.
+// This is the number that drives the headline and the exit code: it is the
+// only case where OFA can *prove* something is pending.
+//
+// Self-tier installs are deliberately excluded: they carry no Latest, so
+// Outdated is always false for them. See countUpdaters.
 func countUpdates(res []resolve.Resolution) int {
 	n := 0
 	for _, r := range res {
-		if r.Outdated || r.Tier == "self" {
+		if r.Outdated {
+			n++
+		}
+	}
+	return n
+}
+
+// countUpdaters returns how many resolutions are self-tier — harnesses with
+// an updater OFA can run but no version to compare against. Reporting one of
+// these as a pending update is what made `ofa check` say "8 with updates"
+// immediately after a fully successful apply; the two facts are now counted
+// and reported separately.
+func countUpdaters(res []resolve.Resolution) int {
+	n := 0
+	for _, r := range res {
+		if r.Tier == "self" {
 			n++
 		}
 	}

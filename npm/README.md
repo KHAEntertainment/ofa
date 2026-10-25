@@ -6,7 +6,7 @@ A single command to detect, version-check, and update every coding harness on yo
 
 ```
 $ ofa check
-Scan: 13 harnesses, 8 with updates
+scan: 13 harnesses, 0 with updates, 8 updaters available
   agy          1.3.4          [self]    agy → updater available
   claude       2.1.300        [self]    claude → updater available
   coderabbit   0.7.6          [self]    coderabbit → updater available
@@ -17,7 +17,7 @@ Scan: 13 harnesses, 8 with updates
   mmx          1.0.25         [self]    mmx → updater available
 ```
 
-Exit code is `1` if anything's pending, `0` otherwise — pipe it into your shell scripts.
+Exit code is `1` if any install is **known to be outdated**, `0` otherwise — pipe it into your shell scripts. An available updater (a self-tier harness with no version to compare) is reported separately and deliberately does **not** make the exit code `1`, so `ofa check && …` fires when nothing is actually pending.
 
 ## Why
 
@@ -148,7 +148,8 @@ $ ofa scan              # detect + write state, report drift since last scan
 {
   "scanned_at": "2026-10-15T20:31:42Z",
   "harness_count": 13,
-  "update_count": 8,
+  "update_count": 0,
+  "updater_available_count": 8,
   "harnesses": {
     "claude": {
       "name": "Claude Code",
