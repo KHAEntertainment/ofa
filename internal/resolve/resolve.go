@@ -48,6 +48,16 @@ type Resolution struct {
 	RefreshErr string
 }
 
+// UpdaterReachable reports whether OFA can run an update that targets this
+// install. Registry updaters name their package (`brew upgrade <pkg>`,
+// `npm i -g <pkg>`, `uv tool upgrade <pkg>`), so they always reach the copy
+// they manage. Native updaters are `<bin> update`, resolved via PATH: for a
+// shadowed native install that runs the live copy instead, so the catalog
+// command cannot update the copy it claims to target.
+func (r Resolution) UpdaterReachable() bool {
+	return !(r.Shadowed && r.Method == "native")
+}
+
 // Runner runs a shell command and returns stdout. Same shape as detect.Runner
 // so tests can reuse fixtures.
 type Runner func(name string, args ...string) (string, error)

@@ -320,10 +320,19 @@ func classify(instances []Instance, live map[string]liveBin) {
 	for bin, idxs := range byBin {
 		lb := live[bin]
 		if len(idxs) == 1 {
-			if lb.path != "" {
-				instances[idxs[0]].Path = lb.path
+			i := idxs[0]
+			// A lone native install only owns the live binary if PATH
+			// resolves back to its probe path. Otherwise `<bin> update`
+			// would run the other executable, so report shadowing and
+			// keep the probe path rather than claiming reachability.
+			if instances[i].Method == "native" && lb.path != "" && !ownsReal(instances[i], lb.real) {
+				instances[i].Status = Shadowed
+				continue
 			}
-			instances[idxs[0]].Status = Active
+			if lb.path != "" {
+				instances[i].Path = lb.path
+			}
+			instances[i].Status = Active
 			continue
 		}
 		owner := -1

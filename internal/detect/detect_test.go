@@ -139,6 +139,25 @@ func TestClassifyNativeSingleKeepsPathWhenNotOnPath(t *testing.T) {
 	}
 }
 
+func TestClassifyNativeSingleShadowedWhenPathResolvesElsewhere(t *testing.T) {
+	// A lone native install must not claim the live binary when PATH
+	// resolves to a different executable: `<bin> update` would run that
+	// other copy, so report shadowing and keep the probe path.
+	instances := []Instance{
+		{HarnessID: "opencode", Method: "native", Bin: "opencode", Path: "/home/x/.opencode/bin/opencode"},
+	}
+	live := map[string]liveBin{
+		"opencode": {path: "/opt/homebrew/bin/opencode", real: "/opt/homebrew/lib/node_modules/opencode-ai/bin/opencode.exe"},
+	}
+	classify(instances, live)
+	if instances[0].Status != Shadowed {
+		t.Errorf("lone native install pointing at another executable should be shadowed: %+v", instances[0])
+	}
+	if instances[0].Path != "/home/x/.opencode/bin/opencode" {
+		t.Errorf("shadowed native should keep its probe path, got %q", instances[0].Path)
+	}
+}
+
 func TestClassifyNativeSymlinkOwnsRealPath(t *testing.T) {
 	dir := t.TempDir()
 	real := filepath.Join(dir, "claude-2.1.310")
