@@ -277,12 +277,15 @@ type liveBin struct {
 	real string
 }
 
-// resolveShadowing resolves active vs shadowed for registry-backed instances
-// that share a bin name. Native instances already carry a concrete path.
+// resolveShadowing resolves active vs shadowed for every instance that
+// shares a bin name, including native installs. Native paths are probed from
+// the catalog rather than a registry, but they compete for the same PATH
+// entry as an npm or brew copy — leaving them out made a script-installed
+// binary look absent while the registry copy was reported as live.
 func resolveShadowing(instances []Instance) {
 	live := map[string]liveBin{}
 	for i := range instances {
-		if instances[i].Method == "native" {
+		if instances[i].Bin == "" {
 			continue
 		}
 		if _, ok := live[instances[i].Bin]; ok {
@@ -309,16 +312,32 @@ func lookUp(bin string) liveBin {
 func classify(instances []Instance, live map[string]liveBin) {
 	byBin := map[string][]int{}
 	for i := range instances {
-		if instances[i].Method == "native" {
+		if instances[i].Bin == "" {
 			continue
 		}
 		byBin[instances[i].Bin] = append(byBin[instances[i].Bin], i)
 	}
 	for bin, idxs := range byBin {
 		lb := live[bin]
+		if lb.path == "" {
+			for _, i := range idxs {
+				instances[i].OffPath = true
+			}
+		}
 		if len(idxs) == 1 {
-			instances[idxs[0]].Path = lb.path
-			instances[idxs[0]].Status = Active
+			i := idxs[0]
+			// A lone native install only owns the live binary if PATH
+			// resolves back to its probe path. Otherwise `<bin> update`
+			// would run the other executable, so report shadowing and
+			// keep the probe path rather than claiming reachability.
+			if instances[i].Method == "native" && lb.path != "" && !ownsReal(instances[i], lb.real) {
+				instances[i].Status = Shadowed
+				continue
+			}
+			if lb.path != "" {
+				instances[i].Path = lb.path
+			}
+			instances[i].Status = Active
 			continue
 		}
 		owner := -1
@@ -334,7 +353,9 @@ func classify(instances []Instance, live map[string]liveBin) {
 		for _, i := range idxs {
 			if i == owner {
 				instances[i].Status = Active
-				instances[i].Path = lb.path
+				if lb.path != "" {
+					instances[i].Path = lb.path
+				}
 			} else {
 				instances[i].Status = Shadowed
 				instances[i].Path = ""
@@ -358,6 +379,17 @@ func ownsReal(inst Instance, real string) bool {
 		return strings.Contains(real, "/pipx/venvs/"+inst.Package+"/")
 	case "uv":
 		return strings.Contains(real, "/uv/tools/"+inst.Package+"/")
+	case "native":
+		// Native installs carry the probed path instead of a registry
+		// package marker, so ownership means "this path is the live one".
+		if inst.Path == "" {
+			return false
+		}
+		p := inst.Path
+		if resolved, err := filepath.EvalSymlinks(p); err == nil {
+			p = resolved
+		}
+		return p == real
 	}
 	return false
 }

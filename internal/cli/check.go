@@ -215,9 +215,9 @@ func printUpdateRow(w interface{ Write([]byte) (int, error) }, r resolve.Resolut
 	switch {
 	case r.Outdated:
 		fmt.Fprintf(w, "  %-14s %-32s [%s]  %s → %s%s\n", r.HarnessID, r.Cur, r.Tier, r.Bin, r.Latest, suffix)
-	case r.Tier == "self":
+	case r.Tier == "self" && r.UpdaterReachable():
 		fmt.Fprintf(w, "  %-14s %-32s [self]  %s → updater available%s\n", r.HarnessID, r.Cur, r.Bin, suffix)
-	case r.Tier == "none":
+	case r.Tier == "none" || (r.Tier == "self" && !r.UpdaterReachable()):
 		fmt.Fprintf(w, "  %-14s %-32s [none]  %s → no update path%s\n", r.HarnessID, r.Cur, r.Bin, suffix)
 	case r.ResolverErr != "":
 		fmt.Fprintf(w, "  %-14s %-32s [%s]  %s → (resolver error: %s)%s\n", r.HarnessID, r.Cur, r.Tier, r.Bin, r.ResolverErr, suffix)
@@ -278,7 +278,7 @@ func countUpdates(res []resolve.Resolution, pins map[string]bool) int {
 func countUpdaters(res []resolve.Resolution, pins map[string]bool) int {
 	n := 0
 	for _, r := range res {
-		if r.Tier == "self" && !pins[r.HarnessID] {
+		if r.Tier == "self" && !pins[r.HarnessID] && r.UpdaterReachable() {
 			n++
 		}
 	}

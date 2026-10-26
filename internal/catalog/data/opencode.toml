@@ -25,3 +25,11 @@ bin      = "opencode"
 version  = { cmd = ["opencode", "--version"] }
 latest   = "brew"
 update   = { cmd = ["brew", "upgrade", "opencode"] }
+
+[[installs]]
+method   = "native"
+bin      = "opencode"
+paths    = ["~/.opencode/bin/opencode"]
+version  = { cmd = ["opencode", "--version"] }
+latest   = "self"
+update   = { cmd = ["opencode", "upgrade"] }

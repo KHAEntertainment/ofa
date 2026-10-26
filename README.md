@@ -229,15 +229,15 @@ The shadowed row is marked in the table, and `check --json` carries
 
 | Harness                | Install methods                              | Update path |
 |------------------------|----------------------------------------------|-------------|
-| Claude Code            | native                                       | `claude update` |
-| Codex                  | brew cask                                    | `brew upgrade --cask codex` |
+| Claude Code            | native, npm                                  | `claude update`, `npm i -g @anthropic-ai/claude-code@latest` |
+| Codex                  | brew cask, npm                               | `brew upgrade --cask codex`, `npm i -g @openai/codex@latest` |
 | Cursor Agent           | native                                       | `cursor-agent update` |
 | Devin                  | native                                       | `devin update` |
 | GitHub Copilot CLI     | npm                                          | `copilot update` |
 | Kimi Code              | uv, native                                    | `uv tool upgrade kimi-cli`, `kimi upgrade --yes` |
 | Kilo Code              | npm                                          | `npm i -g @kilocode/cli@latest` |
 | MiniMax (`mmx`)        | npm                                          | `mmx update` |
-| opencode               | npm, brew formula, npm (beta)                | `npm i -g ...`, `brew upgrade opencode` |
+| opencode               | npm, brew formula, npm (beta), native        | `npm i -g ...`, `brew upgrade opencode`, `opencode upgrade` |
 | Pi Coding Agent        | npm                                          | `npm i -g @earendil-works/pi-coding-agent@latest` |
 | Qwen Code              | npm, brew formula                            | `npm i -g ...`, `brew upgrade qwen-code` |
 | Antigravity (`agy`)    | native                                       | `agy update` |
@@ -247,7 +247,21 @@ Adding a harness is a PR with a TOML file. See [`internal/catalog/data/agy.toml`
 
 ## Platform
 
-v1 is macOS-only. Cross-platform is additive by design, with two seams that already exist: install methods are a catalog `method` value plus a small parser in `internal/detect/methods.go` (not a plugin interface), and `update.cmd` is data, so a Linux update path is a new field on the same catalog entry rather than new code.
+macOS and Linux. Every install method OFA implements works on both: npm, pipx,
+uv, Homebrew (including Linuxbrew), curl-installer natives, and the per-harness
+self-updaters. The binary is a single cross-compiled static release; CI tests on
+Linux.
+
+Linux users are covered through the same catalog entries as macOS. The install
+methods that matter there — npm for Claude Code and Codex, the opencode curl
+installer, native paths under `~/.local/bin` — are detected and updated the same
+way. Distro package backends (`apt`, `dnf`, `snap`) are not implemented yet
+because no harness in the catalog ships through a distro repository; adding one
+is a parser branch in `internal/detect/methods.go` plus a `latest` tier when a
+catalog entry needs it.
+
+`update.cmd` is data, so a new install path is a new field on the same catalog
+entry rather than new code.
 
 ## Roadmap
 
@@ -257,8 +271,13 @@ and uncommitted to any date.
 
 ### Medium-term: platform reach
 
-- **Linux detector backends.** `apt`, `dnf`, `snap`, plus the existing npm/pipx/uv/native ones. Each is a parser branch in `internal/detect/methods.go` plus a `latest` tier and catalog rows — additive, but not a one-file drop-in.
-- **Windows (WSL) and native Windows.** WSL reuses the Linux backends; native Windows adds `scoop`, `winget`, and Windows registry probing for native installs.
+- **Distro package backends.** `apt`, `dnf`, and `snap` detection plus their
+  latest-version tiers. Deferred until a catalog entry actually ships through a
+  distro repository — today none do, so these parsers would detect nothing.
+  Everything else OFA supports already runs on Linux (see [Platform](#platform)).
+- **Windows (WSL) and native Windows.** WSL reuses the existing Linux-capable
+  methods; native Windows adds `scoop`, `winget`, and Windows registry probing
+  for native installs.
 
 ### Long-term: agent-assisted Catalog (`ofa doctor`)
 

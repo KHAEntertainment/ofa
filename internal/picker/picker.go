@@ -70,9 +70,14 @@ func buildItems(res []resolve.Resolution, pins map[string]bool) []item {
 	for _, r := range res {
 		// Only items with an update available appear in the picker. At-
 		// latest installs (Tier=brew/npm/pypi with Outdated=false) are
-		// reported by `ofa check` but not actionable here. Shadowed
-		// installs never appear — detect.Scan marks them but they have
-		// no path to be the live binary, so updating them is wasted work.
+		// reported by `ofa check` but not actionable here. A shadowed
+		// registry install stays, because its updater names the package
+		// and reaches the copy it manages; a shadowed native install is
+		// dropped, because `<bin> update` resolves through PATH to a
+		// different executable.
+		if !r.UpdaterReachable() {
+			continue
+		}
 		if !r.Outdated && r.Tier != "self" {
 			continue
 		}
@@ -91,5 +96,14 @@ func labelFor(r resolve.Resolution) string {
 	default:
 		action = r.Bin
 	}
-	return fmt.Sprintf("%-14s %-32s  %s", r.HarnessID, r.Cur, action)
+	return fmt.Sprintf("%-14s %-32s  %s", r.HarnessID, r.Cur, labelSuffix(r, action))
+}
+
+// labelSuffix keeps the action text aligned and adds the shadowed marker, so
+// a selectable row never implies its update replaces the live binary.
+func labelSuffix(r resolve.Resolution, action string) string {
+	if r.Shadowed {
+		return action + " (shadowed)"
+	}
+	return action
 }

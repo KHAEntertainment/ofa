@@ -123,6 +123,13 @@ func buildRequests(cat []catalog.Harness, resolutions []resolve.Resolution, verb
 			skipReasons[labelFor(r)] = "pinned in config"
 			continue
 		}
+		// A shadowed native install's catalog command is "<bin> update",
+		// resolved via PATH. That reaches the live binary, not the copy this
+		// resolution names, so running it would update something else.
+		if r.Shadowed && r.Method == "native" {
+			skipReasons[labelFor(r)] = "shadowed; its update command targets the live binary"
+			continue
+		}
 		h, ok := byID[r.HarnessID]
 		if !ok {
 			skipReasons[labelFor(r)] = "harness not in catalog"

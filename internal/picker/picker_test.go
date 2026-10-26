@@ -57,12 +57,36 @@ func fixture() model {
 
 func TestBuildItems_FiltersAtLatest(t *testing.T) {
 	items := buildItems([]resolve.Resolution{
-		{HarnessID: "codex", Tier: "brew"},                  // at-latest
-		{HarnessID: "claude", Tier: "self"},                  // include (updater available)
-		{HarnessID: "qwen", Outdated: true, Tier: "npm"},    // include (outdated)
+		{HarnessID: "codex", Tier: "brew"},               // at-latest
+		{HarnessID: "claude", Tier: "self"},              // include (updater available)
+		{HarnessID: "qwen", Outdated: true, Tier: "npm"}, // include (outdated)
 	}, nil)
 	if len(items) != 2 {
 		t.Errorf("want 2 items (at-latest dropped), got %d", len(items))
+	}
+}
+
+func TestBuildItems_FiltersUnreachableShadowedOnly(t *testing.T) {
+	items := buildItems([]resolve.Resolution{
+		{HarnessID: "opencode", Method: "native", Tier: "self", Shadowed: true},         // native + shadowed → drop
+		{HarnessID: "qwen", Method: "npm", Outdated: true, Tier: "npm", Shadowed: true}, // registry updater → include
+		{HarnessID: "claude", Method: "native", Tier: "self"},                           // include
+	}, nil)
+	if len(items) != 2 {
+		t.Fatalf("want 2 items, got %d: %+v", len(items), items)
+	}
+	var got []string
+	for _, it := range items {
+		got = append(got, it.Resolution.HarnessID)
+	}
+	if got[0] != "qwen" || got[1] != "claude" {
+		t.Errorf("items = %v, want [qwen claude]", got)
+	}
+	if !strings.Contains(items[0].Label, "(shadowed)") {
+		t.Errorf("shadowed registry row should be marked: %q", items[0].Label)
+	}
+	if strings.Contains(items[1].Label, "(shadowed)") {
+		t.Errorf("active row should not be marked: %q", items[1].Label)
 	}
 }
 
@@ -142,8 +166,8 @@ func TestModel_ATogglesAllOnThenOff(t *testing.T) {
 
 func TestModel_APartialThenAFillsRest(t *testing.T) {
 	m := fixture()
-	m = updateKey(t, m, " ")        // select item 0
-	m = updateKey(t, m, "a")        // a now sees not-all-selected, fills the rest
+	m = updateKey(t, m, " ") // select item 0
+	m = updateKey(t, m, "a") // a now sees not-all-selected, fills the rest
 	for i := range m.items {
 		if !m.selected[i] {
 			t.Errorf("after partial+a: item %d not selected", i)
