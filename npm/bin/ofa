@@ -15,7 +15,7 @@ if (!fs.existsSync(platformBin)) {
   console.error(
     `@khaentertainment/ofa: native binary not staged for ${process.platform}-${process.arch}.\n` +
     `Run \`npm rebuild @khaentertainment/ofa\` (allowing scripts) to retry, or\n` +
-    `install Go 1.25+ and run: go install github.com/KHAEntertainment/ofa/cmd/ofa@latest`
+    `download a binary from https://github.com/KHAEntertainment/ofa/releases`
   );
   process.exit(1);
 }
