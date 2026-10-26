@@ -18,8 +18,8 @@ const subdir = PLATFORM_DIRS[key];
 
 if (!subdir) {
   console.error(`@khaentertainment/ofa: no binary bundled for ${key}.`);
-  console.error(`Install Go 1.25+ and run: go install github.com/KHAEntertainment/ofa/cmd/ofa@latest`);
-  // Don't fail the install — the user can fall back to `go install`.
+  console.error(`Download a release binary from https://github.com/KHAEntertainment/ofa/releases`);
+  // Don't fail the install — the user can install from GitHub releases.
   process.exit(0);
 }
 
