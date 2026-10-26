@@ -22,6 +22,10 @@ type Instance struct {
 	Path      string // resolved live path when Active; empty when Shadowed
 	Version   string
 	Status    Status
+	// OffPath reports that this install's bin does not resolve on PATH. The
+	// install is still real, but a native `<bin> update` cannot run, so
+	// reachability must not be claimed for it.
+	OffPath bool
 }
 
 // Runner runs a command and returns its stdout (stderr discarded). Swappable

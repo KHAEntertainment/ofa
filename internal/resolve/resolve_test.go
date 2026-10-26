@@ -254,6 +254,26 @@ func TestResolve(t *testing.T) {
 
 // TestResolve_BrewAbsentIsClean covers the case where brew outdated doesn't
 // list a package — brew's authoritative "you are up to date" answer.
+func TestUpdaterReachable(t *testing.T) {
+	cases := []struct {
+		name string
+		r    Resolution
+		want bool
+	}{
+		{"native live", Resolution{Method: "native"}, true},
+		{"native shadowed", Resolution{Method: "native", Shadowed: true}, false},
+		{"native off PATH", Resolution{Method: "native", OffPath: true}, false},
+		{"native shadowed and off PATH", Resolution{Method: "native", Shadowed: true, OffPath: true}, false},
+		{"npm shadowed", Resolution{Method: "npm", Shadowed: true}, true},
+		{"brew off PATH", Resolution{Method: "brew-formula", OffPath: true}, true},
+	}
+	for _, c := range cases {
+		if got := c.r.UpdaterReachable(); got != c.want {
+			t.Errorf("%s: UpdaterReachable = %v, want %v", c.name, got, c.want)
+		}
+	}
+}
+
 func TestResolve_BrewAbsentIsClean(t *testing.T) {
 	cat := []catalog.Harness{
 		{ID: "qwen-brew", Installs: []catalog.Install{

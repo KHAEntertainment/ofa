@@ -37,6 +37,7 @@ type Resolution struct {
 	Outdated    bool   // true iff Latest != "" and cur differs from latest
 	Tier        string // "self" | "brew" | "npm" | "pypi" | "none"
 	Shadowed    bool   // this install is not the live binary on PATH
+	OffPath     bool   // this install's bin does not resolve on PATH
 	ResolverErr string // non-empty when latest lookup failed; resolution continues
 
 	// Stale marks a latest version served from cache because a refresh
@@ -51,11 +52,14 @@ type Resolution struct {
 // UpdaterReachable reports whether OFA can run an update that targets this
 // install. Registry updaters name their package (`brew upgrade <pkg>`,
 // `npm i -g <pkg>`, `uv tool upgrade <pkg>`), so they always reach the copy
-// they manage. Native updaters are `<bin> update`, resolved via PATH: for a
-// shadowed native install that runs the live copy instead, so the catalog
-// command cannot update the copy it claims to target.
+// they manage. Native updaters are `<bin> update`, resolved via PATH, so they
+// need the bin on PATH and live: a shadowed native install would run the
+// other executable, and an off-PATH one cannot run at all.
 func (r Resolution) UpdaterReachable() bool {
-	return !(r.Shadowed && r.Method == "native")
+	if r.Method != "native" {
+		return true
+	}
+	return !r.Shadowed && !r.OffPath
 }
 
 // Runner runs a shell command and returns stdout. Same shape as detect.Runner
@@ -126,6 +130,7 @@ func Resolve(insts []detect.Instance, harnesses []catalog.Harness, run Runner, g
 			Cur:       inst.Version,
 			Tier:      in.Latest,
 			Shadowed:  inst.Status == detect.Shadowed,
+			OffPath:   inst.OffPath,
 		}
 		if res.Tier == "" {
 			res.Tier = "self" // default for catalog entries that omit it

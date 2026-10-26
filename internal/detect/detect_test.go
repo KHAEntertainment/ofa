@@ -137,6 +137,9 @@ func TestClassifyNativeSingleKeepsPathWhenNotOnPath(t *testing.T) {
 	if instances[0].Status != Active || instances[0].Path != "/home/x/.local/bin/claude" {
 		t.Errorf("native path should survive a failed LookPath: %+v", instances[0])
 	}
+	if !instances[0].OffPath {
+		t.Errorf("native install absent from PATH should be marked OffPath: %+v", instances[0])
+	}
 }
 
 func TestClassifyNativeSingleShadowedWhenPathResolvesElsewhere(t *testing.T) {

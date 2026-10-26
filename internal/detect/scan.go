@@ -319,6 +319,11 @@ func classify(instances []Instance, live map[string]liveBin) {
 	}
 	for bin, idxs := range byBin {
 		lb := live[bin]
+		if lb.path == "" {
+			for _, i := range idxs {
+				instances[i].OffPath = true
+			}
+		}
 		if len(idxs) == 1 {
 			i := idxs[0]
 			// A lone native install only owns the live binary if PATH
