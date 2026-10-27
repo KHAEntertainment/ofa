@@ -191,6 +191,45 @@ version = { cmd = ["bird", "--version"] }
 	}
 }
 
+// A user file with a misspelled key is skipped like any other invalid file, and
+// its Problem names both the file and the key: the warning has to tell the user
+// which line to fix, not just that something was wrong.
+func TestMergedSkipsUserFileWithUnknownKey(t *testing.T) {
+	dir := t.TempDir()
+	writeFile(t, dir, "local-harness.toml", `id = "local-harness"
+name = "Local Harness"
+
+[[installs]]
+method = "npm"
+package = "local-harness"
+bin = "local-harness"
+lates = "npm"
+version = { cmd = ["local-harness", "--version"] }
+`)
+	writeFile(t, dir, "good.toml", nativeTOML("good", "Good"))
+
+	got, problems, err := Merged(dir)
+	if err != nil {
+		t.Fatalf("a bad user file must not be a hard error: %v", err)
+	}
+	if len(problems) != 1 {
+		t.Fatalf("problems = %v, want 1", problems)
+	}
+	want := "local-harness.toml: unknown key(s): installs.lates"
+	if problems[0].Error() != want {
+		t.Errorf("problem = %q, want %q", problems[0].Error(), want)
+	}
+	if _, ok := byID(got)["local-harness"]; ok {
+		t.Error("entry with an unknown key must be skipped, not merged")
+	}
+	if _, ok := byID(got)["good"]; !ok {
+		t.Error("the valid user file must still load")
+	}
+	if len(got) != len(mustEmbedded(t))+1 {
+		t.Errorf("harness count = %d, want embedded+1", len(got))
+	}
+}
+
 // Two user files claiming one id: the first in filename order wins, and the
 // second is reported. Nothing here may shadow the embedded catalog.
 func TestMergedDuplicateUserIDFirstFileWins(t *testing.T) {
@@ -416,6 +455,39 @@ func TestMergedUnreadableFileIsSkipped(t *testing.T) {
 	}
 	if _, ok := ids["locked"]; ok {
 		t.Error("unreadable file must be skipped, not loaded")
+	}
+}
+
+// The dangerous shape for the doctor flow: a user file that overrides a shipped
+// id but carries a typo. It must be skipped — so the embedded entry survives
+// untouched — rather than half-applied, and reported.
+func TestMergedUnknownKeyInOverrideKeepsEmbeddedEntry(t *testing.T) {
+	embedded := byID(mustEmbedded(t))["claude"]
+	dir := t.TempDir()
+	writeFile(t, dir, "claude.toml", `id = "claude"
+name = "Claude Local"
+
+[[installs]]
+method = "npm"
+package = "@anthropic-ai/claude-code"
+bin = "claude"
+version = { cmd = ["claude", "--version"] }
+updat = { cmd = ["npm", "install", "-g", "@anthropic-ai/claude-code@latest"] }
+`)
+
+	got, problems, err := Merged(dir)
+	if err != nil {
+		t.Fatalf("Merged: %v", err)
+	}
+	if len(problems) != 1 {
+		t.Fatalf("problems = %v, want 1", problems)
+	}
+	want := "claude.toml: unknown key(s): installs.updat, installs.updat.cmd"
+	if problems[0].Error() != want {
+		t.Errorf("problem = %q, want %q", problems[0].Error(), want)
+	}
+	if h := byID(got)["claude"]; !reflect.DeepEqual(h, embedded) {
+		t.Errorf("a rejected override must leave the shipped entry intact:\ngot  %+v\nwant %+v", h, embedded)
 	}
 }
 
