@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strings"
 
 	"github.com/BurntSushi/toml"
 )
@@ -98,15 +99,38 @@ type entry struct {
 // parseEntry decodes and validates one file's bytes. The error carries no
 // file name: loadEntries and Merged both prefix it with the entry's own name,
 // and only they know whether the entry is fatal or skippable.
+//
+// A key the structs do not consume rejects the whole entry. TOML decodes
+// unknown keys happily, so `lates = "npm"` would otherwise yield a valid-looking
+// harness whose latest is empty — an entry that silently detects or updates
+// wrongly, which is exactly what a hand-edited or agent-drafted catalog file
+// tends to contain. This mirrors config.Load, so config.toml and the catalog
+// are strict about typos in the same way.
 func parseEntry(e entry) (Harness, error) {
 	var h Harness
-	if _, err := toml.Decode(string(e.data), &h); err != nil {
+	md, err := toml.Decode(string(e.data), &h)
+	if err != nil {
 		return Harness{}, err
+	}
+	if names := undecodedNames(md.Undecoded()); len(names) > 0 {
+		return Harness{}, fmt.Errorf("unknown key(s): %s", strings.Join(names, ", "))
 	}
 	if err := h.validate(); err != nil {
 		return Harness{}, err
 	}
 	return h, nil
+}
+
+// undecodedNames renders the keys a decode did not consume as full dotted
+// paths ("installs.lates"), sorted so one file always reports the same message
+// whichever order the keys appear in it.
+func undecodedNames(keys []toml.Key) []string {
+	names := make([]string, 0, len(keys))
+	for _, k := range keys {
+		names = append(names, k.String())
+	}
+	sort.Strings(names)
+	return names
 }
 
 func loadEntries(entries []entry) ([]Harness, error) {
