@@ -59,6 +59,13 @@ func ConfigPath() string {
 	return filepath.Join(Dir(), "config.toml")
 }
 
+// CatalogDir returns the path to the user catalog directory, where the user can
+// add a harness or replace one the binary ships with. Like ConfigPath, OFA only
+// ever reads it; nothing here creates it.
+func CatalogDir() string {
+	return filepath.Join(Dir(), "catalog")
+}
+
 // Load reads the user config. A missing file is an empty config, not an error:
 // pinning is opt-in and most users never create the file.
 //
