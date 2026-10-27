@@ -8,6 +8,7 @@ import (
 	"testing"
 	"time"
 
+	"ofa/internal/catalog"
 	"ofa/internal/detect"
 	"ofa/internal/resolve"
 )
@@ -103,53 +104,30 @@ func TestScanUsesUserOverrideOfEmbeddedHarness(t *testing.T) {
 }
 
 // check/scan/apply must survive a broken user catalog: same exit code, same
-// stdout, warnings on stderr only. --json in particular must keep its shape —
-// byte-for-byte identical to the run with no user catalog at all.
+// stdout as the embedded-only baseline, warnings on stderr only. --json in
+// particular must keep its shape — byte-for-byte identical to a run that never
+// had a user catalog at all.
 func TestBrokenUserCatalogWarnsButDoesNotChangeOutput(t *testing.T) {
-	pinned := func() time.Time { return mustTime("2025-01-02T03:04:05Z") }
-
-	// run executes one command against dir and returns its full result.
-	run := func(t *testing.T, args []string, dir string) (ExitCode, string, string) {
-		t.Helper()
-		a, out, errOut, sd, sr, _ := newTestApp(t, args, nil)
-		a.CatalogDir = dir
-		a.Now = pinned
-		sd.instances = []detect.Instance{
-			{HarnessID: "claude", Method: "native", Bin: "claude", Version: "2.1.300", Status: detect.Active},
-			{HarnessID: "qwen", Method: "npm", Package: "@qwen-code/qwen-code", Bin: "qwen", Version: "0.22.1", Status: detect.Active},
-		}
-		sr.res = []resolve.Resolution{
-			{HarnessID: "claude", Method: "native", Bin: "claude", Cur: "2.1.300", Tier: "self"},
-			{HarnessID: "qwen", Method: "npm", Package: "@qwen-code/qwen-code", Cur: "0.22.1", Latest: "0.25.2", Outdated: true, Tier: "npm"},
-		}
-		code := a.Run()
-		return code, out.String(), errOut.String()
-	}
-
 	broken := writeUserCatalog(t, map[string]string{"broken.toml": "id = [unclosed\n"})
-	absent := filepath.Join(t.TempDir(), "catalog")
 
-	for _, args := range [][]string{
-		{"scan"},
-		{"scan", "--json"},
-		{"check"},
-		{"check", "--json"},
-		{"apply", "--dry-run"},
-	} {
+	for _, args := range catalogCommands() {
 		t.Run(strings.Join(args, " "), func(t *testing.T) {
-			wantCode, wantOut, wantErr := run(t, args, absent)
-			gotCode, gotOut, gotErr := run(t, args, broken)
+			wantCode, wantOut, wantErr := userCatalogRun(t, args, "", true)
+			if wantOut == "" {
+				t.Fatalf("embedded-only baseline printed nothing; the comparison would be vacuous")
+			}
+			gotCode, gotOut, gotErr := userCatalogRun(t, args, broken, false)
 
 			if gotCode != wantCode {
 				t.Errorf("exit = %d, want %d unchanged by a skipped user file", gotCode, wantCode)
 			}
 			if gotOut != wantOut {
-				t.Errorf("stdout changed:\nwith broken user file: %q\nwithout:              %q", gotOut, wantOut)
+				t.Errorf("stdout changed:\nwith broken user file: %q\nbaseline:             %q", gotOut, wantOut)
 			}
 			// Stderr must be unchanged except for the one added warning line,
 			// and a clean catalog must add nothing at all.
 			if strings.Contains(wantErr, "skipping user catalog file") {
-				t.Fatalf("no user catalog must not warn, got stderr %q", wantErr)
+				t.Fatalf("the embedded-only baseline must not warn, got stderr %q", wantErr)
 			}
 			warning, rest, found := strings.Cut(gotErr, "\n")
 			if !found {
@@ -190,6 +168,88 @@ func TestBrokenUserCatalogKeepsJSONParsable(t *testing.T) {
 	}
 	if !strings.Contains(stderr.String(), "broken.toml") {
 		t.Errorf("warning missing from stderr, got %q", stderr.String())
+	}
+}
+
+// userCatalogRun executes one command end to end against dir and returns its
+// exit code, stdout and stderr. When embeddedOnly is true the loader is
+// replaced by catalog.Embedded() with no problems, which is the v0.4.1 baseline
+// this feature must leave alone.
+func userCatalogRun(t *testing.T, args []string, dir string, embeddedOnly bool) (ExitCode, string, string) {
+	t.Helper()
+	a, out, errOut, sd, sr, _ := newTestApp(t, args, nil)
+	a.CatalogDir = dir
+	a.Now = func() time.Time { return mustTime("2025-01-02T03:04:05Z") }
+	if embeddedOnly {
+		a.CatalogLoader = func() ([]catalog.Harness, []catalog.Problem, error) {
+			cat, err := catalog.Embedded()
+			return cat, nil, err
+		}
+	}
+	sd.instances = []detect.Instance{
+		{HarnessID: "claude", Method: "native", Bin: "claude", Version: "2.1.300", Status: detect.Active},
+		{HarnessID: "qwen", Method: "npm", Package: "@qwen-code/qwen-code", Bin: "qwen", Version: "0.22.1", Status: detect.Active},
+	}
+	sr.res = []resolve.Resolution{
+		{HarnessID: "claude", Method: "native", Bin: "claude", Cur: "2.1.300", Tier: "self"},
+		{HarnessID: "qwen", Method: "npm", Package: "@qwen-code/qwen-code", Cur: "0.22.1", Latest: "0.25.2", Outdated: true, Tier: "npm"},
+	}
+	code := a.Run()
+	return code, out.String(), errOut.String()
+}
+
+// catalogCommands is the matrix every output-stability assertion runs over.
+func catalogCommands() [][]string {
+	return [][]string{
+		{"scan"},
+		{"scan", "--json"},
+		{"check"},
+		{"check", "--json"},
+		{"apply", "--dry-run"},
+	}
+}
+
+// An absent user catalog, an empty one, and one whose path merely looks like a
+// broken glob pattern must all reproduce the embedded-only baseline exactly:
+// same exit code, same stdout bytes, nothing extra on stderr. The baseline run
+// is a loader returning catalog.Embedded(), so this compares against the
+// shipped behavior rather than against the new loader itself.
+func TestNoUserCatalogMatchesEmbeddedOnlyBaseline(t *testing.T) {
+	root := t.TempDir()
+	for _, args := range catalogCommands() {
+		t.Run(strings.Join(args, " "), func(t *testing.T) {
+			wantCode, wantOut, wantErr := userCatalogRun(t, args, "", true)
+			if wantOut == "" {
+				t.Fatalf("embedded-only baseline printed nothing; the comparison would be vacuous")
+			}
+
+			for _, tc := range []struct {
+				name string
+				dir  string
+			}{
+				{"absent", filepath.Join(root, "absent-catalog")},
+				{"empty", t.TempDir()},
+				// B1 regression: a '[' in the path used to reach
+				// filepath.Glob as a pattern, and `ofa scan --json`
+				// exited 2 with "syntax error in pattern" for a user
+				// catalog that was merely absent.
+				{"absent bracket path", filepath.Join(root, "catalog[")},
+				{"absent star path", filepath.Join(root, "catalog*")},
+			} {
+				t.Run(tc.name, func(t *testing.T) {
+					code, out, errOut := userCatalogRun(t, args, tc.dir, false)
+					if code != wantCode {
+						t.Errorf("exit = %d, want baseline %d", code, wantCode)
+					}
+					if out != wantOut {
+						t.Errorf("stdout differs from the embedded-only baseline:\ngot  %q\nwant %q", out, wantOut)
+					}
+					if errOut != wantErr {
+						t.Errorf("stderr = %q, want baseline %q (no user catalog must be silent)", errOut, wantErr)
+					}
+				})
+			}
+		})
 	}
 }
 

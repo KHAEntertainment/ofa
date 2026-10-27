@@ -1,10 +1,13 @@
 package catalog
 
 import (
+	"errors"
 	"fmt"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"sort"
+	"strings"
 )
 
 // Problem is one user catalog file that could not be used. File is the base
@@ -54,10 +57,7 @@ func Merged(userDir string) ([]Harness, []Problem, error) {
 		index[h.ID] = i
 	}
 
-	files, problems, err := userEntries(userDir)
-	if err != nil {
-		return out, problems, err
-	}
+	files, problems := userEntries(userDir)
 	// fromUser records which user file defined each id, so two user files
 	// claiming one id is a reported duplicate while a user file shadowing an
 	// embedded id is the documented override.
@@ -86,31 +86,77 @@ func Merged(userDir string) ([]Harness, []Problem, error) {
 	return out, problems, nil
 }
 
-// userEntries reads the *.toml files for a user catalog, sorted by base name so
-// that "first file wins" is deterministic. An absent, empty, or non-directory
-// dir yields no entries and no problems: not having a user catalog is the
-// normal case, not a fault worth printing. A file that cannot be read is
-// reported as a problem and skipped, like a file that will not parse.
-func userEntries(dir string) ([]entry, []Problem, error) {
-	// filepath.Join("", "*.toml") is the bare pattern "*.toml", which would
-	// glob the process's working directory. An empty dir means "none".
+// userEntries reads the *.toml files for a user catalog, sorted by file name so
+// that "first file wins" is deterministic. The directory is listed literally —
+// never treated as a glob pattern — because it is a real path the user chose:
+// `~/.config/ofa/catalog[1]` is a directory name, not a character class, and a
+// pattern would either fail to match or read a different directory entirely.
+//
+// An absent dir, a path that is not a directory, and an empty dir all yield no
+// entries and no problems: not having a user catalog is the normal case, not a
+// fault worth printing. A dir that cannot be listed (permissions) is one
+// problem naming the dir, and the embedded catalog still loads. A file that
+// cannot be read is one problem naming that file and is skipped, like a file
+// that will not parse.
+func userEntries(dir string) ([]entry, []Problem) {
+	// Joining "" with a name would read the process's working directory. An
+	// empty dir means "no user catalog", never "the CWD".
 	if dir == "" {
-		return nil, nil, nil
+		return nil, nil
 	}
-	matches, err := filepath.Glob(filepath.Join(dir, "*.toml"))
+	// Stat first so an absent path and a path that is not a directory stay
+	// quiet, while a real access failure is reported against the directory.
+	st, err := os.Stat(dir)
 	if err != nil {
-		return nil, nil, err
+		if errors.Is(err, os.ErrNotExist) {
+			return nil, nil
+		}
+		return nil, []Problem{{File: dir, Err: err}}
 	}
-	sort.Strings(matches)
-	entries := make([]entry, 0, len(matches))
-	var problems []Problem
-	for _, m := range matches {
-		b, err := os.ReadFile(m)
-		if err != nil {
-			problems = append(problems, Problem{File: filepath.Base(m), Err: err})
+	if !st.IsDir() {
+		return nil, nil
+	}
+	dirents, err := os.ReadDir(dir)
+	if err != nil {
+		return nil, []Problem{{File: dir, Err: err}}
+	}
+
+	names := make([]string, 0, len(dirents))
+	for _, de := range dirents {
+		if !strings.HasSuffix(de.Name(), ".toml") || !isCatalogFile(dir, de) {
 			continue
 		}
-		entries = append(entries, entry{name: filepath.Base(m), data: b})
+		names = append(names, de.Name())
 	}
-	return entries, problems, nil
+	sort.Strings(names)
+
+	entries := make([]entry, 0, len(names))
+	var problems []Problem
+	for _, name := range names {
+		b, err := os.ReadFile(filepath.Join(dir, name))
+		if err != nil {
+			problems = append(problems, Problem{File: name, Err: err})
+			continue
+		}
+		entries = append(entries, entry{name: name, data: b})
+	}
+	return entries, problems
+}
+
+// isCatalogFile reports whether de is something to read as a catalog entry: a
+// regular file, or a symlink that resolves to one. A directory named *.toml is
+// skipped. A symlink that cannot be resolved is kept so the read reports it as
+// a problem instead of dropping it silently.
+func isCatalogFile(dir string, de fs.DirEntry) bool {
+	if de.Type().IsRegular() {
+		return true
+	}
+	if de.IsDir() || de.Type()&fs.ModeSymlink == 0 {
+		return false
+	}
+	st, err := os.Stat(filepath.Join(dir, de.Name()))
+	if err != nil {
+		return true
+	}
+	return st.Mode().IsRegular()
 }
