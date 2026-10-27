@@ -59,9 +59,16 @@ type App struct {
 	Stdout io.Writer
 	Stderr io.Writer
 
-	// CatalogLoader returns the harnesses to scan against. Default loads
-	// the embedded TOML Catalog. Tests override to load a temp dir.
-	CatalogLoader func() ([]catalog.Harness, error)
+	// CatalogLoader returns the harnesses to scan against, plus one
+	// catalog.Problem per user catalog file it had to skip. Default loads
+	// the embedded TOML Catalog with the user catalog merged over it
+	// (catalog.Merged over CatalogDir). Tests override to load a temp dir.
+	CatalogLoader func() ([]catalog.Harness, []catalog.Problem, error)
+
+	// CatalogDir is the user catalog directory merged over the embedded
+	// one. Default = config.CatalogDir(); tests point it at a tempdir so a
+	// developer's own ~/.config/ofa/catalog never changes their results.
+	CatalogDir string
 
 	// Pipeline functions. Defaults wire detect+resolve+update end-to-end;
 	// tests can stub any layer to skip the shell.
@@ -117,12 +124,11 @@ func New(args []string, stdin io.Reader, stdout, stderr io.Writer) *App {
 	if stderr == nil {
 		stderr = os.Stderr
 	}
-	return &App{
+	a := &App{
 		Args:          args,
 		Stdin:         stdin,
 		Stdout:        stdout,
 		Stderr:        stderr,
-		CatalogLoader: catalog.Embedded,
 		DetectFn:      detect.Scan,
 		ResolveFn:     resolve.Resolve,
 		DetectRunner:  detect.DefaultRunner,
@@ -133,7 +139,15 @@ func New(args []string, stdin io.Reader, stdout, stderr io.Writer) *App {
 		Now:           time.Now,
 		StderrIsTTY:   stderrIsTTY,
 		ConfigLoader:  config.Load,
+		CatalogDir:    config.CatalogDir(),
 	}
+	// The default loader reads a.CatalogDir rather than config.CatalogDir()
+	// directly, so a test can drive the real merge path against a fixture
+	// directory without reaching into the developer's own catalog.
+	a.CatalogLoader = func() ([]catalog.Harness, []catalog.Problem, error) {
+		return catalog.Merged(a.CatalogDir)
+	}
+	return a
 }
 
 // Run parses the top-level command and dispatches. Returns the process
@@ -225,11 +239,18 @@ func (a *App) warnUnknownPins(cat []catalog.Harness) {
 	}
 }
 
-// loadCatalog is a thin wrapper that prints the error and returns a
-// useful exit. Centralized so every command surfaces load failures the
-// same way.
+// loadCatalog is a thin wrapper that reports skipped user catalog files and
+// then prints any hard load error, returning a useful exit. Centralized so
+// every command surfaces load failures the same way.
+//
+// A skipped user file is a warning, never a failure: the command runs against
+// the embedded catalog plus every file that did load. Warnings go to Stderr so
+// --json on stdout keeps its shape.
 func (a *App) loadCatalog() ([]catalog.Harness, ExitCode) {
-	cat, err := a.CatalogLoader()
+	cat, problems, err := a.CatalogLoader()
+	for _, p := range problems {
+		fmt.Fprintf(a.Stderr, "ofa: warning: skipping user catalog file %v\n", p)
+	}
 	if err != nil {
 		fmt.Fprintf(a.Stderr, "ofa: catalog: %v\n", err)
 		return nil, ExitError
