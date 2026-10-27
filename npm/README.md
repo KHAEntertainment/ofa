@@ -187,17 +187,54 @@ Two limits worth knowing:
   id that is not in the Catalog produces a warning — so a misspelled pin cannot
   look like it worked while OFA updates the harness anyway.
 
+### User catalog
+
+OFA's Catalog is embedded in the binary, and everything it knows can be
+extended or corrected from `~/.config/ofa/catalog/`. Drop one TOML file per
+harness in there and it is merged over the embedded Catalog by id: a file with a
+new `id` adds a harness, and a file whose `id` already ships replaces that entry
+outright — no field-level merge, so the file you write is exactly what OFA uses.
+
+```toml
+# ~/.config/ofa/catalog/my-harness.toml
+id = "my-harness"
+name = "My Harness"
+
+[[installs]]
+method = "native"
+bin = "my-harness"
+paths = ["~/.local/bin/my-harness"]
+version = { cmd = ["my-harness", "--version"] }
+```
+
+Entries use the same keys as the embedded ones — `id`, `name`, `homepage`, and
+one `[[installs]]` block per install method (`brew-formula`, `brew-cask`, `npm`,
+`pipx`, `uv`, `native`). OFA only ever reads this directory; it never writes
+there, and nothing creates it for you.
+
+Three limits worth knowing:
+
+- **One bad file cannot break the catalog.** A file that fails to parse or
+  validate is skipped with a warning on stderr naming the file and the reason.
+  `scan`, `check`, `apply`, and the picker still run, and the embedded entries
+  always load. Warnings never touch stdout, so `--json` output keeps its shape.
+- **First file wins.** Two files claiming one id: the first in filename order is
+  used and the second is reported.
+- **No user catalog is the normal case.** Without the directory — or with it
+  empty — output is byte-identical to a stock install, with nothing extra on
+  stderr.
+
 ## How it works
 
 ```
-catalog.Embedded()  →  detect.Scan()  →  resolve.Resolve()  →  picker / CLI
+catalog.Merged()    →  detect.Scan()  →  resolve.Resolve()  →  picker / CLI
                                               ↓
                                        update.Apply()  →  DefaultExecutor
 ```
 
 Two-layer registry:
 
-1. **Catalog** — a directory of TOML files, one per harness, embedded into the binary at build time. Adding a new harness is adding a file.
+1. **Catalog** — a directory of TOML files, one per harness, embedded into the binary at build time and merged with `~/.config/ofa/catalog/*.toml` at load time (see [User catalog](#user-catalog)). Adding a new harness is adding a file.
 2. **State** — `~/.config/ofa/state.json`, the result of the last scan on this machine, used to compute drift (added / removed / changed).
 
 Detection is deterministic. Each install method (`brew-formula`, `brew-cask`, `npm`, `pipx`, `uv`, `native`) is a labeled branch in `internal/detect/methods.go` that shells out and parses the package manager's own output, plus a catalog `method` value on the entries that use it. Adding a method means a parser, a `latest` tier, and catalog rows — no change to the resolver.

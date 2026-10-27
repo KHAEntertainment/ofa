@@ -95,6 +95,20 @@ type entry struct {
 	data []byte
 }
 
+// parseEntry decodes and validates one file's bytes. The error carries no
+// file name: loadEntries and Merged both prefix it with the entry's own name,
+// and only they know whether the entry is fatal or skippable.
+func parseEntry(e entry) (Harness, error) {
+	var h Harness
+	if _, err := toml.Decode(string(e.data), &h); err != nil {
+		return Harness{}, err
+	}
+	if err := h.validate(); err != nil {
+		return Harness{}, err
+	}
+	return h, nil
+}
+
 func loadEntries(entries []entry) ([]Harness, error) {
 	if len(entries) == 0 {
 		return nil, fmt.Errorf("no catalog entries")
@@ -104,11 +118,8 @@ func loadEntries(entries []entry) ([]Harness, error) {
 	var out []Harness
 	seen := map[string]bool{}
 	for _, e := range entries {
-		var h Harness
-		if _, err := toml.Decode(string(e.data), &h); err != nil {
-			return nil, fmt.Errorf("%s: %w", e.name, err)
-		}
-		if err := h.validate(); err != nil {
+		h, err := parseEntry(e)
+		if err != nil {
 			return nil, fmt.Errorf("%s: %w", e.name, err)
 		}
 		if seen[h.ID] {

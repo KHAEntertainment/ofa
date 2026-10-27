@@ -6,6 +6,7 @@ import (
 	"errors"
 	"io"
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -29,14 +30,17 @@ func mustTime(s string) time.Time {
 }
 
 // stubDetect is a DetectFn substitute. Returns the canned instances and the
-// detector failures to degrade with, if any.
+// detector failures to degrade with, if any. It records the catalog it was
+// handed so tests can assert what the loader actually produced.
 type stubDetect struct {
 	instances []detect.Instance
 	failures  []detect.Failure
 	err       error
+	cat       []catalog.Harness
 }
 
 func (s *stubDetect) Run(cat []catalog.Harness, run detect.Runner) ([]detect.Instance, []detect.Failure, error) {
+	s.cat = cat
 	return s.instances, s.failures, s.err
 }
 
@@ -114,6 +118,10 @@ func newTestApp(t *testing.T, args []string, stdin io.Reader) (*App, *bytes.Buff
 	// Never read the developer's real ~/.config/ofa/config.toml; a pin on
 	// this machine would otherwise change test behavior.
 	a.ConfigLoader = func() (config.Config, error) { return config.Config{}, nil }
+	// Same for the user catalog: keep the real merge path wired, but point
+	// it at an absent tempdir so a harness someone added on this machine
+	// can never change a test's results.
+	a.CatalogDir = filepath.Join(t.TempDir(), "catalog")
 	return a, stdout, stderr, sd, sr, se
 }
 

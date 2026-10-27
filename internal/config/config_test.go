@@ -17,6 +17,9 @@ func TestDirHonorsOFAHomeAndEnsure(t *testing.T) {
 	if got := StatePath(); got != filepath.Join(dir, "state.json") {
 		t.Fatalf("StatePath() = %q", got)
 	}
+	if got := CatalogDir(); got != filepath.Join(dir, "catalog") {
+		t.Fatalf("CatalogDir() = %q, want the catalog dir under OFA_HOME", got)
+	}
 	if err := EnsureDir(); err != nil {
 		t.Fatalf("EnsureDir: %v", err)
 	}
