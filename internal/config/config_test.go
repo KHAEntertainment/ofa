@@ -3,6 +3,7 @@ package config
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -87,5 +88,24 @@ func TestLoadEmptyPinIsError(t *testing.T) {
 	writeConfig(t, `pins = [""]`)
 	if _, err := Load(); err == nil {
 		t.Fatal("expected an error for an empty pin id")
+	}
+}
+
+func TestDoctorDirHonorsOFAHome(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("OFA_HOME", dir)
+	if got, want := DoctorDir(), filepath.Join(dir, "doctor"); got != want {
+		t.Errorf("DoctorDir() = %q, want %q", got, want)
+	}
+}
+
+func TestDoctorDirDefaultUnderConfigDir(t *testing.T) {
+	t.Setenv("OFA_HOME", "")
+	got := DoctorDir()
+	if want := filepath.Join(Dir(), "doctor"); got != want {
+		t.Errorf("DoctorDir() = %q, want %q", got, want)
+	}
+	if !strings.HasSuffix(got, filepath.Join(".config", "ofa", "doctor")) {
+		t.Errorf("DoctorDir() = %q, want it under ~/.config/ofa", got)
 	}
 }

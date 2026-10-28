@@ -4,6 +4,7 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 )
@@ -290,5 +291,75 @@ func writeFile(t *testing.T, dir, name, content string) {
 	t.Helper()
 	if err := os.WriteFile(filepath.Join(dir, name), []byte(content), 0o644); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestValidMethodsMatchesValidate(t *testing.T) {
+	got := ValidMethods()
+	want := []string{"brew-cask", "brew-formula", "native", "npm", "pipx", "uv"}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("ValidMethods() = %v, want %v", got, want)
+	}
+	// The view must stay a view: every advertised method must be accepted by
+	// validate, or doctor's prompt would advertise values the catalog rejects.
+	for _, m := range got {
+		if !validMethods[m] {
+			t.Errorf("ValidMethods advertises %q, which validate rejects", m)
+		}
+	}
+}
+
+func TestValidLatestMatchesValidate(t *testing.T) {
+	got := ValidLatest()
+	want := []string{"brew", "none", "npm", "pypi", "self"}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("ValidLatest() = %v, want %v", got, want)
+	}
+	for _, l := range got {
+		if !validLatest[l] {
+			t.Errorf("ValidLatest advertises %q, which validate rejects", l)
+		}
+	}
+}
+
+func TestParseEntry(t *testing.T) {
+	h, err := ParseEntry("draft.toml", []byte(`id = "x"
+name = "X"
+
+[[installs]]
+method = "npm"
+package = "x"
+bin = "x"
+version = { cmd = ["x", "--version"] }
+latest = "npm"
+`))
+	if err != nil {
+		t.Fatalf("ParseEntry: %v", err)
+	}
+	if h.ID != "x" {
+		t.Errorf("id = %q, want x", h.ID)
+	}
+}
+
+func TestParseEntryPrefixesNameAndValidates(t *testing.T) {
+	// An unknown key is the typo class an agent draft actually produces.
+	_, err := ParseEntry("draft.toml", []byte(`id = "x"
+name = "X"
+lates = "npm"
+
+[[installs]]
+method = "npm"
+package = "x"
+bin = "x"
+version = { cmd = ["x", "--version"] }
+`))
+	if err == nil {
+		t.Fatal("expected unknown-key error")
+	}
+	if !strings.HasPrefix(err.Error(), "draft.toml:") {
+		t.Errorf("error = %q, want it prefixed with the entry name", err)
+	}
+	if !strings.Contains(err.Error(), "unknown key") {
+		t.Errorf("error = %q, want unknown key reason", err)
 	}
 }

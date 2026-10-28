@@ -24,6 +24,7 @@ import (
 	"ofa/internal/catalog"
 	"ofa/internal/config"
 	"ofa/internal/detect"
+	"ofa/internal/doctor"
 	"ofa/internal/resolve"
 	"ofa/internal/update"
 )
@@ -81,6 +82,16 @@ type App struct {
 	ResolveGetter resolve.Getter
 	UpdateExec    update.Executor
 
+	// AgentFn drafts catalog entries for `ofa doctor`. Default runs Claude
+	// Code headless and tool-less (doctor.ClaudeRunner); tests inject a
+	// fake so no test ever spawns a real agent.
+	AgentFn doctor.AgentRunner
+
+	// DoctorDir is the root directory for doctor session artifacts.
+	// Default = config.DoctorDir(); tests point it at a tempdir so a test
+	// never writes into the developer's real ~/.config/ofa/doctor.
+	DoctorDir string
+
 	// State file path. Default = config.StatePath().
 	StatePath string
 
@@ -135,6 +146,8 @@ func New(args []string, stdin io.Reader, stdout, stderr io.Writer) *App {
 		ResolveRunner: resolve.DefaultRunner,
 		ResolveGetter: resolve.DefaultGetter,
 		UpdateExec:    update.DefaultExecutor,
+		AgentFn:       doctor.ClaudeRunner(),
+		DoctorDir:     config.DoctorDir(),
 		StatePath:     config.StatePath(),
 		Now:           time.Now,
 		StderrIsTTY:   stderrIsTTY,
@@ -175,6 +188,8 @@ func (a *App) Run() ExitCode {
 		return a.checkCmd(a.Args[1:])
 	case "apply", "update":
 		return a.applyCmd(a.Args[1:])
+	case "doctor":
+		return a.doctorCmd(a.Args[1:])
 	case "--refresh", "-refresh":
 		// Bare picker with the one flag it accepts. Pass the whole
 		// argv (flag included) so pickerCmd's FlagSet actually parses
@@ -198,6 +213,9 @@ Usage:
                       --dry-run/--plan prints without executing, --verbose
                       streams installer output; default shows progress lines)
   ofa check --json    machine-readable variant
+  ofa doctor [<bin>]  agent-assisted repair for undetected catalog entries
+                      (opt-in, v1 --agent claude only; writes a proposal under
+                      ~/.config/ofa/doctor/history/, never installs it)
   --refresh           re-query registries instead of cached latest versions
                       (accepted by: ofa, ofa check, ofa apply)
   ofa --version       print version

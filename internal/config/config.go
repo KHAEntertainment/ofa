@@ -66,6 +66,14 @@ func CatalogDir() string {
 	return filepath.Join(Dir(), "catalog")
 }
 
+// DoctorDir returns the root directory for `ofa doctor` session artifacts
+// (facts, prompts, and any proposal, under history/). It is derived from Dir
+// like CatalogDir, but unlike the catalog directory doctor does create it —
+// only when doctor actually runs, never during scan/check/apply.
+func DoctorDir() string {
+	return filepath.Join(Dir(), "doctor")
+}
+
 // Load reads the user config. A missing file is an empty config, not an error:
 // pinning is opt-in and most users never create the file.
 //
