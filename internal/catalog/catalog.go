@@ -91,6 +91,39 @@ func Load(dir string) ([]Harness, error) {
 	return loadEntries(entries)
 }
 
+// ValidMethods returns every implementable install method, sorted. It is a
+// read-only view of the same set validate() enforces, so ofa doctor can build
+// its prompt schema from the single source of truth: a method the prompt
+// advertises is always a method the catalog accepts, and vice versa.
+func ValidMethods() []string { return sortedKeys(validMethods) }
+
+// ValidLatest returns every accepted `latest` value, sorted. Read-only view
+// of the set validate() enforces, for the same reason as ValidMethods.
+func ValidLatest() []string { return sortedKeys(validLatest) }
+
+// sortedKeys renders a method/latest set as a sorted slice, a stable
+// read-only view callers can join into prompts or errors.
+func sortedKeys(m map[string]bool) []string {
+	out := make([]string, 0, len(m))
+	for k := range m {
+		out = append(out, k)
+	}
+	sort.Strings(out)
+	return out
+}
+
+// ParseEntry decodes and validates one catalog file's bytes for callers
+// outside the package — ofa doctor, validating an agent-drafted entry before
+// anyone executes it. name only prefixes the error, matching the "file:
+// reason" shape loadEntries and Merged already report.
+func ParseEntry(name string, data []byte) (Harness, error) {
+	h, err := parseEntry(entry{name: name, data: data})
+	if err != nil {
+		return Harness{}, fmt.Errorf("%s: %w", name, err)
+	}
+	return h, nil
+}
+
 type entry struct {
 	name string
 	data []byte
