@@ -171,6 +171,40 @@ func TestBrokenUserCatalogKeepsJSONParsable(t *testing.T) {
 	}
 }
 
+// An unknown key in a user file reaches the user through the same skip path as
+// a syntax error, and the warning names the key as well as the file: a typo in a
+// doctor-drafted entry has to be visible in `ofa scan`, not silently dropped.
+func TestUnknownKeyInUserCatalogWarnsFileAndKey(t *testing.T) {
+	a, _, stderr, sd, _, _ := newTestApp(t, []string{"scan"}, nil)
+	a.CatalogDir = writeUserCatalog(t, map[string]string{
+		"local-harness.toml": `id = "local-harness"
+name = "Local Harness"
+
+[[installs]]
+method = "native"
+bin = "local-harness"
+version = { cmd = ["local-harness", "--version"] }
+lates = "self"
+`,
+	})
+	sd.instances = nil
+
+	if code := a.Run(); code != ExitOK {
+		t.Fatalf("scan exit = %d, want %d (stderr: %s)", code, ExitOK, stderr.String())
+	}
+	got := stderr.String()
+	for _, want := range []string{"ofa: warning: skipping user catalog file", "local-harness.toml", "unknown key(s): installs.lates"} {
+		if !strings.Contains(got, want) {
+			t.Errorf("warning must contain %q, got %q", want, got)
+		}
+	}
+	for _, h := range sd.cat {
+		if h.ID == "local-harness" {
+			t.Error("the skipped entry must not reach detection")
+		}
+	}
+}
+
 // userCatalogRun executes one command end to end against dir and returns its
 // exit code, stdout and stderr. When embeddedOnly is true the loader is
 // replaced by catalog.Embedded() with no problems, which is the v0.4.1 baseline

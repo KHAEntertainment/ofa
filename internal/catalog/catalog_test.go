@@ -1,8 +1,10 @@
 package catalog
 
 import (
+	"io/fs"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -98,6 +100,189 @@ version = { cmd = ["b", "--version"] }
 `)
 	if _, err := Load(dir); err == nil {
 		t.Fatal("expected error for duplicate id")
+	}
+}
+
+// TestLoadRejectsUnknownKeys pins the whole point of the check: a key the
+// structs do not consume means a field the author meant to set that silently
+// stayed empty, so the file is rejected and the message carries the full dotted
+// key path. loadEntries supplies the "file: " prefix, so a user of the CLI
+// always learns which file to fix.
+func TestLoadRejectsUnknownKeys(t *testing.T) {
+	cases := []struct {
+		name string
+		body string
+		want string
+	}{
+		{
+			name: "unknown top-level key",
+			body: `id = "x"
+name = "X"
+pinskills = 3
+
+[[installs]]
+method = "native"
+bin = "x"
+version = { cmd = ["x", "--version"] }
+`,
+			want: "x.toml: unknown key(s): pinskills",
+		},
+		{
+			// The bug from the issue: `latest` misspelled decodes to an
+			// empty Latest, which then resolves as "report-only".
+			name: "misspelled latest inside [[installs]]",
+			body: `id = "x"
+name = "X"
+
+[[installs]]
+method = "npm"
+package = "x-cli"
+bin = "x"
+lates = "npm"
+version = { cmd = ["x", "--version"] }
+`,
+			want: "x.toml: unknown key(s): installs.lates",
+		},
+		{
+			name: "unknown key in the second [[installs]]",
+			body: `id = "x"
+name = "X"
+
+[[installs]]
+method = "native"
+bin = "x"
+version = { cmd = ["x", "--version"] }
+
+[[installs]]
+method = "npm"
+package = "x-cli"
+bin = "x"
+version = { cmd = ["x", "--version"] }
+updat = { cmd = ["npm", "install", "-g", "x-cli"] }
+`,
+			want: "x.toml: unknown key(s): installs.updat, installs.updat.cmd",
+		},
+		{
+			name: "unknown key inside the version table",
+			body: `id = "x"
+name = "X"
+
+[[installs]]
+method = "native"
+bin = "x"
+version = { cmd = ["x", "--version"], lag = 1 }
+`,
+			want: "x.toml: unknown key(s): installs.version.lag",
+		},
+		{
+			name: "unknown key inside the update table",
+			body: `id = "x"
+name = "X"
+
+[[installs]]
+method = "native"
+bin = "x"
+version = { cmd = ["x", "--version"] }
+update = { cmd = ["x", "update"], shim = "z" }
+`,
+			want: "x.toml: unknown key(s): installs.update.shim",
+		},
+		{
+			name: "unknown key in a [installs.version] header table",
+			body: `id = "x"
+name = "X"
+
+[[installs]]
+method = "native"
+bin = "x"
+
+[installs.version]
+cmd = ["x", "--version"]
+verbose = true
+`,
+			want: "x.toml: unknown key(s): installs.version.verbose",
+		},
+		{
+			// An unknown table is reported by its head and by each key under
+			// it, the same way config.toml reports them: nothing is collapsed,
+			// so no key that a typo hid is left out of the message.
+			name: "unknown table names its head and its children",
+			body: `id = "x"
+name = "X"
+
+[[installs]]
+method = "native"
+bin = "x"
+version = { cmd = ["x", "--version"] }
+
+[extra]
+foo = 1
+bar = 2
+`,
+			want: "x.toml: unknown key(s): extra, extra.bar, extra.foo",
+		},
+		{
+			name: "several unknowns are reported together, sorted",
+			body: `id = "x"
+name = "X"
+pinskills = 3
+
+[[installs]]
+method = "npm"
+package = "x-cli"
+bin = "x"
+lates = "npm"
+version = { cmd = ["x", "--version"] }
+update = { cmd = ["x", "update"], shim = "z" }
+`,
+			want: "x.toml: unknown key(s): installs.lates, installs.update.shim, pinskills",
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			writeFile(t, dir, "x.toml", tc.body)
+			hs, err := Load(dir)
+			if err == nil {
+				t.Fatalf("file with an unknown key was accepted: %+v", hs)
+			}
+			if err.Error() != tc.want {
+				t.Errorf("err = %q, want %q", err.Error(), tc.want)
+			}
+			if hs != nil {
+				t.Errorf("a rejected file must yield no harnesses, got %d", len(hs))
+			}
+		})
+	}
+}
+
+// TestEveryEmbeddedEntryParses is the shipped-catalog guard: every embedded
+// data/*.toml must decode with no unknown key. Embedded stops at the first bad
+// file, so this checks the entries one by one and names each one that breaks.
+// It also pins the id == file name convention the embedded files follow.
+func TestEveryEmbeddedEntryParses(t *testing.T) {
+	names, err := fs.Glob(catalogFS, "data/*.toml")
+	if err != nil {
+		t.Fatalf("glob embedded catalog: %v", err)
+	}
+	if len(names) != 13 {
+		t.Fatalf("embedded catalog files = %d, want 13", len(names))
+	}
+	for _, name := range names {
+		b, err := fs.ReadFile(catalogFS, name)
+		if err != nil {
+			t.Fatalf("%s: %v", name, err)
+		}
+		base := filepath.Base(name)
+		h, err := parseEntry(entry{name: base, data: b})
+		if err != nil {
+			t.Errorf("%s: %v", base, err)
+			continue
+		}
+		if want := strings.TrimSuffix(base, ".toml"); h.ID != want {
+			t.Errorf("%s declares id %q, want it to match the file name", base, h.ID)
+		}
 	}
 }
 
