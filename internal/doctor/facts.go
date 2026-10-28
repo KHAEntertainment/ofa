@@ -21,6 +21,10 @@ const (
 	errMax       = 200
 )
 
+// truncationMark marks every cut firstLines makes, and is included in the
+// byte budget it enforces.
+const truncationMark = "…[truncated]"
+
 // Facts is everything doctor knows about one target binary, gathered before
 // any agent is involved. All of it is untrusted: --version and --help output
 // is whatever the binary chose to print, and the paths come from this
@@ -84,30 +88,39 @@ func (f Facts) String() string {
 	return b.String()
 }
 
-// firstLines truncates command output to at most n lines, each at most
-// maxLineRunes runes (UTF-8 boundaries respected), totaling at most maxTotal
-// bytes, marking each cut so a reader knows output continued.
+// firstLines truncates command output to at most n lines of at most
+// maxLineRunes runes each, with the total — newlines and truncation marker
+// included — never exceeding maxTotal bytes.
 func firstLines(s string, n, maxTotal int) string {
+	truncated := false
 	lines := strings.Split(s, "\n")
 	if len(lines) > n {
 		lines = lines[:n]
-		lines[len(lines)-1] += " …[truncated]"
+		truncated = true
 	}
-	total := 0
+	capped := make([]string, len(lines))
 	for i, line := range lines {
 		line = strings.TrimRight(line, "\r")
-		if l := len([]rune(line)); l > maxLineRunes {
-			line = truncateRunes(line, maxLineRunes) + " …[truncated]"
+		if len([]rune(line)) > maxLineRunes {
+			line = truncateRunes(line, maxLineRunes)
+			truncated = true
 		}
-		lines[i] = line
-		total += len(line)
-		if total > maxTotal {
-			lines[i] += " …[truncated]"
-			lines = lines[:i+1]
-			break
-		}
+		capped[i] = line
 	}
-	return strings.TrimRight(strings.Join(lines, "\n"), "\n")
+	out := strings.Join(capped, "\n")
+	if !truncated && len(out) <= maxTotal {
+		return strings.TrimRight(out, "\n")
+	}
+	// Enforce the byte budget exactly: reserve room for the marker, cut on
+	// a rune boundary, then mark.
+	limit := maxTotal - len(truncationMark)
+	if limit < 0 {
+		limit = 0
+	}
+	if len(out) > limit {
+		out = truncateBytes(out, limit)
+	}
+	return out + truncationMark
 }
 
 // truncateRunes caps s at max runes, cutting on a rune boundary.

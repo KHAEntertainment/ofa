@@ -3,8 +3,10 @@ package cli
 import (
 	"context"
 	"errors"
+	"flag"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 
@@ -297,4 +299,57 @@ func findSessionFile(t *testing.T, doctorDir, name string) string {
 		t.Fatalf("read %s: %v", name, err)
 	}
 	return string(b)
+}
+
+// A3: the usage text implies `ofa doctor <bin> --agent claude`, but Go's
+// flag package stops at the first positional, so that order used to fail
+// with a bogus too-many-arguments error. permuteArgs fixes the order.
+func TestDoctorCmd_FlagsAfterPositional(t *testing.T) {
+	a, stdout, stderr, _, _, _ := newTestApp(t, []string{"doctor", "sh", "--agent", "claude"}, nil)
+	agent := &stubAgent{responses: []string{shEntry}}
+	wireDoctor(t, a, agent, shRunner())
+	if code := a.Run(); code != ExitOK {
+		t.Fatalf("exit = %d, want %d; stderr: %s", code, ExitOK, stderr.String())
+	}
+	if !strings.Contains(stdout.String(), "proposal ready") {
+		t.Errorf("stdout = %q, want proposal-ready", stdout.String())
+	}
+}
+
+func TestDoctorCmd_FlagRejectedAfterPositional(t *testing.T) {
+	a, _, stderr, _, _, _ := newTestApp(t, []string{"doctor", "sh", "--agent", "codex"}, nil)
+	agent := &stubAgent{}
+	wireDoctor(t, a, agent, shRunner())
+	if code := a.Run(); code != ExitError {
+		t.Errorf("exit = %d, want %d", code, ExitError)
+	}
+	if !strings.Contains(stderr.String(), "claude only") {
+		t.Errorf("stderr = %q, want the claude-only message", stderr.String())
+	}
+	if strings.Contains(stderr.String(), "expected at most one") {
+		t.Error("flag after positional was misparsed as an extra positional")
+	}
+}
+
+func TestPermuteArgs(t *testing.T) {
+	fs := flag.NewFlagSet("doctor", flag.ContinueOnError)
+	fs.String("agent", "claude", "")
+	cases := []struct {
+		name string
+		in   []string
+		want []string
+	}{
+		{"flag after positional", []string{"sh", "--agent", "claude"}, []string{"--agent", "claude", "sh"}},
+		{"flag before positional", []string{"--agent", "claude", "sh"}, []string{"--agent", "claude", "sh"}},
+		{"flag with = value", []string{"sh", "--agent=claude"}, []string{"--agent=claude", "sh"}},
+		{"positional only", []string{"sh"}, []string{"sh"}},
+		{"two positionals preserved", []string{"sh", "extra"}, []string{"sh", "extra"}},
+		{"dashdash ends flags", []string{"--", "sh"}, []string{"sh"}},
+		{"missing value stays flag", []string{"--agent"}, []string{"--agent"}},
+	}
+	for _, c := range cases {
+		if got := permuteArgs(fs, c.in); !reflect.DeepEqual(got, c.want) {
+			t.Errorf("%s: permuteArgs(%v) = %v, want %v", c.name, c.in, got, c.want)
+		}
+	}
 }

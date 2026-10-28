@@ -15,6 +15,42 @@ import (
 // machine running the suite.
 var doctorAgentLookPath = exec.LookPath
 
+// permuteArgs reorders argv so flags precede positional arguments: Go's
+// flag package stops at the first positional, which made
+// `ofa doctor <bin> --agent claude` — the order the usage text implies —
+// fail with a bogus "too many arguments" error. A flag's value token (for
+// flags that take one) travels with its flag; `--` ends flag parsing.
+func permuteArgs(fs *flag.FlagSet, args []string) []string {
+	var flags, positional []string
+	for i := 0; i < len(args); i++ {
+		a := args[i]
+		if a == "--" {
+			positional = append(positional, args[i+1:]...)
+			break
+		}
+		if strings.HasPrefix(a, "-") && len(a) > 1 {
+			flags = append(flags, a)
+			name := strings.TrimLeft(a, "-")
+			if strings.Contains(name, "=") {
+				continue // --agent=claude carries its own value
+			}
+			if fl := fs.Lookup(name); fl != nil && !boolFlag(fl) && i+1 < len(args) && !strings.HasPrefix(args[i+1], "-") {
+				i++
+				flags = append(flags, args[i])
+			}
+			continue
+		}
+		positional = append(positional, a)
+	}
+	return append(flags, positional...)
+}
+
+// boolFlag reports whether fl is a boolean flag (no value token).
+func boolFlag(fl *flag.Flag) bool {
+	bv, ok := fl.Value.(interface{ IsBoolFlag() bool })
+	return ok && bv.IsBoolFlag()
+}
+
 // doctorCmd implements `ofa doctor [<bin>] [--agent claude]`: opt-in,
 // agent-assisted repair for catalog entries whose binary is installed but
 // not detected. Without a bin argument it runs the gap check and, when
@@ -32,7 +68,7 @@ func (a *App) doctorCmd(args []string) ExitCode {
 	fs := flag.NewFlagSet("doctor", flag.ContinueOnError)
 	fs.SetOutput(a.Stderr)
 	agent := fs.String("agent", "claude", "drafting agent to use (v1: claude only)")
-	if err := fs.Parse(args); err != nil {
+	if err := fs.Parse(permuteArgs(fs, args)); err != nil {
 		return ExitError
 	}
 	// v1 is Claude-only by owner decision: Codex has no tool-less mode, so
@@ -86,7 +122,8 @@ func (a *App) doctorCmd(args []string) ExitCode {
 		}
 	}
 
-	if _, err := exec.LookPath(bin); err != nil {
+	path, err := exec.LookPath(bin)
+	if err != nil {
 		fmt.Fprintf(a.Stderr, "ofa: doctor: %q is not on PATH\n", bin)
 		return ExitError
 	}
@@ -97,20 +134,21 @@ func (a *App) doctorCmd(args []string) ExitCode {
 
 	res, err := doctor.Run(bin, doctor.Options{
 		Agent:     a.AgentFn,
-		Runner:    a.DetectRunner,
+		Runner:    doctor.BoundedRunnerFor(a.DetectRunner, path),
 		Timeout:   doctor.DefaultTimeout,
 		DoctorDir: a.DoctorDir,
 		Now:       a.Now,
 	})
 	if err != nil {
+		// doctor.Run's errors already carry their own "doctor:" prefix.
 		if res != nil {
 			if res.RejectedPath != "" {
-				fmt.Fprintf(a.Stderr, "ofa: doctor: %v\nraw draft saved to %s\n", err, res.RejectedPath)
+				fmt.Fprintf(a.Stderr, "ofa: %v\nraw draft saved to %s\n", err, res.RejectedPath)
 			} else {
-				fmt.Fprintf(a.Stderr, "ofa: doctor: %v\naudit trail: %s\n", err, filepath.Join(res.Dir, "context.md"))
+				fmt.Fprintf(a.Stderr, "ofa: %v\naudit trail: %s\n", err, filepath.Join(res.Dir, "context.md"))
 			}
 		} else {
-			fmt.Fprintf(a.Stderr, "ofa: doctor: %v\n", err)
+			fmt.Fprintf(a.Stderr, "ofa: %v\n", err)
 		}
 		return ExitError
 	}

@@ -1,7 +1,9 @@
 package doctor
 
 import (
+	"errors"
 	"fmt"
+	"os"
 	"path/filepath"
 	"strings"
 
@@ -25,16 +27,18 @@ type Attempt struct {
 
 // ValidateProposal runs one agent output through the full mechanical gate,
 // in the order that matters: extract, parse and validate, gate the commands
-// statically, and only then test-detect — which is the first point anything
-// from the draft executes. It returns the parsed harness and the extracted
-// TOML (what proposed-catalog.toml would contain) on success.
-func ValidateProposal(out, bin string, run detect.Runner) (catalog.Harness, string, error) {
+// statically, and only then test-detect — the first point anything from the
+// draft executes. targetReal is the symlink-resolved path of the authorized
+// target binary (the LookPath winner); the native-path gate binds every
+// probe path to it. It returns the parsed harness and the extracted TOML
+// (what proposed-catalog.toml would contain) on success.
+func ValidateProposal(out, bin, targetReal string, run detect.Runner) (catalog.Harness, string, error) {
 	tomlSrc := ExtractTOML(out)
 	h, err := catalog.ParseEntry("proposed-catalog.toml", []byte(tomlSrc))
 	if err != nil {
 		return catalog.Harness{}, tomlSrc, err
 	}
-	if err := shapeGate(h, bin); err != nil {
+	if err := shapeGate(h, bin, targetReal); err != nil {
 		return catalog.Harness{}, tomlSrc, err
 	}
 	if err := testDetect(h, bin, run); err != nil {
@@ -65,12 +69,11 @@ func ExtractTOML(out string) string {
 // shapeGate statically inspects a parsed proposal BEFORE any of its commands
 // run. Test-detect executes version.cmd, and for native installs it executes
 // the paths entries — commands an agent drafted from untrusted --help
-// output. The gate ensures every name that would execute is the target
-// binary itself and every argument is a plain flag: no path separators, no
-// shell metacharacters, no control characters. update.cmd is never executed
-// by doctor (the install flow only displays it for human review), so it is
-// deliberately not gated here.
-func shapeGate(h catalog.Harness, bin string) error {
+// output. The gate ensures every executed name is the authorized target
+// binary itself and every version command is a read-only version query.
+// update.cmd is never executed by doctor (the install flow only displays it
+// for human review), so it is deliberately not gated here.
+func shapeGate(h catalog.Harness, bin, targetReal string) error {
 	for i, in := range h.Installs {
 		if in.Bin != bin {
 			return fmt.Errorf("install[%d]: bin %q must be %q", i, in.Bin, bin)
@@ -79,52 +82,102 @@ func shapeGate(h catalog.Harness, bin string) error {
 			return err
 		}
 		if in.Method == "native" {
-			for _, p := range in.Paths {
-				if filepath.Base(p) != bin {
-					return fmt.Errorf("install[%d]: native path %q must name the %q binary", i, p, bin)
-				}
+			if err := checkNativePaths(i, in.Paths, bin, targetReal); err != nil {
+				return err
 			}
 		}
 	}
 	return nil
 }
 
-// checkCmd enforces the version command shape: cmd[0] must be the target bin
-// itself (basename equality plus the plain-argument rule leaves no room for
-// "./bin", a path, or any other executable), and every argument must be a
-// plain flag.
+// versionFlags is the exhaustive allowlist of read-only version query
+// argument vectors: a draft's version.cmd must be exactly [bin, flag] with
+// flag from this set. Character filtering cannot establish that a command
+// is a read-only version query — ["bin", "-c", "id"] and
+// ["claude", "-p", "run id"] contain no metacharacters, and test-detect
+// would execute them — so anything outside the allowlist is rejected before
+// any Runner call.
+var versionFlags = map[string]bool{
+	"--version": true,
+	"-version":  true,
+	"-V":        true,
+	"-v":        true,
+	"version":   true,
+}
+
+// checkCmd enforces the version command shape: exactly [bin, flag], with
+// the flag from the read-only allowlist. No arguments at all is rejected
+// too — there is no way to justify running the bare binary as a "version
+// query".
 func checkCmd(i int, cmd []string, bin string) error {
-	if len(cmd) == 0 {
-		return fmt.Errorf("install[%d]: missing version.cmd", i)
+	if len(cmd) != 2 {
+		return fmt.Errorf("install[%d]: version.cmd must be exactly [%q, <flag>], got %q", i, bin, cmd)
 	}
 	if cmd[0] != bin {
 		return fmt.Errorf("install[%d]: version.cmd must start with %q, got %q", i, bin, cmd[0])
 	}
-	for _, arg := range cmd {
-		if arg == "" {
-			return fmt.Errorf("install[%d]: version.cmd contains an empty argument", i)
+	if !versionFlags[cmd[1]] {
+		return fmt.Errorf("install[%d]: version.cmd flag %q is not a read-only version flag (one of --version, -version, -V, -v, version)", i, cmd[1])
+	}
+	return nil
+}
+
+// checkNativePaths authorizes every native probe path against the target's
+// executable identity. detectNative EXECUTES these paths, so basename
+// equality is not enough — a different file or a symlink to another binary
+// with the target's basename would be executed. After ~ expansion each path
+// must be absolute, contain no ".." segment, and have the target's basename;
+// it must then either not exist (it will never be executed — the
+// correctness gate rejects the draft) or resolve to exactly the file PATH
+// authorized as the target, by filepath.EvalSymlinks equality. A symlink
+// chain to the target itself is the legitimate case that survives.
+func checkNativePaths(i int, paths []string, bin, targetReal string) error {
+	for _, p := range paths {
+		expanded := expandTilde(p)
+		if !filepath.IsAbs(expanded) {
+			return fmt.Errorf("install[%d]: native path %q must be absolute", i, p)
 		}
-		if err := plainArg(arg); err != nil {
-			return fmt.Errorf("install[%d]: version.cmd argument %q: %v", i, arg, err)
+		for _, seg := range strings.Split(expanded, string(filepath.Separator)) {
+			if seg == ".." {
+				return fmt.Errorf("install[%d]: native path %q must not contain \"..\"", i, p)
+			}
+		}
+		if filepath.Base(expanded) != bin {
+			return fmt.Errorf("install[%d]: native path %q must name the %q binary", i, p, bin)
+		}
+		st, err := os.Stat(expanded)
+		if errors.Is(err, os.ErrNotExist) {
+			continue // never executed; the correctness gate handles it
+		}
+		if err != nil {
+			return fmt.Errorf("install[%d]: native path %q: %w", i, p, err)
+		}
+		if st.IsDir() {
+			return fmt.Errorf("install[%d]: native path %q is a directory", i, p)
+		}
+		real, err := filepath.EvalSymlinks(expanded)
+		if err != nil {
+			return fmt.Errorf("install[%d]: native path %q: %w", i, p, err)
+		}
+		if real != targetReal {
+			return fmt.Errorf("install[%d]: native path %q resolves to %q, not the authorized %q binary", i, p, real, bin)
 		}
 	}
 	return nil
 }
 
-// plainArg rejects path separators, ':' and shell metacharacters, and control
-// characters. Doctor execs without a shell, so none of these could be
-// interpreted — but they are never legitimate in a version flag, and their
-// presence means the draft is not what the schema asked for.
-func plainArg(arg string) error {
-	if strings.ContainsAny(arg, `/\:;&|<>$`+"`\"'") {
-		return fmt.Errorf("path separator or shell metacharacter")
-	}
-	for _, r := range arg {
-		if r < 0x20 || r == 0x7f {
-			return fmt.Errorf("control character")
+// expandTilde expands a leading ~ to the home directory, the same way
+// detect expands native probe paths.
+func expandTilde(p string) string {
+	if p == "~" || strings.HasPrefix(p, "~/") {
+		if home, err := os.UserHomeDir(); err == nil {
+			if p == "~" {
+				return home
+			}
+			return filepath.Join(home, p[2:])
 		}
 	}
-	return nil
+	return p
 }
 
 // testDetect is the main correctness gate: the proposal must actually detect

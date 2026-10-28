@@ -145,7 +145,7 @@ func Run(bin string, opts Options) (*Result, error) {
 			}
 			return res, fmt.Errorf("doctor: agent run failed: %w", aerr)
 		}
-		h, tomlSrc, verr := ValidateProposal(out, bin, opts.Runner)
+		h, tomlSrc, verr := ValidateProposal(out, bin, facts.RealPath, opts.Runner)
 		if verr == nil {
 			res.Attempts = append(res.Attempts, att)
 			res.Harness = &h
