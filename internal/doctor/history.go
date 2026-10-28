@@ -55,16 +55,18 @@ func NewSessionDir(root string, now time.Time) (string, error) {
 }
 
 // writeSession writes context.md, the audit trail: the facts, every prompt
-// sent, every raw response, and every verdict. 0600, like everything doctor
-// writes: the facts contain local paths and binary output the user may not
-// want world-readable. Prompts and responses are indented as code blocks so
-// the TOML fences inside them cannot restructure the document.
+// sent, every raw response, and every verdict. Raw responses are redacted
+// first — a successful draft that echoes a credential must not persist it
+// here. 0600, like everything doctor writes: the facts contain local paths
+// and binary output the user may not want world-readable. Prompts and
+// responses are indented as code blocks so the TOML fences inside them
+// cannot restructure the document.
 func writeSession(dir, bin string, f Facts, attempts []Attempt) error {
 	var b strings.Builder
 	fmt.Fprintf(&b, "# ofa doctor — %s\n\nSession directory: %s\n\n## Facts\n\n%s\n", bin, dir, f)
 	for i, att := range attempts {
 		fmt.Fprintf(&b, "## Attempt %d\n\n### Prompt sent\n\n%s\n\n", i+1, indentBlock(att.Prompt))
-		out := att.Output
+		out := redactSecrets(att.Output)
 		if out == "" {
 			out = "(no output)"
 		}

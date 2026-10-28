@@ -9,6 +9,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"reflect"
+	"sort"
 	"strconv"
 	"strings"
 	"syscall"
@@ -125,10 +126,13 @@ func NewBoundedRunner(bin, pinned string) detect.Runner {
 	}
 }
 
-// isRegistryCommand reports whether (name, args) is one of the exact command
-// lines detect itself issues for registry sweeps.
+// isRegistryCommand reports whether (name, args) is one of the exact
+// command lines detect itself issues for registry sweeps. The name must be
+// the LITERAL command name — detect never issues a path — so a path whose
+// basename happens to be a registry name is refused like anything else
+// (R3-A1): the helper's fail-closed claim must not have a path-shaped hole.
 func isRegistryCommand(name string, args []string) bool {
-	argvs, ok := registryArgv[filepath.Base(name)]
+	argvs, ok := registryArgv[name]
 	if !ok {
 		return false
 	}
@@ -150,27 +154,37 @@ func isRegistryCommand(name string, args []string) bool {
 }
 
 // canonicalTarget resolves the authorized executable for bin once: the
-// PATH winner, with every symlink resolved. EvalSymlinks failing (a race
-// that removed the file) falls back to the plain path; the caller has
-// already verified the bin exists.
+// PATH winner, with every symlink resolved. A resolution failure is an
+// ERROR, never a fallback to the unresolved alias: the alias is exactly
+// what an attacker with write access to that PATH entry controls, and a
+// resolution race means the file changed under us between LookPath and
+// EvalSymlinks (R3-B1). The caller refuses to build a runner on error.
 func canonicalTarget(bin string) (string, error) {
 	p, err := exec.LookPath(bin)
 	if err != nil {
 		return "", err
 	}
-	if real, err := filepath.EvalSymlinks(p); err == nil {
-		return real, nil
+	return resolveCanonical(p)
+}
+
+// resolveCanonical resolves one path to its canonical real path, failing
+// on any resolution error — a dangling or vanishing symlink must not
+// silently degrade into the alias itself.
+func resolveCanonical(p string) (string, error) {
+	real, err := filepath.EvalSymlinks(p)
+	if err != nil {
+		return "", fmt.Errorf("resolve authorized target %q: %w", p, err)
 	}
-	return p, nil
+	return real, nil
 }
 
 // BoundedRunnerFor swaps detect.DefaultRunner — the unbounded production
 // default — for the pinned bounded runner: the target's canonical path is
 // resolved once, here, before any draft is even asked for. An injected test
 // runner passes through untouched, so the Runner seam keeps working exactly
-// as it did. If the canonical target cannot be resolved (it was verified
-// moments earlier, so this is a race), the result refuses every command
-// rather than executing anything unpinned.
+// as it did. If the canonical target cannot be resolved — the bin vanished,
+// or its PATH alias changed under us mid-resolution (R3-B1) — the result
+// refuses every command rather than executing anything unpinned.
 func BoundedRunnerFor(run detect.Runner, bin string) detect.Runner {
 	if !sameRunner(run, detect.DefaultRunner) {
 		return run
@@ -252,30 +266,34 @@ func execBounded(ctx context.Context, name string, args []string, spec execSpec)
 	cmd.Cancel = func() error { return killProcessGroup(cmd) }
 
 	err = cmd.Run()
-	straggler := false
 	if err != nil {
 		var ee *exec.ExitError
 		if errors.Is(err, exec.ErrWaitDelay) && !errors.As(err, &ee) {
 			// The process itself exited cleanly; a straggler kept the pipes
 			// open past WaitDelay. Treat it as success with the output we
-			// collected, and keep the evidence for the group reap below.
+			// collected.
 			err = nil
-			straggler = true
 		}
 	}
-	// Reap lingering group members only with evidence. The leader has been
-	// reaped by Run, so an unconditional kill(-pgid) could hit a stale or
-	// reused PGID — os.Process's finished-process protection no longer
-	// applies to a raw group signal. A straggler still holding our pipes
-	// past WaitDelay is exactly that evidence: the group provably still has
-	// members, within milliseconds of the leader's exit, when PID reuse is
-	// not yet a practical concern; ESRCH is tolerated if it is already gone.
-	// Quiet descendants that closed our pipes before exiting are not
-	// chased — the alternative is signaling a PGID we can no longer vouch
-	// for. On the timeout path the group is killed pre-reap by Cancel,
-	// where the PGID is still guaranteed valid.
-	if straggler && cmd.Process != nil {
-		_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
+	// Reap lingering group members after Wait, on EVERY outcome — not just
+	// ErrWaitDelay: a parent that exits NON-ZERO returns *exec.ExitError,
+	// which masks ErrWaitDelay, and its same-group pipe-holding child then
+	// outlives the runner's return (R3-B2). The cleanup does not depend on
+	// Wait's error type: kill(-pgid, 0) succeeds only while the group still
+	// has a live (or unreaped) member. What is guaranteed: the leader has
+	// just been reaped by Wait, so a probe hit means a member survived the
+	// leader — within this window (WaitDelay is 2s, not milliseconds) PID
+	// reuse is implausible on real schedulers but NOT kernel-guaranteed;
+	// ESRCH (group gone) and EPERM are tolerated. What is NOT guaranteed:
+	// membership evidence — an open pipe proves a descriptor, not that its
+	// holder is in this group — and deliberately detached (setsid)
+	// descendants are outside the group and are not chased. The timeout
+	// path kills the group pre-reap inside Cancel, where the PGID is
+	// unconditionally valid.
+	if cmd.Process != nil {
+		if syscall.Kill(-cmd.Process.Pid, syscall.Signal(0)) == nil {
+			_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
+		}
 	}
 	if ctxErr := ctx.Err(); ctxErr != nil {
 		return stdout.String(), stderr.String(), stdout.truncated, ctxErr
@@ -321,16 +339,26 @@ func streamSnippet(stdout, stderr string) string {
 
 // credentialVars are the environment variables doctor passes to the agent;
 // their exact values are replaced wherever they appear in subprocess
-// diagnostics.
+// diagnostics and persisted output.
 var credentialVars = []string{"ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "CLAUDE_CODE_OAUTH_TOKEN"}
 
 // redactSecrets replaces the exact values of the credential variables
-// doctor passes to the agent with [redacted].
+// doctor passes to the agent with [redacted], longest value first so an
+// overlapping pair (one value a prefix of the other) cannot leave the
+// longer secret's suffix behind. Matching is EXACT-VALUE only: it is not a
+// credential-format scanner, and values that never crossed the agent
+// boundary are not guessed at — URL-encoded or partial echoes of a value
+// are out of scope.
 func redactSecrets(s string) string {
+	var secrets []string
 	for _, k := range credentialVars {
 		if v := os.Getenv(k); v != "" {
-			s = strings.ReplaceAll(s, v, "[redacted]")
+			secrets = append(secrets, v)
 		}
+	}
+	sort.Slice(secrets, func(i, j int) bool { return len(secrets[i]) > len(secrets[j]) })
+	for _, v := range secrets {
+		s = strings.ReplaceAll(s, v, "[redacted]")
 	}
 	return s
 }

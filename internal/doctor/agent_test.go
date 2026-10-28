@@ -300,3 +300,75 @@ func TestRedactSecrets(t *testing.T) {
 		t.Errorf("redactSecrets = %q, want unchanged", got)
 	}
 }
+
+// heartbeatScript: spawns a same-group heartbeat writer appending to a file
+// every 0.2s, records its pid, prints a message, then exits 3. The heartbeat
+// inherits stdout (holding the pipe) and keeps running after the parent
+// fails.
+const heartbeatScript = `#!/bin/bash
+while true; do echo beat >> %[1]s; /bin/sleep 0.2; done &
+echo $! > %[2]s
+echo "failed"
+exit 3
+`
+
+// R3-B2: a parent that exits NON-ZERO (Wait returns *exec.ExitError, masking
+// ErrWaitDelay) must not leave its pipe-holding heartbeat child running
+// after the runner returns.
+func TestClaudeRunnerFailedParentKillsHeartbeatChild(t *testing.T) {
+	heartbeat := filepath.Join(t.TempDir(), "heartbeat.log")
+	pidfile := filepath.Join(t.TempDir(), "grandchild.pid")
+	fakeClaudeDir(t, "claude", fmt.Sprintf(heartbeatScript, heartbeat, pidfile))
+
+	_, err := ClaudeRunner()(context.Background(), "draft")
+	if err == nil {
+		t.Fatal("expected the exit-3 failure")
+	}
+	if !strings.Contains(err.Error(), "exit status 3") {
+		t.Errorf("error = %v, want exit status 3", err)
+	}
+
+	pid := readPID(t, pidfile)
+	waitProcessGone(t, pid, 3*time.Second)
+
+	// The heartbeat must stop growing: once the child is dead, the file is
+	// frozen.
+	size := func() int64 {
+		st, err := os.Stat(heartbeat)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return st.Size()
+	}
+	a := size()
+	time.Sleep(500 * time.Millisecond)
+	if b := size(); b > a {
+		t.Errorf("heartbeat kept growing after the runner returned: %d → %d bytes", a, b)
+	}
+}
+
+// R3-A2: a SUCCESSFUL draft that echoes a credential must not persist it in
+// context.md.
+func TestRunSuccessRedactsCredentialsInContext(t *testing.T) {
+	t.Setenv("ANTHROPIC_API_KEY", "sk-ant-r3-context-secret")
+	opts := runOpts(t)
+	opts.Agent = (&fakeAgent{responses: []string{
+		"```toml\n" + nativeEntryFor("sh", "/bin/sh") + "\n```\nby the way, the key is sk-ant-r3-context-secret",
+	}}).Run
+	opts.Runner = (&fakeRunner{responses: map[string]string{"sh": "sh 1.0\n", "/bin/sh": "sh 1.0\n", "/usr/bin/sh": "sh 1.0\n"}}).Run
+
+	res, err := Run("sh", opts)
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	ctx, err := os.ReadFile(filepath.Join(res.Dir, "context.md"))
+	if err != nil {
+		t.Fatalf("read context.md: %v", err)
+	}
+	if strings.Contains(string(ctx), "sk-ant-r3-context-secret") {
+		t.Error("context.md persisted the credential")
+	}
+	if !strings.Contains(string(ctx), "[redacted]") {
+		t.Error("context.md missing the redaction marker")
+	}
+}

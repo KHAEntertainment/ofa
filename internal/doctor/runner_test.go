@@ -356,3 +356,86 @@ func TestStreamSnippetBoundedAndQuoted(t *testing.T) {
 		t.Error("empty streams should yield no snippet")
 	}
 }
+
+// R3-B1: an unresolvable target — a dangling PATH alias — must make the
+// factory refuse, never fall back to executing the alias.
+func TestBoundedRunnerForRefusesUnresolvableTarget(t *testing.T) {
+	dir := t.TempDir()
+	dangling := filepath.Join(dir, "zzdangle")
+	if err := os.Symlink(filepath.Join(dir, "zzgone"), dangling); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", dir)
+	run := BoundedRunnerFor(detect.DefaultRunner, "zzdangle")
+	out, err := run("zzdangle", "--version")
+	if err == nil {
+		t.Fatalf("unresolvable target accepted: out = %q", out)
+	}
+	if !strings.Contains(err.Error(), "refused") {
+		t.Errorf("err = %v, want a refusal", err)
+	}
+}
+
+func TestResolveCanonical(t *testing.T) {
+	dir := t.TempDir()
+	real := filepath.Join(dir, "real")
+	if err := os.WriteFile(real, []byte("x"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	// A resolving chain collapses to the canonical file. On macOS
+	// /var → /private/var, so the expected value is itself resolved.
+	want, err := resolveCanonical(real)
+	if err != nil {
+		t.Fatal(err)
+	}
+	link := filepath.Join(dir, "link")
+	if err := os.Symlink(real, link); err != nil {
+		t.Fatal(err)
+	}
+	got, err := resolveCanonical(link)
+	if err != nil || got != want {
+		t.Errorf("resolveCanonical(link) = (%q, %v), want (%q, nil)", got, err, want)
+	}
+	// A dangling symlink is an error, not a silent fallback to the alias.
+	dangling := filepath.Join(dir, "dangling")
+	if err := os.Symlink(filepath.Join(dir, "gone"), dangling); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := resolveCanonical(dangling); err == nil {
+		t.Error("resolveCanonical(dangling) succeeded, want resolution error")
+	}
+}
+
+// R3-A1: registry names are matched literally — a path whose basename is a
+// registry command is refused even with the correct argv.
+func TestNewBoundedRunnerRefusesRegistryPathAliases(t *testing.T) {
+	dir := t.TempDir()
+	fakeNpm := filepath.Join(dir, "npm")
+	if err := os.WriteFile(fakeNpm, []byte("#!/bin/bash\n/usr/bin/env\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", dir)
+	run := NewBoundedRunner("zzpin", "/bin/true")
+	_, err := run(fakeNpm, "ls", "-g", "--depth=0", "--json")
+	if err == nil || !strings.Contains(err.Error(), "refused") {
+		t.Errorf("path-form registry name: err = %v, want refusal", err)
+	}
+	// The literal name with the same argv still runs.
+	if _, err := run("npm", "ls", "-g", "--depth=0", "--json"); err != nil {
+		t.Errorf("literal registry name: err = %v, want success", err)
+	}
+}
+
+// R3-A2: overlapping credential values are redacted longest-first, so a
+// secret that is a prefix of another cannot leave its suffix behind.
+func TestRedactSecretsOverlappingValues(t *testing.T) {
+	t.Setenv("ANTHROPIC_AUTH_TOKEN", "tok-abc")
+	t.Setenv("ANTHROPIC_API_KEY", "tok-abc-VERY-SECRET")
+	got := redactSecrets("here: tok-abc-VERY-SECRET and tok-abc")
+	if strings.Contains(got, "VERY-SECRET") || strings.Contains(got, "tok-abc") {
+		t.Errorf("overlapping secrets survived: %q", got)
+	}
+	if got != "here: [redacted] and [redacted]" {
+		t.Errorf("got = %q", got)
+	}
+}
