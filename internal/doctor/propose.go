@@ -67,12 +67,14 @@ func ExtractTOML(out string) string {
 }
 
 // shapeGate statically inspects a parsed proposal BEFORE any of its commands
-// run. Test-detect executes version.cmd, and for native installs it executes
-// the paths entries — commands an agent drafted from untrusted --help
-// output. The gate ensures every executed name is the authorized target
-// binary itself and every version command is a read-only version query.
-// update.cmd is never executed by doctor (the install flow only displays it
-// for human review), so it is deliberately not gated here.
+// run. It is the first line of defense — clear, early feedback to the model
+// and to the one retry — while the bounded runner is the enforcement at
+// execution time: a draft that slips past this gate still cannot execute
+// anything but the pinned target (see runner.go). Test-detect executes
+// version.cmd, and for native installs it probes the paths entries —
+// commands an agent drafted from untrusted --help output. update.cmd is
+// never executed by doctor (the install flow only displays it for human
+// review), so it is deliberately not gated here.
 func shapeGate(h catalog.Harness, bin, targetReal string) error {
 	for i, in := range h.Installs {
 		if in.Bin != bin {
@@ -90,47 +92,43 @@ func shapeGate(h catalog.Harness, bin, targetReal string) error {
 	return nil
 }
 
-// versionFlags is the exhaustive allowlist of read-only version query
-// argument vectors: a draft's version.cmd must be exactly [bin, flag] with
-// flag from this set. Character filtering cannot establish that a command
-// is a read-only version query — ["bin", "-c", "id"] and
-// ["claude", "-p", "run id"] contain no metacharacters, and test-detect
-// would execute them — so anything outside the allowlist is rejected before
-// any Runner call.
+// versionFlags is the read-only version query argument allowlist. It has
+// exactly one entry — "--version" — the vector the facts phase has already
+// proven for this binary and the vector every shipped catalog entry uses.
+// Character filtering cannot establish that a command is read-only, and
+// wider allowlists ("-v", "version", ...) authorize active behavior on
+// harnesses the catalog has never seen, so anything outside this set is
+// rejected before any Runner call.
 var versionFlags = map[string]bool{
 	"--version": true,
-	"-version":  true,
-	"-V":        true,
-	"-v":        true,
-	"version":   true,
 }
 
-// checkCmd enforces the version command shape: exactly [bin, flag], with
-// the flag from the read-only allowlist. No arguments at all is rejected
-// too — there is no way to justify running the bare binary as a "version
-// query".
+// checkCmd enforces the version command: exactly [bin, "--version"]. The
+// facts phase has already run `<bin> --version` successfully before
+// drafting, and every shipped catalog entry uses exactly this form — so
+// one form, no judgment calls. Anything else is rejected before any Runner
+// call: bare "version" is a positional prompt on some harnesses (pi's
+// `version` in non-TTY starts a tool-enabled model session), "-v" is
+// verbose or ambiguous on others, and "-c"/"-p"/extra arguments are
+// active commands. The error text tells the model exactly what to use, and
+// it is what the one retry feeds back.
 func checkCmd(i int, cmd []string, bin string) error {
-	if len(cmd) != 2 {
-		return fmt.Errorf("install[%d]: version.cmd must be exactly [%q, <flag>], got %q", i, bin, cmd)
-	}
-	if cmd[0] != bin {
-		return fmt.Errorf("install[%d]: version.cmd must start with %q, got %q", i, bin, cmd[0])
-	}
-	if !versionFlags[cmd[1]] {
-		return fmt.Errorf("install[%d]: version.cmd flag %q is not a read-only version flag (one of --version, -version, -V, -v, version)", i, cmd[1])
+	if len(cmd) != 2 || cmd[0] != bin || cmd[1] != "--version" {
+		return fmt.Errorf("install[%d]: version.cmd must be exactly [%q, \"--version\"], got %q", i, bin, cmd)
 	}
 	return nil
 }
 
 // checkNativePaths authorizes every native probe path against the target's
-// executable identity. detectNative EXECUTES these paths, so basename
-// equality is not enough — a different file or a symlink to another binary
-// with the target's basename would be executed. After ~ expansion each path
-// must be absolute, contain no ".." segment, and have the target's basename;
-// it must then either not exist (it will never be executed — the
-// correctness gate rejects the draft) or resolve to exactly the file PATH
-// authorized as the target, by filepath.EvalSymlinks equality. A symlink
-// chain to the target itself is the legitimate case that survives.
+// executable identity — statically, for feedback; the bounded runner pins
+// what actually executes (R2-B2). detectNative probes these paths, so
+// basename equality is not enough. After ~ expansion each path must be
+// absolute, contain no ".." segment, and have the target's basename; it
+// must then either not exist (the correctness gate rejects the draft, and
+// even if the file appears later the runner still executes only the pinned
+// target) or resolve to exactly the file PATH authorized as the target, by
+// filepath.EvalSymlinks equality. A symlink chain to the target itself is
+// the legitimate case that survives.
 func checkNativePaths(i int, paths []string, bin, targetReal string) error {
 	for _, p := range paths {
 		expanded := expandTilde(p)

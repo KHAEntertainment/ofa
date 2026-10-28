@@ -128,14 +128,91 @@ func TestExecBoundedNonZeroExitCarriesStderr(t *testing.T) {
 	}
 }
 
-// The target binary runs with the minimal environment: no secrets cross.
+// R2-B2: execution is pinned. A draft-supplied path is never what runs —
+// not a symlink swapped after the static gate, and not a path that was
+// absent at the gate and created before the exec.
+func TestNewBoundedRunnerPinsTheAuthorizedTarget(t *testing.T) {
+	dir := t.TempDir()
+	authorized := filepath.Join(dir, "zzpin")
+	if err := os.WriteFile(authorized, []byte("#!/bin/bash\necho zzpin 1.0\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	// The evil double: writes a marker, so any execution of it is visible.
+	evilDir := t.TempDir()
+	marker := filepath.Join(t.TempDir(), "PWNED")
+	evil := filepath.Join(evilDir, "zzpin")
+	if err := os.WriteFile(evil, []byte(fmt.Sprintf("#!/bin/bash\ntouch %s\necho evil\n", marker)), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	run := NewBoundedRunner("zzpin", authorized)
+
+	// A symlink that pointed at the authorized target when the static gate
+	// checked it, then swapped to the evil double before detection execs.
+	linkDir := t.TempDir()
+	link := filepath.Join(linkDir, "zzpin")
+	if err := os.Symlink(authorized, link); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(link); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(evil, link); err != nil {
+		t.Fatal(err)
+	}
+	out, err := run(link, "--version")
+	if err != nil {
+		t.Fatalf("pinned run: %v", err)
+	}
+	if !strings.Contains(out, "zzpin 1.0") {
+		t.Errorf("output = %q, want the authorized target's output", out)
+	}
+	if _, err := os.Stat(marker); !os.IsNotExist(err) {
+		t.Fatal("the swapped symlink was executed: marker file exists")
+	}
+
+	// A path that was absent at gate time and created before the exec.
+	if _, err := run(evil, "--version"); err != nil {
+		t.Fatalf("pinned run: %v", err)
+	}
+	if _, err := os.Stat(marker); !os.IsNotExist(err) {
+		t.Fatal("the late-created path was executed: marker file exists")
+	}
+
+	// The bin name itself is pinned too.
+	if out, err = run("zzpin", "--version"); err != nil || !strings.Contains(out, "zzpin 1.0") {
+		t.Errorf("run(bin) = (%q, %v)", out, err)
+	}
+}
+
+// Anything that is not the pinned target or a fixed registry command is
+// refused without executing — fail closed.
+func TestNewBoundedRunnerRefusesEverythingElse(t *testing.T) {
+	run := NewBoundedRunner("zzpin", "/bin/true")
+	// A different name with its own basename.
+	if _, err := run("/bin/otherbin", "--version"); err == nil || !strings.Contains(err.Error(), "refused") {
+		t.Errorf("foreign name: err = %v, want refusal", err)
+	}
+	// The right name with the wrong argv.
+	if _, err := run("zzpin", "-c", "touch", "x"); err == nil || !strings.Contains(err.Error(), "refused") {
+		t.Errorf("wrong argv: err = %v, want refusal", err)
+	}
+	// A registry tool with an argv detect never issues.
+	if _, err := run("npm", "install", "-g", "evil"); err == nil || !strings.Contains(err.Error(), "refused") {
+		t.Errorf("smuggled registry argv: err = %v, want refusal", err)
+	}
+}
+
+// The pinned target runs with the minimal environment: no secrets cross.
 func TestNewBoundedRunnerTargetModeMinimalEnv(t *testing.T) {
 	t.Setenv("GITHUB_TOKEN", "ghp-leak")
 	t.Setenv("AWS_SECRET_ACCESS_KEY", "aws-leak")
-	run := NewBoundedRunner("/usr/bin/env")
-	out, err := run("env")
+	zzenv := script(t, "env\n")
+	// The pinned path's basename need not match the bin; the runner pins by
+	// decision, not by name.
+	run := NewBoundedRunner("zzenv", zzenv)
+	out, err := run("zzenv", "--version")
 	if err != nil {
-		t.Fatalf("bounded runner: %v", err)
+		t.Fatalf("pinned run: %v", err)
 	}
 	if !strings.Contains(out, "TERM=dumb") {
 		t.Errorf("target-mode env missing TERM=dumb: %q", out)
@@ -147,23 +224,20 @@ func TestNewBoundedRunnerTargetModeMinimalEnv(t *testing.T) {
 	}
 }
 
-// Registry commands inherit the caller's environment and still run bounded.
+// Registry commands inherit the caller's environment and run only with
+// detect's fixed argv.
 func TestNewBoundedRunnerRegistryModeInheritsEnv(t *testing.T) {
 	t.Setenv("OFABOUND_TEST_VAR", "inherited")
-	run := NewBoundedRunner("/bin/zztarget")
-	// brew is a registry command name; use it to run env via... no — the
-	// runner executes the named command directly. Use a registry name only
-	// detect uses; here assert the routing decision indirectly through a
-	// command whose base IS a registry name.
-	dir := t.TempDir()
-	p := filepath.Join(dir, "npm")
-	if err := os.WriteFile(p, []byte("#!/bin/bash\nenv\n"), 0o755); err != nil {
+	regDir := t.TempDir()
+	fakeNpm := filepath.Join(regDir, "npm")
+	if err := os.WriteFile(fakeNpm, []byte("#!/bin/bash\n/usr/bin/env\n"), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	run = NewBoundedRunner("/bin/zztarget")
-	out, err := run(p)
+	t.Setenv("PATH", regDir)
+	run := NewBoundedRunner("zzpin", "/bin/true")
+	out, err := run("npm", "ls", "-g", "--depth=0", "--json")
 	if err != nil {
-		t.Fatalf("bounded runner: %v", err)
+		t.Fatalf("registry run: %v", err)
 	}
 	if !strings.Contains(out, "OFABOUND_TEST_VAR=inherited") {
 		t.Errorf("registry-mode env did not inherit: %q", out)
@@ -171,19 +245,24 @@ func TestNewBoundedRunnerRegistryModeInheritsEnv(t *testing.T) {
 }
 
 // BoundedRunnerFor passes injected runners through untouched and swaps only
-// the unbounded production default.
+// the unbounded production default, pinning the target once.
 func TestBoundedRunnerFor(t *testing.T) {
 	fake := func(name string, args ...string) (string, error) { return "fake", nil }
-	if got := BoundedRunnerFor(fake, "/bin/sh"); sameRunner(got, fake) == false {
+	if got := BoundedRunnerFor(fake, "sh"); !sameRunner(got, fake) {
 		t.Error("injected runner was replaced")
 	}
-	bounded := BoundedRunnerFor(detect.DefaultRunner, "/bin/echo")
+	bounded := BoundedRunnerFor(detect.DefaultRunner, "echo")
 	if sameRunner(bounded, detect.DefaultRunner) {
 		t.Fatal("detect.DefaultRunner was passed through unbounded")
 	}
-	out, err := bounded("/bin/echo", "swapped")
-	if err != nil || out != "swapped\n" {
-		t.Errorf("bounded runner = (%q, %v), want (swapped\\n, nil)", out, err)
+	// The pinned target: any probe of echo executes the canonical echo,
+	// with argv[0] presented as the bin name.
+	out, err := bounded("echo", "--version")
+	if err != nil {
+		t.Fatalf("pinned run: %v", err)
+	}
+	if out != "--version\n" {
+		t.Errorf("pinned echo output = %q, want --version\\n", out)
 	}
 }
 

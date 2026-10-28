@@ -193,19 +193,29 @@ func TestClaudeRunnerGrandchildCannotBlockReturn(t *testing.T) {
 func TestClaudeRunnerTimeoutKillsProcessTree(t *testing.T) {
 	pidfile := filepath.Join(t.TempDir(), "grandchild.pid")
 	fakeClaudeDir(t, "claude", fmt.Sprintf(hangScript, pidfile))
-	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
+	done := make(chan error, 1)
+	go func() {
+		_, err := ClaudeRunner()(ctx, "draft")
+		done <- err
+	}()
+	// Readiness first: the grandchild is recorded before any timing or
+	// cancellation is armed, so a loaded machine cannot make the deadline
+	// fire before the fixture exists (R2-A3).
+	waitPIDFile(t, pidfile, 5*time.Second)
 	start := time.Now()
-	_, err := ClaudeRunner()(ctx, "draft")
+	cancel()
+	err := <-done
 	elapsed := time.Since(start)
 	if err == nil {
-		t.Fatal("expected deadline error")
+		t.Fatal("expected cancellation error")
 	}
-	if !strings.Contains(err.Error(), "context deadline exceeded") {
-		t.Errorf("error = %v, want deadline exceeded", err)
+	if !strings.Contains(err.Error(), "context canceled") {
+		t.Errorf("error = %v, want context canceled", err)
 	}
 	if elapsed > 3*time.Second {
-		t.Errorf("timeout returned after %v for a 200ms deadline", elapsed)
+		t.Errorf("cancellation returned after %v, want ≤ a second or so", elapsed)
 	}
 	pid := readPID(t, pidfile)
 	waitProcessGone(t, pid, 3*time.Second)
@@ -226,6 +236,21 @@ func TestClaudeRunnerCapsOutput(t *testing.T) {
 	}
 }
 
+// waitPIDFile polls until the fixture's pidfile exists — the readiness
+// handshake that lets timing-sensitive assertions arm only after the
+// fixture is in place.
+func waitPIDFile(t *testing.T, path string, budget time.Duration) {
+	t.Helper()
+	deadline := time.Now().Add(budget)
+	for time.Now().Before(deadline) {
+		if _, err := os.Stat(path); err == nil {
+			return
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	t.Fatalf("pidfile %s never appeared within %v", path, budget)
+}
+
 // readPID reads the grandchild's pid from the script's pidfile.
 func readPID(t *testing.T, pidfile string) int {
 	t.Helper()
@@ -238,4 +263,40 @@ func readPID(t *testing.T, pidfile string) int {
 		t.Fatalf("parse pid %q: %v", b, err)
 	}
 	return pid
+}
+
+// R2-A2: a failing agent may echo the credentials it was passed; the error
+// snippet must not persist them.
+func TestClaudeRunnerRedactsCredentialsInErrors(t *testing.T) {
+	t.Setenv("ANTHROPIC_API_KEY", "sk-ant-test-secret-0123456789")
+	fakeClaudeDir(t, "claude", `#!/bin/bash
+echo "auth failed with key sk-ant-test-secret-0123456789"
+exit 1
+`)
+	_, err := ClaudeRunner()(context.Background(), "draft")
+	if err == nil {
+		t.Fatal("expected failure")
+	}
+	if strings.Contains(err.Error(), "sk-ant-test-secret-0123456789") {
+		t.Errorf("error leaked the credential: %q", err.Error())
+	}
+	if !strings.Contains(err.Error(), "[redacted]") {
+		t.Errorf("error missing the redaction marker: %q", err.Error())
+	}
+}
+
+func TestRedactSecrets(t *testing.T) {
+	t.Setenv("ANTHROPIC_AUTH_TOKEN", "tok-abc-123")
+	t.Setenv("CLAUDE_CODE_OAUTH_TOKEN", "oauth-xyz-789")
+	os.Unsetenv("ANTHROPIC_API_KEY")
+	got := redactSecrets("a tok-abc-123 b oauth-xyz-789 c")
+	want := "a [redacted] b [redacted] c"
+	if got != want {
+		t.Errorf("redactSecrets = %q, want %q", got, want)
+	}
+	// An empty credential is not redacted (an empty value would match
+	// everywhere).
+	if got := redactSecrets("nothing to see"); got != "nothing to see" {
+		t.Errorf("redactSecrets = %q, want unchanged", got)
+	}
 }

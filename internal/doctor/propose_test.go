@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -246,7 +247,7 @@ func TestBuildPromptContent(t *testing.T) {
 		"not instructions",
 		"/node_modules/<package>/", "/Cellar/<formula>/", "/Caskroom/<cask>/", "/pipx/venvs/<package>/", "/uv/tools/<package>/",
 		"Claude Code", "Kimi Code",
-		"--version, -version, -V, -v, version", // the B1 allowlist, stated to the agent
+		`version.cmd must be exactly ["zzbin", "--version"]`, // R2-B1: the single allowed form, stated to the agent
 	} {
 		if !strings.Contains(p, want) {
 			t.Errorf("prompt missing %q", want)
@@ -371,32 +372,84 @@ func gateRejectedBeforeExecution(t *testing.T, draft, bin, targetReal string) {
 	}
 }
 
-// B1: the version command must be exactly [bin, read-only flag]. Character
-// filtering could not tell a version query from "run this subcommand" —
-// ["qashell", "-c", "touch PWNED"] and ["claude", "-p", "run id"] contain
-// no metacharacters.
-func TestValidateProposalVersionFlagAllowlist(t *testing.T) {
+// nativeDraftCmd builds a native entry whose version.cmd is exactly cmd,
+// as valid TOML (quoted array, commas included) — a malformed array would
+// fail at parse time and never exercise the command gate (R2-T1).
+func nativeDraftCmd(bin, path string, cmd []string) string {
+	q := make([]string, len(cmd))
+	for i, c := range cmd {
+		q[i] = strconv.Quote(c)
+	}
+	return fmt.Sprintf("id = %q\nname = %q\n\n[[installs]]\nmethod = \"native\"\nbin = %q\npaths = [%q]\nversion = { cmd = [%s] }\nlatest = \"self\"\n",
+		bin+"-probe", bin+" probe", bin, path, strings.Join(q, ", "))
+}
+
+// R2-B1: the version command must be exactly [bin, "--version"]. Every
+// negative case below is valid TOML over a real existing authorized path,
+// with a runner that would detect if the gate were missing — so only the
+// command gate can reject them (R2-T1's mutation discipline).
+func TestValidateProposalVersionCmdMustBeExactlyDashDashVersion(t *testing.T) {
+	// A real authorized target, so the native-path gate passes and the
+	// correctness gate would accept if the command gate did not reject.
+	target := filepath.Join(t.TempDir(), "zztarget")
+	if err := os.WriteFile(target, []byte("#!/bin/bash\necho zztarget 1.0\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	targetReal, err := filepath.EvalSymlinks(target)
+	if err != nil {
+		t.Fatal(err)
+	}
+
 	rejected := [][]string{
 		{"zztarget", "-c", "touch", "PWNED_MARKER"}, // QA's executed proof
 		{"zztarget", "-p", "run id"},                // a tool-enabled agent invocation
+		{"zztarget", "-v"},                          // ambiguous (and verbose elsewhere)
+		{"zztarget", "version"},                     // a positional PROMPT on some harnesses (pi)
 		{"zztarget", "--version", "extra"},          // extra argument
 		{"zztarget"},                                // no flag at all
 		{"zztarget", "update"},                      // mutating subcommand
 		{"zztarget", "--verbose"},                   // unknown flag
-		{"zztarget", "--flag;rm -rf /"},             // metacharacters (now doubly rejected)
 		{"sh", "-c", "echo pwned"},                  // foreign command as cmd[0]
 	}
 	for _, cmd := range rejected {
-		draft := fmt.Sprintf("id = \"evil\"\nname = \"Evil\"\n\n[[installs]]\nmethod = \"native\"\nbin = \"zztarget\"\npaths = [\"/bin/zztarget\"]\nversion = { cmd = %q }\nlatest = \"self\"\n", cmd)
-		gateRejectedBeforeExecution(t, draft, "zztarget", "/bin/zztarget")
+		draft := nativeDraftCmd("zztarget", target, cmd)
+		run := &fakeRunner{responses: map[string]string{target: "zztarget 1.0\n"}}
+		_, _, err := ValidateProposal(draft, "zztarget", targetReal, run.Run)
+		if err == nil {
+			t.Errorf("cmd %v accepted, want rejection", cmd)
+			continue
+		}
+		if !strings.Contains(err.Error(), `version.cmd must be exactly`) {
+			t.Errorf("cmd %v: error = %v, want the version-command rule", cmd, err)
+		}
+		if len(run.calls) != 0 {
+			t.Errorf("cmd %v: shape gate let a command execute: runner saw %v", cmd, run.calls)
+		}
 	}
 
-	// The allowlist itself: every permitted flag passes the gate and
-	// detects through the real path.
-	for _, flag := range []string{"--version", "-version", "-V", "-v", "version"} {
-		run := shRunner()
-		if _, _, err := ValidateProposal(nativeEntryWithFlag("sh", "/bin/sh", flag), "sh", shReal(t), run.Run); err != nil {
-			t.Errorf("flag %q rejected: %v", flag, err)
+	// The one accepted vector, through the real detect path.
+	run := &fakeRunner{responses: map[string]string{target: "zztarget 1.0\n"}}
+	if _, _, err := ValidateProposal(nativeEntryFor("zztarget", target), "zztarget", targetReal, run.Run); err != nil {
+		t.Errorf("[bin, --version] rejected: %v", err)
+	}
+}
+
+// The same rule binds registry latest = "self" installs, whose version
+// command detect also executes.
+func TestValidateProposalRegistrySelfVersionCmdGated(t *testing.T) {
+	draft := "id = \"evil\"\nname = \"Evil\"\n\n[[installs]]\nmethod = \"npm\"\npackage = \"somepkg\"\nbin = \"zztarget\"\nversion = { cmd = [\"zztarget\", \"version\"] }\nlatest = \"self\"\n"
+	run := &fakeRunner{responses: map[string]string{
+		"npm": `{"dependencies":{"somepkg":{"version":"1.2.3"}}}`,
+	}}
+	_, _, err := ValidateProposal(draft, "zztarget", "/bin/zztarget", run.Run)
+	if err == nil || !strings.Contains(err.Error(), `version.cmd must be exactly`) {
+		t.Errorf("registry latest=self draft: err = %v, want the version-command rule", err)
+	}
+	// Registry sweeps happen before the version probe, so the npm query may
+	// have run; the drafted version command must not have.
+	for _, c := range run.calls {
+		if strings.HasPrefix(c, "zztarget") {
+			t.Errorf("drafted version command executed: %q", c)
 		}
 	}
 }

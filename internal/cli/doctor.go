@@ -22,10 +22,15 @@ var doctorAgentLookPath = exec.LookPath
 // flags that take one) travels with its flag; `--` ends flag parsing.
 func permuteArgs(fs *flag.FlagSet, args []string) []string {
 	var flags, positional []string
+	seenDashDash := false
+	// "--" ends flag parsing: everything after it is positional, and the
+	// sentinel itself is preserved in the output so flag.Parse stops there
+	// too.
 	for i := 0; i < len(args); i++ {
 		a := args[i]
 		if a == "--" {
 			positional = append(positional, args[i+1:]...)
+			seenDashDash = true
 			break
 		}
 		if strings.HasPrefix(a, "-") && len(a) > 1 {
@@ -41,6 +46,13 @@ func permuteArgs(fs *flag.FlagSet, args []string) []string {
 			continue
 		}
 		positional = append(positional, a)
+	}
+	// The end-of-flags sentinel is preserved only when present: everything
+	// after it stays positional, so `ofa doctor -- --agent=codex` drafts for
+	// a bin literally named "--agent=codex" instead of parsing a flag the
+	// user meant to escape.
+	if seenDashDash {
+		flags = append(flags, "--")
 	}
 	return append(flags, positional...)
 }
@@ -122,8 +134,7 @@ func (a *App) doctorCmd(args []string) ExitCode {
 		}
 	}
 
-	path, err := exec.LookPath(bin)
-	if err != nil {
+	if _, err := exec.LookPath(bin); err != nil {
 		fmt.Fprintf(a.Stderr, "ofa: doctor: %q is not on PATH\n", bin)
 		return ExitError
 	}
@@ -134,7 +145,7 @@ func (a *App) doctorCmd(args []string) ExitCode {
 
 	res, err := doctor.Run(bin, doctor.Options{
 		Agent:     a.AgentFn,
-		Runner:    doctor.BoundedRunnerFor(a.DetectRunner, path),
+		Runner:    doctor.BoundedRunnerFor(a.DetectRunner, bin),
 		Timeout:   doctor.DefaultTimeout,
 		DoctorDir: a.DoctorDir,
 		Now:       a.Now,

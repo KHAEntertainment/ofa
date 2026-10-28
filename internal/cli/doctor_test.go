@@ -344,7 +344,8 @@ func TestPermuteArgs(t *testing.T) {
 		{"flag with = value", []string{"sh", "--agent=claude"}, []string{"--agent=claude", "sh"}},
 		{"positional only", []string{"sh"}, []string{"sh"}},
 		{"two positionals preserved", []string{"sh", "extra"}, []string{"sh", "extra"}},
-		{"dashdash ends flags", []string{"--", "sh"}, []string{"sh"}},
+		{"dashdash preserved", []string{"--", "sh"}, []string{"--", "sh"}},
+		{"dashdash escapes a flag-looking bin", []string{"--", "--agent=codex"}, []string{"--", "--agent=codex"}},
 		{"missing value stays flag", []string{"--agent"}, []string{"--agent"}},
 	}
 	for _, c := range cases {

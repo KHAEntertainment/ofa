@@ -108,7 +108,7 @@ func BuildPrompt(bin string, f Facts) string {
 
 	b.WriteString("\n## Hard rules\n\n")
 	fmt.Fprintf(&b, "- Every install must set bin = %q.\n", bin)
-	fmt.Fprintf(&b, "- version.cmd must be exactly [%q, <flag>] with <flag> one of: --version, -version, -V, -v, version. Any other form is rejected before it is ever run.\n", bin)
+	fmt.Fprintf(&b, "- version.cmd must be exactly [%q, \"--version\"] — the only form accepted; the facts below show it already worked. Anything else (\"-v\", \"version\", extra or missing arguments) is rejected before it is ever run.\n", bin)
 	b.WriteString("- The real path in the untrusted facts below reveals the install method and registry package:\n")
 	b.WriteString("  /node_modules/<package>/ → method \"npm\" with that package\n")
 	b.WriteString("  /Cellar/<formula>/       → method \"brew-formula\"\n")
