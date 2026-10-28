@@ -31,6 +31,21 @@ func script(t *testing.T, body string) string {
 	return p
 }
 
+// printfScript writes an executable /bin/sh script that prints its
+// arguments one per line — the deterministic stand-in for system binaries
+// whose flag behavior differs between BSD and GNU (`echo --version` prints
+// its argument on macOS and a version banner on Linux, which is exactly
+// what broke CI).
+func printfScript(t *testing.T) string {
+	t.Helper()
+	dir := t.TempDir()
+	p := filepath.Join(dir, "zzprintf")
+	if err := os.WriteFile(p, []byte("#!/bin/sh\nprintf '%s\\n' \"$@\"\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	return p
+}
+
 func TestMinimalCommandEnv(t *testing.T) {
 	t.Setenv("PATH", "/usr/bin:/bin")
 	t.Setenv("HOME", "/Users/tester")
@@ -51,7 +66,10 @@ func TestMinimalCommandEnv(t *testing.T) {
 }
 
 func TestExecBoundedBasic(t *testing.T) {
-	out, errOut, _, err := execBounded(context.Background(), "/bin/echo", []string{"hello"}, execSpec{timeout: 5 * time.Second, env: nil})
+	// A printf fixture, not /bin/echo: the fixture's behavior cannot differ
+	// between BSD and GNU userlands.
+	s := printfScript(t)
+	out, errOut, _, err := execBounded(context.Background(), s, []string{"hello"}, execSpec{timeout: 5 * time.Second, env: nil})
 	if err != nil {
 		t.Fatalf("execBounded: %v (stderr %q)", err, errOut)
 	}
@@ -251,18 +269,32 @@ func TestBoundedRunnerFor(t *testing.T) {
 	if got := BoundedRunnerFor(fake, "sh"); !sameRunner(got, fake) {
 		t.Error("injected runner was replaced")
 	}
-	bounded := BoundedRunnerFor(detect.DefaultRunner, "echo")
+	// A fixture bin on PATH, not a system binary: the pinned target's flag
+	// behavior must not depend on the platform (GNU echo --version prints a
+	// version banner; BSD echo prints its argument — this exact difference
+	// broke CI on the ubuntu runner).
+	dir := t.TempDir()
+	fixture := filepath.Join(dir, "zzpin")
+	if err := os.WriteFile(fixture, []byte("#!/bin/sh\nprintf '%s\\n' \"$@\"\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", dir)
+	bounded := BoundedRunnerFor(detect.DefaultRunner, "zzpin")
 	if sameRunner(bounded, detect.DefaultRunner) {
 		t.Fatal("detect.DefaultRunner was passed through unbounded")
 	}
-	// The pinned target: any probe of echo executes the canonical echo,
-	// with argv[0] presented as the bin name.
-	out, err := bounded("echo", "--version")
+	// Any probe of the bin — by name or by a path with its basename —
+	// executes the pinned canonical fixture, with argv[0] presented as the
+	// bin name.
+	out, err := bounded("zzpin", "--version")
 	if err != nil {
 		t.Fatalf("pinned run: %v", err)
 	}
 	if out != "--version\n" {
-		t.Errorf("pinned echo output = %q, want --version\\n", out)
+		t.Errorf("pinned output = %q, want --version\\n", out)
+	}
+	if out, err = bounded(fixture, "--version"); err != nil || out != "--version\n" {
+		t.Errorf("pinned run by path = (%q, %v), want (--version\\n, nil)", out, err)
 	}
 }
 
