@@ -167,6 +167,23 @@ func canonicalTarget(bin string) (string, error) {
 	return resolveCanonical(p)
 }
 
+// AuthorizedTarget resolves bin to its PATH winner and its canonical real
+// path (every symlink resolved). The install flow uses it to recover the
+// target a recorded session drafted for, so revalidation binds native
+// probe paths to the same executable identity the original run used —
+// never to an alias the proposal file itself could have chosen.
+func AuthorizedTarget(bin string) (path, real string, err error) {
+	p, err := exec.LookPath(bin)
+	if err != nil {
+		return "", "", err
+	}
+	real, err = resolveCanonical(p)
+	if err != nil {
+		return "", "", err
+	}
+	return p, real, nil
+}
+
 // resolveCanonical resolves one path to its canonical real path, failing
 // on any resolution error — a dangling or vanishing symlink must not
 // silently degrade into the alias itself.
