@@ -1,17 +1,22 @@
 package cli
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"flag"
+	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"reflect"
 	"strings"
 	"testing"
+	"time"
 
 	"ofa/internal/catalog"
 	"ofa/internal/detect"
+	"ofa/internal/doctor"
 )
 
 // The doctor command's tests never spawn a real agent: AgentFn is always a
@@ -353,4 +358,501 @@ func TestPermuteArgs(t *testing.T) {
 			t.Errorf("%s: permuteArgs(%v) = %v, want %v", c.name, c.in, got, c.want)
 		}
 	}
+}
+
+// --- PR C: review, confirm, install ---
+
+// shEntryUpdate is shEntry plus an update command that is deliberately
+// non-standard (sh -c ...), so the review must both show it verbatim and
+// flag it.
+const shEntryUpdate = "```toml\nid = \"sh-probe\"\nname = \"Shell Probe\"\n\n[[installs]]\nmethod = \"native\"\nbin = \"sh\"\npaths = [\"/bin/sh\"]\nversion = { cmd = [\"sh\", \"--version\"] }\nlatest = \"self\"\nupdate = { cmd = [\"sh\", \"-c\", \"echo hi there\"] }\n```\n"
+
+// lineFeeder serves one line per Read, the way a terminal's line
+// discipline does. A plain strings.Reader does not work for sequences of
+// prompts: bufio.Scanner read-ahead would swallow every queued answer on
+// the first prompt, leaving the second one at EOF (a spurious decline).
+type lineFeeder struct {
+	lines []string
+	i     int
+}
+
+func (f *lineFeeder) Read(p []byte) (int, error) {
+	if f.i >= len(f.lines) {
+		return 0, io.EOF
+	}
+	n := copy(p, f.lines[f.i]+"\n")
+	f.i++
+	return n, nil
+}
+
+// makeInteractive points Stdin at the given answers (one per prompt) and
+// makes StdinIsTTY report a terminal, so confirm prompts can be driven
+// from a table.
+func makeInteractive(a *App, answers ...string) {
+	a.Stdin = &lineFeeder{lines: answers}
+	a.StdinIsTTY = func(io.Reader) bool { return true }
+}
+
+// shInstance is a detected sh, as the post-install scan should find it.
+func shInstance() detect.Instance {
+	return detect.Instance{HarnessID: "sh-probe", Method: "native", Bin: "sh", Status: detect.Active, Version: "1.0"}
+}
+
+// detectingAfterInstall swaps DetectFn for one that reports sh only once
+// a doctor session exists: the initial scan (which runs before any
+// session directory is created) sees nothing — doctor has work to do —
+// and the post-install scan sees the win. The catalog file itself cannot
+// be the trigger: the overwrite tests pre-create it.
+func detectingAfterInstall(a *App) {
+	a.DetectFn = func(cat []catalog.Harness, run detect.Runner) ([]detect.Instance, []detect.Failure, error) {
+		if _, err := os.Stat(filepath.Join(a.DoctorDir, "history")); err == nil {
+			return []detect.Instance{shInstance()}, nil, nil
+		}
+		return nil, nil, nil
+	}
+}
+
+func TestDoctorCmd_ReviewBlockShownVerbatim(t *testing.T) {
+	a, stdout, stderr, sd, _, _ := newTestApp(t, []string{"doctor", "sh"}, nil)
+	wireDoctor(t, a, &stubAgent{responses: []string{shEntryUpdate}}, shRunner())
+	sd.instances = nil
+
+	if code := a.Run(); code != ExitOK {
+		t.Fatalf("exit = %d, want %d; stderr: %s", code, ExitOK, stderr.String())
+	}
+	out := stdout.String()
+	for _, want := range []string{
+		"harness id: sh-probe",
+		"name: Shell Probe",
+		"method: native",
+		"bin: sh",
+		"version command: sh --version",
+		"update command: sh -c 'echo hi there'",
+		"non-standard update command, read it carefully",
+		"ofa apply will run the update command above",
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("review block missing %q:\n%s", want, out)
+		}
+	}
+	// Non-TTY stdin: no prompt, no install, the --install command instead.
+	if strings.Contains(stderr.String(), "Install to") {
+		t.Errorf("non-TTY stdin was prompted: %s", stderr.String())
+	}
+	if !strings.Contains(out, "ofa doctor --install ") {
+		t.Errorf("stdout missing the --install command:\n%s", out)
+	}
+	if _, err := os.Stat(filepath.Join(a.CatalogDir, "sh-probe.toml")); !os.IsNotExist(err) {
+		t.Error("non-TTY run installed into the user catalog")
+	}
+}
+
+// claudeEntry drafts an entry whose id is a real embedded id (claude),
+// for the same target bin sh: the proposal must be called out as an
+// override of the embedded entry.
+const claudeEntry = "```toml\nid = \"claude\"\nname = \"Claude (local draft)\"\n\n[[installs]]\nmethod = \"native\"\nbin = \"sh\"\npaths = [\"/bin/sh\"]\nversion = { cmd = [\"sh\", \"--version\"] }\nlatest = \"self\"\n```\n"
+
+func TestDoctorCmd_OverridesEmbeddedEntry(t *testing.T) {
+	a, stdout, stderr, _, _, _ := newTestApp(t, []string{"doctor", "sh"}, nil)
+	wireDoctor(t, a, &stubAgent{responses: []string{claudeEntry}}, shRunner())
+	if code := a.Run(); code != ExitOK {
+		t.Fatalf("exit = %d, want 0; stderr: %s", code, stderr.String())
+	}
+	out := stdout.String()
+	for _, want := range []string{
+		`overrides embedded "claude"`,
+		"user catalog wins by id",
+		`name "Claude Code"`,
+		`name "Claude (local draft)"`,
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("override block missing %q:\n%s", want, out)
+		}
+	}
+}
+
+func TestDoctorCmd_ConfirmDeclineWritesNothing(t *testing.T) {
+	a, stdout, stderr, sd, _, _ := newTestApp(t, []string{"doctor", "sh"}, nil)
+	wireDoctor(t, a, &stubAgent{responses: []string{shEntry}}, shRunner())
+	makeInteractive(a, "n")
+	sd.instances = nil
+
+	if code := a.Run(); code != ExitOK {
+		t.Fatalf("exit = %d, want 0; stderr: %s", code, stderr.String())
+	}
+	if !strings.Contains(stderr.String(), "Install to") || !strings.Contains(stderr.String(), "[y/N]") {
+		t.Errorf("stderr missing the prompt: %s", stderr.String())
+	}
+	if !strings.Contains(stdout.String(), "declined; nothing was written") {
+		t.Errorf("stdout missing the decline notice: %s", stdout.String())
+	}
+	if _, err := os.Stat(filepath.Join(a.CatalogDir, "sh-probe.toml")); !os.IsNotExist(err) {
+		t.Error("declined confirm still installed")
+	}
+	// The session stays proposed: install later is still possible.
+	if rec, err := readSessionRecord(t, a.DoctorDir); err != nil || rec.Status != "proposed" {
+		t.Errorf("session record = %+v, %v; want status proposed", rec, err)
+	}
+}
+
+func TestDoctorCmd_ConfirmYesInstalls(t *testing.T) {
+	a, stdout, stderr, _, _, _ := newTestApp(t, []string{"doctor", "sh"}, nil)
+	wireDoctor(t, a, &stubAgent{responses: []string{shEntry}}, shRunner())
+	makeInteractive(a, "y")
+	detectingAfterInstall(a)
+
+	if code := a.Run(); code != ExitOK {
+		t.Fatalf("exit = %d, want 0; stderr: %s", code, stderr.String())
+	}
+	// Default answer is No: only an explicit y installs.
+	path := filepath.Join(a.CatalogDir, "sh-probe.toml")
+	b, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("catalog entry not written: %v", err)
+	}
+	// The written bytes are the proposal's exact TOML.
+	proposal := findSessionFile(t, a.DoctorDir, "proposed-catalog.toml")
+	if string(b) != proposal {
+		t.Errorf("installed content = %q, want the proposal's %q", string(b), proposal)
+	}
+	st, _ := os.Stat(path)
+	if st.Mode().Perm() != 0o600 {
+		t.Errorf("mode = %o, want 600", st.Mode().Perm())
+	}
+	if !strings.Contains(stdout.String(), "installed: ") {
+		t.Errorf("stdout missing the installed line: %s", stdout.String())
+	}
+	if !strings.Contains(stdout.String(), "detected: sh 1.0 (sh-probe, native)") {
+		t.Errorf("stdout missing the post-install detection: %s", stdout.String())
+	}
+	rec, err := readSessionRecord(t, a.DoctorDir)
+	if err != nil || rec.Status != "installed" || rec.InstalledPath != path || rec.Target != "sh" {
+		t.Errorf("session record = %+v, %v; want installed with the path", rec, err)
+	}
+}
+
+func TestDoctorCmd_InstalledButNotDetectedReports(t *testing.T) {
+	a, _, _, sd, _, _ := newTestApp(t, []string{"doctor", "sh"}, nil)
+	wireDoctor(t, a, &stubAgent{responses: []string{shEntry}}, shRunner())
+	makeInteractive(a, "y")
+	// The post-install scan never finds sh.
+	a.DetectFn = func([]catalog.Harness, detect.Runner) ([]detect.Instance, []detect.Failure, error) {
+		return nil, nil, nil
+	}
+	sd.instances = nil
+
+	if code := a.Run(); code != ExitError {
+		t.Fatalf("exit = %d, want %d (not detected after install)", code, ExitError)
+	}
+	// The file stays in place, but the miss is said plainly.
+	if _, err := os.Stat(filepath.Join(a.CatalogDir, "sh-probe.toml")); err != nil {
+		t.Errorf("entry should stay in place after a detection miss: %v", err)
+	}
+}
+
+func TestDoctorCmd_OverwriteNeedsSecondConfirm(t *testing.T) {
+	existing := "id = \"sh-probe\"\nname = \"Mine\"\n\n[[installs]]\nmethod = \"native\"\nbin = \"sh\"\npaths = [\"/bin/sh\"]\nversion = { cmd = [\"sh\", \"--version\"] }\n"
+	path := func(a *App) string { return filepath.Join(a.CatalogDir, "sh-probe.toml") }
+
+	// Decline the overwrite: the user's file is untouched.
+	a, stdout, stderr, sd, _, _ := newTestApp(t, []string{"doctor", "sh"}, nil)
+	wireDoctor(t, a, &stubAgent{responses: []string{shEntry}}, shRunner())
+	makeInteractive(a, "y", "n")
+	if err := os.MkdirAll(a.CatalogDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path(a), []byte(existing), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	detectingAfterInstall(a)
+	sd.instances = nil
+	if code := a.Run(); code != ExitOK {
+		t.Fatalf("exit = %d, want 0; stderr: %s", code, stderr.String())
+	}
+	if !strings.Contains(stderr.String(), "already exists") || !strings.Contains(stderr.String(), "Overwrite") {
+		t.Errorf("stderr missing the overwrite warning: %s", stderr.String())
+	}
+	if !strings.Contains(stdout.String(), "left untouched") {
+		t.Errorf("stdout missing the untouched notice: %s", stdout.String())
+	}
+	b, _ := os.ReadFile(path(a))
+	if string(b) != existing {
+		t.Errorf("existing file was modified: %q", string(b))
+	}
+
+	// Confirm the overwrite: the proposal replaces it.
+	a2, _, _, _, _, _ := newTestApp(t, []string{"doctor", "sh"}, nil)
+	wireDoctor(t, a2, &stubAgent{responses: []string{shEntry}}, shRunner())
+	makeInteractive(a2, "y", "y")
+	if err := os.MkdirAll(a2.CatalogDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path(a2), []byte(existing), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	detectingAfterInstall(a2)
+	if code := a2.Run(); code != ExitOK {
+		t.Fatalf("exit = %d, want 0", code)
+	}
+	b, _ = os.ReadFile(path(a2))
+	if string(b) == existing {
+		t.Error("overwrite confirm did not replace the file")
+	}
+}
+
+func TestDoctorCmd_DuplicateIDNeedsSecondConfirm(t *testing.T) {
+	other := "id = \"sh-probe\"\nname = \"Old\"\n\n[[installs]]\nmethod = \"native\"\nbin = \"sh\"\npaths = [\"/bin/sh\"]\nversion = { cmd = [\"sh\", \"--version\"] }\n"
+	decline := func(t *testing.T, answers ...string) (stdout, stderr *bytes.Buffer, installed bool) {
+		t.Helper()
+		a, stdout, stderr, sd, _, _ := newTestApp(t, []string{"doctor", "sh"}, nil)
+		wireDoctor(t, a, &stubAgent{responses: []string{shEntry}}, shRunner())
+		makeInteractive(a, answers...)
+		if err := os.MkdirAll(a.CatalogDir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(a.CatalogDir, "a-old.toml"), []byte(other), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		detectingAfterInstall(a)
+		sd.instances = nil
+		code := a.Run()
+		if code != ExitOK {
+			t.Fatalf("exit = %d, want 0; stderr: %s", code, stderr.String())
+		}
+		_, err := os.Stat(filepath.Join(a.CatalogDir, "sh-probe.toml"))
+		return stdout, stderr, err == nil
+	}
+	stdout, stderr, installed := decline(t, "y", "n")
+	if installed {
+		t.Error("duplicate-id warning was not enough to stop the install")
+	}
+	if !strings.Contains(stderr.String(), "a-old.toml") || !strings.Contains(stderr.String(), "already define harness id") {
+		t.Errorf("stderr missing the duplicate warning: %s", stderr.String())
+	}
+	if !strings.Contains(stdout.String(), "declined") {
+		t.Errorf("stdout missing the decline notice: %s", stdout.String())
+	}
+	_, _, installed = decline(t, "y", "y")
+	if !installed {
+		t.Error("explicit confirm did not install past the duplicate warning")
+	}
+}
+
+// --- --install ---
+
+// seedSession writes a history session directory by hand: session.json and
+// the proposed TOML. The TOML is what --install revalidates, so tests can
+// tamper with it.
+func seedSession(t *testing.T, doctorDir, id, target, status string, proposal string) string {
+	t.Helper()
+	dir := filepath.Join(doctorDir, "history", id)
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	rec := doctor.SessionRecord{
+		Target:    target,
+		HarnessID: "sh-probe",
+		Time:      time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC),
+		Status:    status,
+	}
+	if err := doctor.SaveSessionRecord(dir, rec); err != nil {
+		t.Fatal(err)
+	}
+	if proposal != "" {
+		if err := os.WriteFile(filepath.Join(dir, "proposed-catalog.toml"), []byte(proposal), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	return dir
+}
+
+// bareToml is shEntry's TOML without the code fence.
+const bareToml = "id = \"sh-probe\"\nname = \"Shell Probe\"\n\n[[installs]]\nmethod = \"native\"\nbin = \"sh\"\npaths = [\"/bin/sh\"]\nversion = { cmd = [\"sh\", \"--version\"] }\nlatest = \"self\"\n"
+
+func TestDoctorInstallCmd_HappyPath(t *testing.T) {
+	a, stdout, stderr, sd, _, _ := newTestApp(t, []string{"doctor", "--install", "20260101T000000Z"}, nil)
+	wireDoctor(t, a, &stubAgent{}, shRunner())
+	makeInteractive(a, "y")
+	seedSession(t, a.DoctorDir, "20260101T000000Z", "sh", "proposed", bareToml)
+	sd.instances = []detect.Instance{shInstance()}
+
+	if code := a.Run(); code != ExitOK {
+		t.Fatalf("exit = %d, want 0; stderr: %s", code, stderr.String())
+	}
+	out := stdout.String()
+	for _, want := range []string{"revalidated proposal from session 20260101T000000Z", "harness id: sh-probe", "Install to"} {
+		_ = want
+	}
+	if !strings.Contains(out, "revalidated proposal") || !strings.Contains(out, "harness id: sh-probe") {
+		t.Errorf("stdout missing the review flow:\n%s", out)
+	}
+	if !strings.Contains(out, "installed: ") || !strings.Contains(out, "detected: sh 1.0") {
+		t.Errorf("stdout missing the install result:\n%s", out)
+	}
+	b, err := os.ReadFile(filepath.Join(a.CatalogDir, "sh-probe.toml"))
+	if err != nil || string(b) != bareToml {
+		t.Errorf("installed content = %q, %v", string(b), err)
+	}
+	rec, err := doctor.LoadSessionRecord(filepath.Join(a.DoctorDir, "history", "20260101T000000Z"))
+	if err != nil || rec.Status != "installed" {
+		t.Errorf("session record = %+v, %v; want installed", rec, err)
+	}
+}
+
+func TestDoctorInstallCmd_RevalidationRejectsTamperedProposal(t *testing.T) {
+	// The recorded target is sh, but the file now describes cat: the shape
+	// gate must catch it, and nothing may be written.
+	tampered := "id = \"cat-probe\"\nname = \"Cat Probe\"\n\n[[installs]]\nmethod = \"native\"\nbin = \"cat\"\npaths = [\"/bin/cat\"]\nversion = { cmd = [\"cat\", \"--version\"] }\nlatest = \"self\"\n"
+	a, _, stderr, _, _, _ := newTestApp(t, []string{"doctor", "--install", "20260101T000000Z"}, nil)
+	wireDoctor(t, a, &stubAgent{}, shRunner())
+	makeInteractive(a, "y")
+	dir := seedSession(t, a.DoctorDir, "20260101T000000Z", "sh", "proposed", tampered)
+
+	if code := a.Run(); code != ExitError {
+		t.Fatalf("exit = %d, want %d (tampered proposal)", code, ExitError)
+	}
+	if !strings.Contains(stderr.String(), "no longer valid") {
+		t.Errorf("stderr missing the rejection reason: %s", stderr.String())
+	}
+	if _, err := os.Stat(filepath.Join(a.CatalogDir, "cat-probe.toml")); !os.IsNotExist(err) {
+		t.Error("tampered proposal was installed")
+	}
+	if _, err := os.Stat(filepath.Join(a.CatalogDir, "sh-probe.toml")); !os.IsNotExist(err) {
+		t.Error("tampered proposal was installed under the recorded id")
+	}
+	rec, err := doctor.LoadSessionRecord(dir)
+	if err != nil || rec.Status != "rejected" {
+		t.Errorf("session record = %+v, %v; want rejected", rec, err)
+	}
+}
+
+func TestDoctorInstallCmd_TargetGoneFromPath(t *testing.T) {
+	a, _, stderr, _, _, _ := newTestApp(t, []string{"doctor", "--install", "20260101T000000Z"}, nil)
+	wireDoctor(t, a, &stubAgent{}, shRunner())
+	seedSession(t, a.DoctorDir, "20260101T000000Z", "ofa-no-such-bin-xyz", "proposed", bareToml)
+
+	if code := a.Run(); code != ExitError {
+		t.Fatalf("exit = %d, want %d (target gone)", code, ExitError)
+	}
+	if !strings.Contains(stderr.String(), "not on PATH anymore") {
+		t.Errorf("stderr missing the target-gone reason: %s", stderr.String())
+	}
+	if _, err := os.Stat(filepath.Join(a.CatalogDir, "sh-probe.toml")); !os.IsNotExist(err) {
+		t.Error("install wrote despite a missing target")
+	}
+}
+
+func TestDoctorInstallCmd_MissingSessionRecord(t *testing.T) {
+	a, _, stderr, _, _, _ := newTestApp(t, []string{"doctor", "--install", "20260101T000000Z"}, nil)
+	wireDoctor(t, a, &stubAgent{}, shRunner())
+	// A PR B session: proposal, but no session.json.
+	dir := seedSession(t, a.DoctorDir, "20260101T000000Z", "sh", "proposed", bareToml)
+	if err := os.Remove(filepath.Join(dir, "session.json")); err != nil {
+		t.Fatal(err)
+	}
+	if code := a.Run(); code != ExitError {
+		t.Fatalf("exit = %d, want %d (no session record)", code, ExitError)
+	}
+	if !strings.Contains(stderr.String(), "cannot install") {
+		t.Errorf("stderr missing the refusal: %s", stderr.String())
+	}
+}
+
+func TestDoctorInstallCmd_NonTTYRefuses(t *testing.T) {
+	a, _, stderr, sd, _, _ := newTestApp(t, []string{"doctor", "--install", "20260101T000000Z"}, nil)
+	wireDoctor(t, a, &stubAgent{}, shRunner())
+	seedSession(t, a.DoctorDir, "20260101T000000Z", "sh", "proposed", bareToml)
+	sd.instances = nil
+	if code := a.Run(); code != ExitError {
+		t.Fatalf("exit = %d, want %d (non-interactive)", code, ExitError)
+	}
+	if !strings.Contains(stderr.String(), "interactive terminal") {
+		t.Errorf("stderr missing the interactive-only notice: %s", stderr.String())
+	}
+	if _, err := os.Stat(filepath.Join(a.CatalogDir, "sh-probe.toml")); !os.IsNotExist(err) {
+		t.Error("non-interactive --install wrote a file")
+	}
+}
+
+// --- --list and usage ---
+
+func TestDoctorListCmd(t *testing.T) {
+	a, stdout, stderr, _, _, _ := newTestApp(t, []string{"doctor", "--list"}, nil)
+	wireDoctor(t, a, &stubAgent{}, shRunner())
+	seedSession(t, a.DoctorDir, "20260101T000000Z", "sh", "proposed", bareToml)
+	// An installed session with its path.
+	dir := seedSession(t, a.DoctorDir, "20260102T000000Z", "cat", "installed", bareToml)
+	rec, err := doctor.LoadSessionRecord(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rec.InstalledPath = "/x/catalog/sh-probe.toml"
+	if err := doctor.SaveSessionRecord(dir, rec); err != nil {
+		t.Fatal(err)
+	}
+	// A PR B session with no session.json: unknown, not an error.
+	prb := seedSession(t, a.DoctorDir, "20260103T000000Z", "sh", "proposed", bareToml)
+	if err := os.Remove(filepath.Join(prb, "session.json")); err != nil {
+		t.Fatal(err)
+	}
+
+	if code := a.Run(); code != ExitOK {
+		t.Fatalf("exit = %d, want 0; stderr: %s", code, stderr.String())
+	}
+	out := stdout.String()
+	for _, want := range []string{
+		"doctor sessions:",
+		"20260101T000000Z  sh  proposed",
+		"20260102T000000Z  cat  installed  -> /x/catalog/sh-probe.toml",
+		"20260103T000000Z  unknown  unknown",
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("listing missing %q:\n%s", want, out)
+		}
+	}
+
+	// No history at all: a quiet success, not an error.
+	a2, stdout2, _, _, _, _ := newTestApp(t, []string{"doctor", "--list"}, nil)
+	wireDoctor(t, a2, &stubAgent{}, shRunner())
+	if code := a2.Run(); code != ExitOK {
+		t.Errorf("exit = %d, want 0", code)
+	}
+	if !strings.Contains(stdout2.String(), "no doctor sessions yet") {
+		t.Errorf("stdout = %q, want the empty notice", stdout2.String())
+	}
+}
+
+func TestDoctorCmd_UsageErrors(t *testing.T) {
+	cases := []struct {
+		name string
+		args []string
+		want string
+	}{
+		{"install and list", []string{"doctor", "--install", "20260101T000000Z", "--list"}, "mutually exclusive"},
+		{"install and bin", []string{"doctor", "--install", "20260101T000000Z", "sh"}, "mutually exclusive"},
+		{"list and bin", []string{"doctor", "--list", "sh"}, "mutually exclusive"},
+		{"bad session id", []string{"doctor", "--install", "../evil"}, "invalid session id"},
+		{"traversal session id", []string{"doctor", "--install", "20260101T000000Z-../../x"}, "invalid session id"},
+	}
+	for _, c := range cases {
+		a, _, stderr, _, _, _ := newTestApp(t, c.args, nil)
+		wireDoctor(t, a, &stubAgent{}, shRunner())
+		if code := a.Run(); code != ExitError {
+			t.Errorf("%s: exit = %d, want %d (usage)", c.name, code, ExitError)
+		}
+		if !strings.Contains(stderr.String(), c.want) {
+			t.Errorf("%s: stderr = %q, want %q", c.name, stderr.String(), c.want)
+		}
+	}
+}
+
+// readSessionRecord loads session.json from the single session directory.
+func readSessionRecord(t *testing.T, doctorDir string) (doctor.SessionRecord, error) {
+	t.Helper()
+	history := filepath.Join(doctorDir, "history")
+	entries, err := os.ReadDir(history)
+	if err != nil || len(entries) == 0 {
+		return doctor.SessionRecord{}, fmt.Errorf("no session dir under %s (%v)", history, err)
+	}
+	return doctor.LoadSessionRecord(filepath.Join(history, entries[0].Name()))
 }

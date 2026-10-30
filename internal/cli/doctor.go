@@ -1,12 +1,17 @@
 package cli
 
 import (
+	"errors"
 	"flag"
 	"fmt"
+	"io"
+	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
 
+	"ofa/internal/catalog"
+	"ofa/internal/detect"
 	"ofa/internal/doctor"
 )
 
@@ -63,14 +68,26 @@ func boolFlag(fl *flag.Flag) bool {
 	return ok && bv.IsBoolFlag()
 }
 
-// doctorCmd implements `ofa doctor [<bin>] [--agent claude]`: opt-in,
+// stdinIsTTY is the default StdinIsTTY gate for doctor's install prompt.
+// It mirrors stderrIsTTY (picker.go): the same cheap ModeCharDevice check,
+// so piped or redirected stdin is never mistaken for a terminal. Doctor
+// only ever prompts — and only ever installs — when this is true; a
+// non-interactive stdin gets the --install command printed instead.
+func stdinIsTTY(r io.Reader) bool {
+	f, ok := r.(*os.File)
+	return ok && isTerminal(f)
+}
+
+// doctorCmd implements `ofa doctor [<bin>] [--agent claude]`,
+// `ofa doctor --install <session-id>`, and `ofa doctor --list`: opt-in,
 // agent-assisted repair for catalog entries whose binary is installed but
 // not detected. Without a bin argument it runs the gap check and, when
-// exactly one gap exists, proceeds with it; several gaps are listed for the
-// user to pick with `ofa doctor <bin>`. It never loops over targets and
-// never installs anything: the session ends with a validated proposal on
-// disk (or rejected.txt) under the doctor history directory, for the
-// follow-on install flow.
+// exactly one gap exists, proceeds with it; several gaps are listed for
+// the user to pick with `ofa doctor <bin>`. A session that produces a
+// validated proposal ends with a review block — every command the entry
+// declares, update.cmd verbatim — and an explicit Install? prompt that
+// defaults to No; only a yes at an interactive terminal writes into the
+// user catalog. update.cmd itself is never executed by doctor.
 //
 // Order of the early exits matters: a bin that is already detected or a
 // gap listing needs no agent and must succeed without Claude installed,
@@ -80,6 +97,8 @@ func (a *App) doctorCmd(args []string) ExitCode {
 	fs := flag.NewFlagSet("doctor", flag.ContinueOnError)
 	fs.SetOutput(a.Stderr)
 	agent := fs.String("agent", "claude", "drafting agent to use (v1: claude only)")
+	install := fs.String("install", "", "install a proposal saved by an earlier doctor run, by session id")
+	list := fs.Bool("list", false, "list saved doctor sessions")
 	if err := fs.Parse(permuteArgs(fs, args)); err != nil {
 		return ExitError
 	}
@@ -90,6 +109,26 @@ func (a *App) doctorCmd(args []string) ExitCode {
 	if *agent != "claude" {
 		fmt.Fprintf(a.Stderr, "ofa: doctor: --agent %q is not supported: v1 drafts with claude only\n", *agent)
 		return ExitError
+	}
+	// --install, --list, and a positional <bin> are three different ways
+	// to say what this invocation does. Combining them is a usage error,
+	// not something to guess an order for.
+	modes := 0
+	for _, on := range []bool{*install != "", *list, fs.NArg() > 0} {
+		if on {
+			modes++
+		}
+	}
+	if modes > 1 {
+		fmt.Fprintf(a.Stderr, "ofa: doctor: --install, --list, and a <bin> argument are mutually exclusive\n")
+		a.usage()
+		return ExitError
+	}
+	if *list {
+		return a.doctorListCmd()
+	}
+	if *install != "" {
+		return a.doctorInstallCmd(*install)
 	}
 	if fs.NArg() > 1 {
 		fmt.Fprintf(a.Stderr, "ofa: doctor: expected at most one <bin> argument, got %d\n", fs.NArg())
@@ -164,17 +203,272 @@ func (a *App) doctorCmd(args []string) ExitCode {
 		return ExitError
 	}
 
-	// A proposal that shadows an embedded id is allowed — the user catalog
-	// wins by design — but it must be said out loud at the earliest moment
-	// the human looks at the result.
-	overrides := ""
-	for _, h := range cat {
-		if h.ID == res.Harness.ID {
-			overrides = fmt.Sprintf(" (overrides embedded %q)", h.ID)
-			break
+	// The review block says everything the entry declares — including a
+	// shadowed embedded id, if any — and the install offer only ever
+	// follows a validated proposal.
+	return a.doctorOfferInstall(res)
+}
+
+// doctorOfferInstall ends a successful drafting session: the review
+// block, then the Install? prompt. The default answer is No. Non-TTY
+// stdin (piped, redirected, or absent) never prompts and never installs —
+// an agent-drafted update command is executed later by `ofa apply`, so
+// only a human at an interactive terminal says yes — and the exact
+// --install command to run is printed instead.
+func (a *App) doctorOfferInstall(res *doctor.Result) ExitCode {
+	h := *res.Harness
+	fmt.Fprintf(a.Stdout, "proposal ready: %s\n", res.ProposalPath)
+	a.printDoctorReview(h)
+	sessionID := filepath.Base(res.Dir)
+	if !a.interactiveStdin() {
+		fmt.Fprintf(a.Stdout, "to install it, run: ofa doctor --install %s\n", sessionID)
+		return ExitOK
+	}
+	src, err := os.ReadFile(res.ProposalPath)
+	if err != nil {
+		fmt.Fprintf(a.Stderr, "ofa: doctor: %v\n", err)
+		return ExitError
+	}
+	return a.doctorConfirmAndWrite(sessionID, res.Dir, h, src)
+}
+
+// doctorConfirmAndWrite asks the install question (default No) and, on a
+// yes, performs the write: the second confirms, the atomic write, the
+// session bookkeeping, and the post-install scan.
+func (a *App) doctorConfirmAndWrite(sessionID, dir string, h catalog.Harness, src []byte) ExitCode {
+	target := filepath.Join(a.CatalogDir, h.ID+".toml")
+	ok, err := confirmPrompt(a.Stdin, a.Stderr, fmt.Sprintf("Install to %s? [y/N] ", target))
+	if err != nil {
+		fmt.Fprintf(a.Stderr, "ofa: confirm: %v\n", err)
+		return ExitError
+	}
+	if !ok {
+		fmt.Fprintln(a.Stdout, "declined; nothing was written")
+		return ExitOK
+	}
+	return a.doctorWriteInstalled(sessionID, dir, h, src)
+}
+
+// doctorWriteInstalled performs the confirmed write. Before anything
+// lands there are two second confirms, each with its own warning: an
+// existing file for this id (overwriting destroys the user's own work),
+// and another user catalog file already declaring the id (the user
+// catalog merges first-file-wins, so one of the two would be silently
+// ignored). Then the write itself is atomic, the session is marked
+// installed, and the target is re-scanned so the win — or its absence —
+// is visible.
+func (a *App) doctorWriteInstalled(sessionID, dir string, h catalog.Harness, src []byte) ExitCode {
+	target := filepath.Join(a.CatalogDir, h.ID+".toml")
+	overwrite := false
+	if _, err := os.Stat(target); err == nil {
+		fmt.Fprintf(a.Stderr, "ofa: doctor: %s already exists\n", target)
+		ok, err := confirmPrompt(a.Stdin, a.Stderr, fmt.Sprintf("Overwrite %s? [y/N] ", target))
+		if err != nil {
+			fmt.Fprintf(a.Stderr, "ofa: confirm: %v\n", err)
+			return ExitError
+		}
+		if !ok {
+			fmt.Fprintln(a.Stdout, "declined; the existing file was left untouched")
+			return ExitOK
+		}
+		overwrite = true
+	} else if !errors.Is(err, os.ErrNotExist) {
+		fmt.Fprintf(a.Stderr, "ofa: doctor: %v\n", err)
+		return ExitError
+	}
+	if dups := doctor.DuplicateIDFiles(a.CatalogDir, h.ID); len(dups) > 0 {
+		fmt.Fprintf(a.Stderr, "ofa: doctor: user catalog file(s) %s already define harness id %q; user files merge first-by-filename, so one of the two will be ignored\n", strings.Join(dups, ", "), h.ID)
+		ok, err := confirmPrompt(a.Stdin, a.Stderr, "Install anyway? [y/N] ")
+		if err != nil {
+			fmt.Fprintf(a.Stderr, "ofa: confirm: %v\n", err)
+			return ExitError
+		}
+		if !ok {
+			fmt.Fprintln(a.Stdout, "declined; nothing was written")
+			return ExitOK
 		}
 	}
-	fmt.Fprintf(a.Stdout, "proposal ready: %s%s\n", res.ProposalPath, overrides)
-	fmt.Fprintf(a.Stdout, "validate it yourself, then install it into your user catalog; ofa did not touch any catalog\n")
+	path, err := doctor.WriteCatalogEntry(h.ID, src, a.CatalogDir, overwrite)
+	if err != nil {
+		fmt.Fprintf(a.Stderr, "ofa: doctor: %v\n", err)
+		return ExitError
+	}
+	fmt.Fprintf(a.Stdout, "installed: %s\n", path)
+	// Session bookkeeping. The entry is already published, so a failure
+	// here is a warning on stderr and a successful exit — never a
+	// rollback of a write the user confirmed.
+	rec, lerr := doctor.LoadSessionRecord(dir)
+	if lerr != nil {
+		fmt.Fprintf(a.Stderr, "ofa: warning: could not mark the session installed: %v\n", lerr)
+	} else {
+		rec.Status = doctor.StatusInstalled
+		rec.InstalledPath = path
+		if serr := doctor.SaveSessionRecord(dir, rec); serr != nil {
+			fmt.Fprintf(a.Stderr, "ofa: warning: could not mark the session installed: %v\n", serr)
+		}
+	}
+	return a.doctorPostInstallScan(h)
+}
+
+// doctorPostInstallScan re-scans through the normal catalog loader — the
+// same merged path every command uses — and reports whether the target is
+// now detected. A miss is reported plainly, never papered over: the file
+// stays in place for inspection, but the command does not claim success.
+func (a *App) doctorPostInstallScan(h catalog.Harness) ExitCode {
+	// The shape gate bound every install to the session's target binary.
+	bin := h.Installs[0].Bin
+	cat, code := a.loadCatalog()
+	if code != ExitOK {
+		return code
+	}
+	insts, _, err := a.DetectFn(cat, a.DetectRunner)
+	if err != nil {
+		fmt.Fprintf(a.Stderr, "ofa: doctor: could not scan after install: %v\n", err)
+		return ExitError
+	}
+	for _, in := range insts {
+		if in.Bin != bin {
+			continue
+		}
+		note := ""
+		if in.Status != detect.Active {
+			note = " (not the live install on PATH)"
+		}
+		fmt.Fprintf(a.Stdout, "detected: %s %s (%s, %s)%s\n", bin, in.Version, in.HarnessID, in.Method, note)
+		if in.Status != detect.Active {
+			return ExitError
+		}
+		return ExitOK
+	}
+	fmt.Fprintf(a.Stderr, "ofa: doctor: %s was NOT detected after install; the entry is in place at %s but does not match this machine\n", bin, filepath.Join(a.CatalogDir, h.ID+".toml"))
+	return ExitError
+}
+
+// doctorInstallCmd implements `ofa doctor --install <session-id>`: it
+// installs a saved proposal after RE-RUNNING the full validation. Nothing
+// in the history directory is trusted — the proposal file may have been
+// edited since the run wrote it — so the same mechanical gate runs again
+// (parse with unknown keys rejected, the static shape gate, and
+// test-detect through the pinned bounded runner) against the target
+// recorded in session.json. A target taken from the proposal itself would
+// make the shape gate's identity check vacuous, which is why sessions
+// without a record are refused rather than guessed. A proposal that fails
+// any check is rejected with the reason and nothing is written.
+func (a *App) doctorInstallCmd(sessionID string) ExitCode {
+	if !doctor.ValidSessionID(sessionID) {
+		fmt.Fprintf(a.Stderr, "ofa: doctor: invalid session id %q\n", sessionID)
+		a.usage()
+		return ExitError
+	}
+	dir := filepath.Join(a.DoctorDir, "history", sessionID)
+	rec, err := doctor.LoadSessionRecord(dir)
+	if err != nil {
+		fmt.Fprintf(a.Stderr, "ofa: doctor: cannot install %s: %v\n", sessionID, err)
+		return ExitError
+	}
+	src, err := doctor.LoadProposal(dir)
+	if err != nil {
+		fmt.Fprintf(a.Stderr, "ofa: doctor: cannot install %s: %v\n", sessionID, err)
+		return ExitError
+	}
+	// The recorded target must still exist on PATH; a proposal for a
+	// binary that is gone cannot be revalidated, and nothing is written.
+	_, real, err := doctor.AuthorizedTarget(rec.Target)
+	if err != nil {
+		fmt.Fprintf(a.Stderr, "ofa: doctor: target %q is not on PATH anymore; nothing was written\n", rec.Target)
+		a.markSessionRejected(dir, rec)
+		return ExitError
+	}
+	h, _, err := doctor.ValidateProposal(string(src), rec.Target, real, doctor.BoundedRunnerFor(a.DetectRunner, rec.Target))
+	if err != nil {
+		fmt.Fprintf(a.Stderr, "ofa: doctor: proposal in session %s is no longer valid: %v\nnothing was written\n", sessionID, err)
+		a.markSessionRejected(dir, rec)
+		return ExitError
+	}
+	fmt.Fprintf(a.Stdout, "revalidated proposal from session %s (target %s)\n", sessionID, rec.Target)
+	a.printDoctorReview(h)
+	if !a.interactiveStdin() {
+		fmt.Fprintf(a.Stderr, "ofa: doctor: --install needs an interactive terminal to confirm; nothing was written\n")
+		return ExitError
+	}
+	return a.doctorConfirmAndWrite(sessionID, dir, h, src)
+}
+
+// markSessionRejected records a failed revalidation in session.json so
+// --list shows the verdict. A bookkeeping failure here must not mask the
+// rejection; the proposal still does not install.
+func (a *App) markSessionRejected(dir string, rec doctor.SessionRecord) {
+	rec.Status = doctor.StatusRejected
+	if err := doctor.SaveSessionRecord(dir, rec); err != nil {
+		fmt.Fprintf(a.Stderr, "ofa: warning: could not record the rejection: %v\n", err)
+	}
+}
+
+// doctorListCmd implements `ofa doctor --list`: one line per history
+// session. Sessions from before session.json existed show "unknown"
+// rather than failing the listing; pruning is out of scope.
+func (a *App) doctorListCmd() ExitCode {
+	root := filepath.Join(a.DoctorDir, "history")
+	entries, err := os.ReadDir(root)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			fmt.Fprintln(a.Stdout, "no doctor sessions yet")
+			return ExitOK
+		}
+		fmt.Fprintf(a.Stderr, "ofa: doctor: %v\n", err)
+		return ExitError
+	}
+	n := 0
+	for _, e := range entries {
+		if !e.IsDir() {
+			continue
+		}
+		if n == 0 {
+			fmt.Fprintln(a.Stdout, "doctor sessions:")
+		}
+		n++
+		target, status, path := "unknown", "unknown", ""
+		if rec, err := doctor.LoadSessionRecord(filepath.Join(root, e.Name())); err == nil {
+			target, status, path = rec.Target, rec.Status, rec.InstalledPath
+		}
+		line := fmt.Sprintf("  %s  %s  %s", e.Name(), target, status)
+		if path != "" {
+			line += fmt.Sprintf("  -> %s", path)
+		}
+		fmt.Fprintln(a.Stdout, line)
+	}
+	if n == 0 {
+		fmt.Fprintln(a.Stdout, "no doctor sessions yet")
+	}
 	return ExitOK
+}
+
+// printDoctorReview prints the review block for one proposed harness,
+// naming the embedded entry it overrides when the id matches one. The
+// comparison is against the embedded catalog specifically: a same-id
+// entry in the user catalog is a duplicate the install flow warns about
+// separately, not an override.
+func (a *App) printDoctorReview(h catalog.Harness) {
+	var embedded *catalog.Harness
+	if embeddedList, err := catalog.Embedded(); err == nil {
+		for i := range embeddedList {
+			if embeddedList[i].ID == h.ID {
+				embedded = &embeddedList[i]
+				break
+			}
+		}
+	}
+	fmt.Fprintln(a.Stdout)
+	lines := doctor.Review{H: h, Overrides: embedded}.Lines()
+	for _, line := range lines {
+		fmt.Fprintln(a.Stdout, line)
+	}
+	fmt.Fprintln(a.Stdout)
+}
+
+// interactiveStdin reports whether the install prompts may ask a human:
+// stdin must be present and a terminal. Everything else — a pipe, a file,
+// nil — is the non-interactive path.
+func (a *App) interactiveStdin() bool {
+	return a.Stdin != nil && a.StdinIsTTY(a.Stdin)
 }

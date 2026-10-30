@@ -109,6 +109,12 @@ type App struct {
 	// real terminal.
 	StderrIsTTY func(io.Writer) bool
 
+	// StdinIsTTY reports whether doctor's install prompt may read an
+	// interactive answer from Stdin. Same stat-based check as
+	// StderrIsTTY; tests override it so the prompt and the
+	// non-interactive branch are both reachable without a real terminal.
+	StdinIsTTY func(io.Reader) bool
+
 	// ConfigLoader reads the user config (~/.config/ofa/config.toml).
 	// Defaults to config.Load; tests override so they never read the
 	// developer's real config.
@@ -151,6 +157,7 @@ func New(args []string, stdin io.Reader, stdout, stderr io.Writer) *App {
 		StatePath:     config.StatePath(),
 		Now:           time.Now,
 		StderrIsTTY:   stderrIsTTY,
+		StdinIsTTY:    stdinIsTTY,
 		ConfigLoader:  config.Load,
 		CatalogDir:    config.CatalogDir(),
 	}
@@ -214,8 +221,13 @@ Usage:
                       streams installer output; default shows progress lines)
   ofa check --json    machine-readable variant
   ofa doctor [<bin>]  agent-assisted repair for undetected catalog entries
-                      (opt-in, v1 --agent claude only; writes a proposal under
-                      ~/.config/ofa/doctor/history/, never installs it)
+                      (opt-in, v1 --agent claude only; drafts an entry, shows
+                      it for review, and installs it into
+                      ~/.config/ofa/catalog/ after confirmation)
+  ofa doctor --install <session>
+                      install a proposal saved by an earlier doctor run
+                      (revalidates it before writing)
+  ofa doctor --list   list saved doctor sessions
   --refresh           re-query registries instead of cached latest versions
                       (accepted by: ofa, ofa check, ofa apply)
   ofa --version       print version
