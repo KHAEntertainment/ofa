@@ -268,7 +268,7 @@ func (a *App) doctorConfirmAndWrite(sessionID, dir string, h catalog.Harness, sr
 	target := filepath.Join(a.CatalogDir, h.ID+".toml")
 	ok, err := confirmPrompt(a.Stdin, a.Stderr, fmt.Sprintf("Install to %s? [y/N] ", doctor.Visible(target)))
 	if err != nil {
-		fmt.Fprintf(a.Stderr, "ofa: confirm: %v\n", err)
+		fmt.Fprintf(a.Stderr, "ofa: confirm: %v; nothing was written\n", err)
 		return ExitError
 	}
 	if !ok {
@@ -290,10 +290,10 @@ func (a *App) doctorWriteInstalled(sessionID, dir string, h catalog.Harness, src
 	target := filepath.Join(a.CatalogDir, h.ID+".toml")
 	overwrite := false
 	if _, err := os.Stat(target); err == nil {
-		fmt.Fprintf(a.Stderr, "ofa: doctor: %s already exists\n", target)
-		ok, err := confirmPrompt(a.Stdin, a.Stderr, fmt.Sprintf("Overwrite %s? [y/N] ", target))
+		fmt.Fprintf(a.Stderr, "ofa: doctor: %s already exists\n", doctor.Visible(target))
+		ok, err := confirmPrompt(a.Stdin, a.Stderr, fmt.Sprintf("Overwrite %s? [y/N] ", doctor.Visible(target)))
 		if err != nil {
-			fmt.Fprintf(a.Stderr, "ofa: confirm: %v\n", err)
+			fmt.Fprintf(a.Stderr, "ofa: confirm: %v; nothing was written\n", err)
 			return ExitError
 		}
 		if !ok {
@@ -309,7 +309,7 @@ func (a *App) doctorWriteInstalled(sessionID, dir string, h catalog.Harness, src
 		fmt.Fprintf(a.Stderr, "ofa: doctor: user catalog file(s) %s already define harness id %q; user files merge first-by-filename, so one of the two will be ignored\n", doctor.Visible(strings.Join(dups, ", ")), h.ID)
 		ok, err := confirmPrompt(a.Stdin, a.Stderr, "Install anyway? [y/N] ")
 		if err != nil {
-			fmt.Fprintf(a.Stderr, "ofa: confirm: %v\n", err)
+			fmt.Fprintf(a.Stderr, "ofa: confirm: %v; nothing was written\n", err)
 			return ExitError
 		}
 		if !ok {
@@ -319,10 +319,11 @@ func (a *App) doctorWriteInstalled(sessionID, dir string, h catalog.Harness, src
 	}
 	path, err := doctor.WriteCatalogEntry(h.ID, src, a.CatalogDir, overwrite)
 	if err != nil {
-		fmt.Fprintf(a.Stderr, "ofa: doctor: %v\n", err)
+		// The errors already carry the "doctor:" prefix.
+		fmt.Fprintf(a.Stderr, "ofa: %v\n", err)
 		return ExitError
 	}
-	fmt.Fprintf(a.Stdout, "installed: %s\n", path)
+	fmt.Fprintf(a.Stdout, "installed: %s\n", doctor.Visible(path))
 	// Session bookkeeping. The entry is already published, so a failure
 	// here is a warning on stderr and a successful exit — never a
 	// rollback of a write the user confirmed.
@@ -380,7 +381,7 @@ func (a *App) doctorPostInstallScan(h catalog.Harness) ExitCode {
 	if len(shadowed) > 0 {
 		return ExitError
 	}
-	fmt.Fprintf(a.Stderr, "ofa: doctor: %s was NOT detected after install; the entry is in place at %s but does not match this machine\n", doctor.Visible(bin), filepath.Join(a.CatalogDir, h.ID+".toml"))
+	fmt.Fprintf(a.Stderr, "ofa: doctor: %s was NOT detected after install; the entry is in place at %s but does not match this machine\n", doctor.Visible(bin), doctor.Visible(filepath.Join(a.CatalogDir, h.ID+".toml")))
 	return ExitError
 }
 

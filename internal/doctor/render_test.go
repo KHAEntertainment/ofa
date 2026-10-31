@@ -163,3 +163,63 @@ func TestValidateProposalRejectsNonGraphicNameBeforeExecution(t *testing.T) {
 	draft := strings.Replace(nativeEntryFor("zztarget", "/bin/zztarget"), `"zztarget probe"`, `"Evil\u202eName"`, 1)
 	gateRejectedBeforeExecution(t, draft, "zztarget", "/bin/zztarget")
 }
+
+// Invalid UTF-8 must never reach the terminal raw, on the clean-looking
+// fast path too: byte 0x9b is a C1 control (CSI) in some terminals.
+func TestVisibleEscapesInvalidUTF8(t *testing.T) {
+	got := Visible("a\x9bb")
+	if got != `'a\x9bb'` {
+		t.Errorf("Visible(invalid byte) = %q, want %q", got, `'a\x9bb'`)
+	}
+	if _, bad := firstNonGraphic("a\xffb"); !bad {
+		t.Error("firstNonGraphic missed an invalid UTF-8 byte")
+	}
+	if got := QuoteCmd([]string{"x", "a\x9bb"}); got != `x 'a\x9bb'` {
+		t.Errorf("QuoteCmd(invalid byte) = %q", got)
+	}
+}
+
+// RuneEscape and IsGraphicRune agree: every rune the latter refuses is
+// rendered as an escape with no raw non-ASCII byte in it.
+func TestRuneEscapeAgreesWithIsGraphicRune(t *testing.T) {
+	for _, c := range []struct {
+		r    rune
+		want string
+	}{
+		{'\u00a0', `\u00a0`}, // NBSP
+		{'\u2007', `\u2007`}, // figure space
+		{'\u202f', `\u202f`}, // narrow NBSP
+		{'\u3000', `\u3000`}, // ideographic space
+		{'\u202e', `\u202e`}, // bidi override
+		{'\ufffd', `\ufffd`}, // replacement character
+		{'\x1b', `\x1b`},
+		{'\n', `\n`},
+	} {
+		if IsGraphicRune(c.r) {
+			t.Errorf("IsGraphicRune(%U) = true, want false", c.r)
+		}
+		if got := RuneEscape(c.r); got != c.want {
+			t.Errorf("RuneEscape(%U) = %q, want %q", c.r, got, c.want)
+		}
+		if got := Visible("a" + string(c.r) + "b"); strings.ContainsRune(got, c.r) {
+			t.Errorf("Visible leaked %U raw: %q", c.r, got)
+		}
+	}
+}
+
+// A literal backslash-n and a real newline must not render the same.
+func TestVisibleBackslashIsUnambiguous(t *testing.T) {
+	lit, nl := Visible(`a\nb`), Visible("a\nb")
+	if lit != `'a\\nb'` {
+		t.Errorf("Visible(literal backslash-n) = %q, want %q", lit, `'a\\nb'`)
+	}
+	if nl != `'a\nb'` {
+		t.Errorf("Visible(newline) = %q, want %q", nl, `'a\nb'`)
+	}
+	if lit == nl {
+		t.Error("a literal backslash-n and a newline render identically")
+	}
+	if got := QuoteCmd([]string{`a\nb`, "a\nb"}); got != `'a\\nb' 'a\nb'` {
+		t.Errorf("QuoteCmd = %q", got)
+	}
+}

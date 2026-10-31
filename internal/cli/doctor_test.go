@@ -617,6 +617,137 @@ func TestDoctorCmd_OverwriteNeedsSecondConfirm(t *testing.T) {
 	}
 }
 
+// writerFunc adapts a function to io.Writer. The tests that use it fail
+// only the y/N question and pass every other write through, so the one
+// thing wrong is that the question never appeared.
+type writerFunc func([]byte) (int, error)
+
+func (f writerFunc) Write(p []byte) (int, error) { return f(p) }
+
+// recordingFeeder answers "y" like lineFeeder but counts reads, so a test
+// can prove no answer was consumed for a question the user never saw.
+type recordingFeeder struct{ reads int }
+
+func (r *recordingFeeder) Read(p []byte) (int, error) {
+	r.reads++
+	return copy(p, "y\n"), nil
+}
+
+// TestDoctorCmd_UnprintableQuestionNeverInstalls: when the Install or
+// Overwrite question cannot be written, stdin is not read, nothing is
+// installed or replaced, and the exit is nonzero.
+func TestDoctorCmd_UnprintableQuestionNeverInstalls(t *testing.T) {
+	existing := "id = \"sh-probe\"\nname = \"Mine\"\n\n[[installs]]\nmethod = \"native\"\nbin = \"sh\"\npaths = [\"/bin/sh\"]\nversion = { cmd = [\"sh\", \"--version\"] }\n"
+	for _, c := range []struct {
+		name     string
+		preexist bool
+		// reads the question that may fail; the initial question fails
+		// first when there is no prior file, the overwrite one when a
+		// prior file exists and the initial one is let through.
+		failOnly string
+	}{
+		{"initial confirm", false, "Install to"},
+		{"overwrite confirm", true, "Overwrite"},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			a, _, stderr, sd, _, _ := newTestApp(t, []string{"doctor", "sh"}, nil)
+			wireDoctor(t, a, &stubAgent{responses: []string{shEntry}}, shRunner())
+			feeder := &recordingFeeder{}
+			a.Stdin = feeder
+			a.StdinIsTTY = func(io.Reader) bool { return true }
+			failOnly := c.failOnly
+			a.Stderr = writerFunc(func(p []byte) (int, error) {
+				if strings.Contains(string(p), "[y/N]") && strings.Contains(string(p), failOnly) {
+					return 0, errors.New("broken stderr")
+				}
+				return stderr.Write(p)
+			})
+			path := filepath.Join(a.CatalogDir, "sh-probe.toml")
+			if c.preexist {
+				if err := os.MkdirAll(a.CatalogDir, 0o755); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.WriteFile(path, []byte(existing), 0o600); err != nil {
+					t.Fatal(err)
+				}
+			}
+			detectingAfterInstall(a)
+			sd.instances = nil
+			code := a.Run()
+			if code == ExitOK {
+				t.Fatalf("exit = 0, want nonzero; stderr: %s", stderr.String())
+			}
+			if c.preexist {
+				// The initial question printed and consumed one answer;
+				// the overwrite question must not have consumed another.
+				if feeder.reads != 1 {
+					t.Errorf("stdin reads = %d, want 1 (only the initial question)", feeder.reads)
+				}
+				b, _ := os.ReadFile(path)
+				if string(b) != existing {
+					t.Errorf("existing file was modified: %q", string(b))
+				}
+			} else {
+				if feeder.reads != 0 {
+					t.Errorf("stdin reads = %d, want 0", feeder.reads)
+				}
+				if _, err := os.Stat(path); !errors.Is(err, os.ErrNotExist) {
+					t.Errorf("catalog entry exists after an unprintable question: %v", err)
+				}
+			}
+			if !strings.Contains(stderr.String(), "nothing was written") {
+				t.Errorf("stderr missing the plain message: %s", stderr.String())
+			}
+		})
+	}
+}
+
+// A failed write reports one "doctor:" prefix, not two.
+func TestDoctorCmd_WriteFailureHasSinglePrefix(t *testing.T) {
+	a, _, stderr, sd, _, _ := newTestApp(t, []string{"doctor", "sh"}, nil)
+	wireDoctor(t, a, &stubAgent{responses: []string{shEntry}}, shRunner())
+	makeInteractive(a, "y", "y")
+	// A directory where the file should go: the overwrite rename fails.
+	if err := os.MkdirAll(filepath.Join(a.CatalogDir, "sh-probe.toml"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	sd.instances = nil
+	if code := a.Run(); code != ExitError {
+		t.Fatalf("exit = %d, want %d; stderr: %s", code, ExitError, stderr.String())
+	}
+	if strings.Contains(stderr.String(), "doctor: doctor:") {
+		t.Errorf("doubled prefix in stderr: %s", stderr.String())
+	}
+	if !strings.Contains(stderr.String(), "ofa: doctor: ") {
+		t.Errorf("stderr missing the single prefix: %s", stderr.String())
+	}
+}
+
+// The configured catalog directory is untrusted text on the terminal: it
+// is shown through the same escaping as every other value.
+func TestDoctorCmd_CatalogDirRenderedSafely(t *testing.T) {
+	a, _, stderr, sd, _, _ := newTestApp(t, []string{"doctor", "sh"}, nil)
+	wireDoctor(t, a, &stubAgent{responses: []string{shEntry}}, shRunner())
+	makeInteractive(a, "y", "n")
+	a.CatalogDir = filepath.Join(a.CatalogDir, "cat\x1b[8m")
+	if err := os.MkdirAll(a.CatalogDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(a.CatalogDir, "sh-probe.toml"), []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	sd.instances = nil
+	if code := a.Run(); code != ExitOK {
+		t.Fatalf("exit = %d, want 0; stderr: %s", code, stderr.String())
+	}
+	if strings.ContainsRune(stderr.String(), '\x1b') {
+		t.Errorf("raw ESC in stderr: %q", stderr.String())
+	}
+	if !strings.Contains(stderr.String(), `cat\x1b[8m`) {
+		t.Errorf("stderr missing the visible escape: %q", stderr.String())
+	}
+}
+
 func TestDoctorCmd_DuplicateIDNeedsSecondConfirm(t *testing.T) {
 	other := "id = \"sh-probe\"\nname = \"Old\"\n\n[[installs]]\nmethod = \"native\"\nbin = \"sh\"\npaths = [\"/bin/sh\"]\nversion = { cmd = [\"sh\", \"--version\"] }\n"
 	decline := func(t *testing.T, answers ...string) (stdout, stderr *bytes.Buffer, installed bool) {

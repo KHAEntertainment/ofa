@@ -464,6 +464,28 @@ func TestValidateProposalRejectsBinMismatchBeforeExecution(t *testing.T) {
 	gateRejectedBeforeExecution(t, draft, "zztarget", "/bin/zztarget")
 }
 
+// An id that cannot become a catalog file name is turned back at propose
+// time, with the reason, so the one retry can fix it; it must not survive
+// until the write.
+func TestValidateProposalRejectsInvalidIDBeforeExecution(t *testing.T) {
+	for _, id := range []string{"../x", "a/b", ".hidden", "A", "x y", strings.Repeat("a", 300), `a\\b`} {
+		t.Run(id[:min(len(id), 12)], func(t *testing.T) {
+			draft := fmt.Sprintf("id = %q\nname = \"X\"\n\n[[installs]]\nmethod = \"native\"\nbin = \"zztarget\"\npaths = [\"/bin/zztarget\"]\nversion = { cmd = [\"zztarget\", \"--version\"] }\nlatest = \"self\"\n", id)
+			run := &fakeRunner{}
+			_, err := ValidateProposal(draft, "zztarget", "/bin/zztarget", run.Run)
+			if err == nil {
+				t.Fatal("draft accepted, want rejection")
+			}
+			if !strings.Contains(err.Error(), "valid catalog file name") {
+				t.Errorf("reason does not name the id problem: %v", err)
+			}
+			if len(run.calls) != 0 {
+				t.Fatalf("shape gate let a command execute: runner saw %v", run.calls)
+			}
+		})
+	}
+}
+
 func TestValidateProposalRejectsUnknownKey(t *testing.T) {
 	draft := "id = \"x\"\nname = \"X\"\nlates = \"npm\"\n\n[[installs]]\nmethod = \"npm\"\npackage = \"x\"\nbin = \"zztarget\"\nversion = { cmd = [\"zztarget\", \"--version\"] }\n"
 	gateRejectedBeforeExecution(t, draft, "zztarget", "/bin/zztarget")

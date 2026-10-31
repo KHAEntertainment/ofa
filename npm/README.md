@@ -321,8 +321,10 @@ Each session writes `~/.config/ofa/doctor/history/<timestamp>/`: the facts
 and the full agent exchange in `context.md`, and a small `session.json`
 recording the target binary and the verdict (proposed, rejected, or
 installed). A session whose draft validates also saves the proposal as
-`proposed-catalog.toml`; a rejected one keeps the raw draft in
-`rejected.txt` instead.
+`proposed-catalog.toml`; a draft that still fails validation after the one
+retry keeps the raw draft in `rejected.txt` instead. A saved proposal that
+fails revalidation at `--install` is marked rejected in `session.json`; it
+gets no `rejected.txt`.
 
 A successful run ends with a review block — the harness id and name, every
 install with its method, package, bin, and paths, the version command, and
@@ -332,21 +334,25 @@ escapes, so nothing can conceal or forge a review line. A drafted update
 command that isn't the usual package-manager or self-update form is flagged
 as non-standard so it gets read, not skimmed. Then the question:
 `Install to ~/.config/ofa/catalog/<id>.toml? [y/N]`. The default is No.
-Piped or redirected stdin — including `< /dev/null` — is never prompted and
-never installs; it prints the `--install` command to run interactively
-instead. There is no `--yes` flag.
+Stdin that is not a terminal — a pipe, a file, `< /dev/null` — is never
+prompted and never installs; it prints the `--install` command to run
+interactively instead. If the question itself can't be printed, doctor
+reads no answer and installs nothing. There is no `--yes` flag.
 
 `--install` re-validates the saved proposal from scratch before writing
 anything: the same parse, the same command checks, the same detection test
 against the target recorded in the session. The whole file, as-is, must be
 one valid entry — no code-fence extraction happens at install time. A
 proposal whose edits leave it failing any check, or whose target binary is
-gone, is rejected with the reason and nothing is written; an edit that
-still passes every check installs on its own merits. An existing file for
-the id, or another user file already declaring it, gets a second explicit
-confirmation — the user catalog merges first-file-wins, so a silent
-duplicate would be ignored. The write is atomic (a synced temp file in the
-catalog directory, then linked into place), and afterwards doctor re-scans
+gone, is rejected with the reason and nothing is written to the catalog
+(the session record is marked rejected); an edit that still passes every
+check installs on its own merits. An existing file for the id, or another
+user file already declaring it, gets a second explicit confirmation — the
+user catalog merges first-file-wins, so a silent duplicate would be
+ignored. The write is atomic: a synced temp file in the catalog directory,
+hard-linked into place for a new entry (so it can never replace a file
+that appeared meanwhile) or renamed over the old one after you confirm an
+overwrite. Afterwards doctor re-scans
 and prints what it bought (`gh 2.102.0 detected`) — or says plainly that
 the target still isn't detected and leaves the file in place for
 inspection.

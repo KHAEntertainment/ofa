@@ -22,11 +22,15 @@ import (
 // a printable graphic character (letter, mark, number, punctuation,
 // symbol) or the ASCII space. Everything else — control characters, DEL,
 // bidi and other format runes, line and paragraph separators, the
-// lookalike Unicode spaces, private-use and unassigned code points — is
+// lookalike Unicode spaces, private-use and unassigned code points, and
+// the replacement character (what an invalid UTF-8 byte decodes to) — is
 // rendered as a visible escape instead.
 func IsGraphicRune(r rune) bool {
 	if r == ' ' {
 		return true
+	}
+	if r == utf8.RuneError {
+		return false
 	}
 	return unicode.IsOneOf([]*unicode.RangeTable{
 		unicode.L, unicode.M, unicode.N, unicode.P, unicode.S,
@@ -34,7 +38,8 @@ func IsGraphicRune(r rune) bool {
 }
 
 // firstNonGraphic returns the first rune of s that must not be emitted
-// raw, and whether such a rune exists.
+// raw, and whether such a rune exists. An invalid UTF-8 byte decodes to
+// utf8.RuneError, which IsGraphicRune rejects, so it is found here too.
 func firstNonGraphic(s string) (rune, bool) {
 	for _, r := range s {
 		if !IsGraphicRune(r) {
@@ -44,11 +49,23 @@ func firstNonGraphic(s string) (rune, bool) {
 	return 0, false
 }
 
-// RuneEscape renders one non-graphic rune as the short visible escape
-// strconv.QuoteToGraphic would produce: \x1b, \n, \r, \u202e. The rune
-// stays identifiable — and inert.
+// RuneEscape renders one non-graphic rune as a short visible escape:
+// \x1b, \n, \r, \u202e. The rune stays identifiable — and inert. It
+// agrees with IsGraphicRune: strconv treats the lookalike Unicode spaces
+// (NBSP, figure space, narrow NBSP) as graphic and would emit them raw, so
+// those get a numeric escape here. A backslash is doubled so no escape is
+// ambiguous with literal text.
 func RuneEscape(r rune) string {
+	if r == '\\' {
+		return `\\`
+	}
 	q := strconv.QuoteRuneToGraphic(r)
+	if !IsGraphicRune(r) && !strings.HasPrefix(q, `'\`) {
+		if r > 0xffff {
+			return fmt.Sprintf(`\U%08x`, r)
+		}
+		return fmt.Sprintf(`\u%04x`, r)
+	}
 	return q[1 : len(q)-1]
 }
 
@@ -61,7 +78,7 @@ func Visible(s string) string {
 	if s == "" {
 		return "''"
 	}
-	if _, bad := firstNonGraphic(s); !bad {
+	if _, bad := firstNonGraphic(s); !bad && !strings.ContainsRune(s, '\\') {
 		return s
 	}
 	return "'" + escapeBody(s) + "'"
@@ -86,6 +103,8 @@ func escapeBody(s string) string {
 		switch {
 		case r == '\'':
 			b.WriteString(`'\''`)
+		case r == '\\':
+			b.WriteString(`\\`)
 		case IsGraphicRune(r):
 			b.WriteRune(r)
 		default:

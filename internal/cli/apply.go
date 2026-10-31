@@ -179,9 +179,13 @@ func labelFor(r resolve.Resolution) string {
 }
 
 // confirmPrompt asks the user a y/N question on stdin. Returns true for
-// "y" / "Y", false for anything else (including EOF / empty input).
+// "y" / "Y", false for anything else (including EOF / empty input). If the
+// question cannot be written, it returns that error without reading stdin:
+// an answer to a question the user never saw must not count as consent.
 func confirmPrompt(stdin interface{ Read([]byte) (int, error) }, stderr interface{ Write([]byte) (int, error) }, prompt string) (bool, error) {
-	fmt.Fprint(stderr, prompt)
+	if _, err := fmt.Fprint(stderr, prompt); err != nil {
+		return false, err
+	}
 	scanner := bufio.NewScanner(stdin)
 	if !scanner.Scan() {
 		if err := scanner.Err(); err != nil {

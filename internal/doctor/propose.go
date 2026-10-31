@@ -130,6 +130,11 @@ func shapeGate(h catalog.Harness, bin, targetReal string) error {
 	if err := checkGraphicFields(h); err != nil {
 		return err
 	}
+	// The id becomes the catalog file name. Rejecting a bad one here puts
+	// the reason in front of the one retry instead of failing at write.
+	if !ValidID(h.ID) {
+		return fmt.Errorf("id %s is not a valid catalog file name: use lowercase letters, digits, dots, underscores and dashes, starting with a letter or digit, at most %d characters", Visible(h.ID), maxIDLen)
+	}
 	for i, in := range h.Installs {
 		if in.Bin != bin {
 			return fmt.Errorf("install[%d]: bin %q must be %q", i, in.Bin, bin)
