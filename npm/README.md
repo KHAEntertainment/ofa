@@ -141,6 +141,7 @@ $ ofa apply --yes       # run all available updates
 $ ofa apply --only pi   # narrow to one harness
 $ ofa apply --verbose   # stream each installer's full output (default: progress lines)
 $ ofa scan              # detect + write state, report drift since last scan
+$ ofa doctor <bin>      # agent-drafted catalog entry for an undetected binary
 ```
 
 `ofa check --json` is the scriptable variant:
@@ -209,8 +210,11 @@ version = { cmd = ["my-harness", "--version"] }
 
 Entries use the same keys as the embedded ones — `id`, `name`, `homepage`, and
 one `[[installs]]` block per install method (`brew-formula`, `brew-cask`, `npm`,
-`pipx`, `uv`, `native`). OFA only ever reads this directory; it never writes
-there, and nothing creates it for you.
+`pipx`, `uv`, `native`). Create the directory by hand, or let `ofa doctor`'s
+install step create it after its explicit confirmation — that step is the one
+door OFA writes through
+(see [Agent-assisted repair](#agent-assisted-repair-ofa-doctor)).
+Every other command — `scan`, `check`, `apply`, the picker — only reads it.
 
 Three limits worth knowing:
 
@@ -296,6 +300,80 @@ catalog entry needs it.
 `update.cmd` is data, so a new install path is a new field on the same catalog
 entry rather than new code.
 
+## Agent-assisted repair (`ofa doctor`)
+
+Sometimes a binary is on PATH but nothing in the Catalog detects it — a new
+harness, or an install somewhere the embedded entry doesn't know about.
+`ofa doctor <bin>` has an agent draft the missing entry, checks the draft,
+and offers to install it into your user catalog. It needs Claude Code on
+PATH: v1 is Claude-only because `claude -p` is the one headless mode that
+runs with no tools and no session persistence, which is what the trust
+model requires.
+
+```sh
+$ ofa doctor                 # gap check: list undetected binaries, or draft for the single one
+$ ofa doctor <bin>           # draft an entry for one binary
+$ ofa doctor --list          # previous sessions and their verdicts
+$ ofa doctor --install 20261028T123456Z   # install a proposal saved by an earlier run
+```
+
+Each session writes `~/.config/ofa/doctor/history/<timestamp>/`: the facts
+and the full agent exchange in `context.md`, and a small `session.json`
+recording the target binary and the verdict (proposed, rejected, or
+installed). A session whose draft validates also saves the proposal as
+`proposed-catalog.toml`; a draft that still fails validation after the one
+retry keeps the raw draft in `rejected.txt` instead. A saved proposal that
+fails revalidation at `--install` is marked rejected in `session.json`; it
+gets no `rejected.txt`.
+
+A successful run ends with a review block — the harness id and name, every
+install with its method, package, bin, and paths, the version command, and
+the update command on its own line, verbatim. Values are rendered
+terminal-safe: control characters and bidi overrides show up as visible
+escapes, so nothing can conceal or forge a review line. A drafted update
+command that isn't the usual package-manager or self-update form is flagged
+as non-standard so it gets read, not skimmed. Then the question:
+`Install to ~/.config/ofa/catalog/<id>.toml? [y/N]`. The default is No.
+Stdin that is not a terminal — a pipe, a file, `< /dev/null` — is never
+prompted and never installs; it prints the `--install` command to run
+interactively instead. If the question itself can't be printed, doctor
+reads no answer and installs nothing. There is no `--yes` flag.
+
+`--install` re-validates the saved proposal from scratch before writing
+anything: the same parse, the same command checks, the same detection test
+against the target recorded in the session. The whole file, as-is, must be
+one valid entry — no code-fence extraction happens at install time. A
+proposal whose edits leave it failing any check, or whose target binary is
+gone, is rejected with the reason and nothing is written to the catalog
+(the session record is marked rejected); an edit that still passes every
+check installs on its own merits. An existing file for the id, or another
+user file already declaring it, gets a second explicit confirmation — the
+user catalog merges first-file-wins, so a silent duplicate would be
+ignored. The write is atomic: a synced temp file in the catalog directory,
+hard-linked into place for a new entry (so it can never replace a file
+that appeared meanwhile) or renamed over the old one after you confirm an
+overwrite. Afterwards doctor re-scans
+and prints what it bought (`gh 2.102.0 detected`) — or says plainly that
+the target still isn't detected and leaves the file in place for
+inspection.
+
+The trust model in five sentences. The agent runs headless with no tools,
+so it can only answer, never act. Everything it returns is untrusted
+input: the draft must parse as a valid entry, its version command must be
+exactly the target binary's `--version` (an update command may name any
+executable — doctor never runs it, it is only displayed for you to read),
+and the entry must actually detect that binary through the real scan path
+before you ever see it. Commands run through a pinned, bounded runner that
+executes nothing except the target binary itself — `--version` and
+`--help` while gathering facts, `--version` again during detection — and
+the fixed registry queries; a drafted path can never choose what runs.
+The update command is the one thing in the draft that `ofa apply` will
+later execute, so doctor only ever displays it, and the decision to
+install is made by a person at a terminal with No as the default. At
+`--install` time nothing is trusted from disk: the proposal is
+revalidated end to end, and the bytes that were validated are the bytes
+that are written.
+
 ## Roadmap
 
 Distribution is done: npm, the Homebrew tap, and tag-triggered releases all ship
@@ -311,16 +389,6 @@ and uncommitted to any date.
 - **Windows (WSL) and native Windows.** WSL reuses the existing Linux-capable
   methods; native Windows adds `scoop`, `winget`, and Windows registry probing
   for native installs.
-
-### Long-term: agent-assisted Catalog (`ofa doctor`)
-
-When a scan finds a binary on PATH that doesn't match any Catalog entry, or a Catalog entry fails to detect a known install, OFA needs help from a human-shaped intelligence to write the TOML. The design avoids any API key or rate-limit dependency on OFA's side:
-
-1. OFA writes the facts it knows into a shared context folder under its config directory: `~/.config/ofa/doctor/CLAUDE.md` (always loaded by Claude Code), `~/.config/ofa/doctor/context.md` (per-invocation facts: which binary, its `--version` output, the gaps it fills).
-2. OFA spawns a headless session of an installed agent — e.g. `claude -p "Read ~/.config/ofa/doctor/CLAUDE.md and ~/.config/ofa/doctor/context.md. Draft a Catalog entry."` — whichever harness the user has installed. No model API, no vendor lock-in; OFA is the orchestrator, the agent does the thinking.
-3. The proposed TOML lands at `~/.config/ofa/doctor/history/<timestamp>/proposed-catalog.toml`. The user reviews it; if approved, copies it into the user Catalog (`~/.config/ofa/catalog/<id>.toml`) or upstream via PR for shared coverage.
-
-Doctor is opt-in (`ofa doctor` only) and never runs in the default `ofa` path. Its directory is created on first use, not at install.
 
 ### Open ideas (not scheduled)
 
@@ -338,7 +406,7 @@ $ go test ./...
 $ # open a PR
 ```
 
-If `ofa doctor` (see [Roadmap](#roadmap)) finds a binary on your machine that doesn't match a catalog entry, it drafts a TOML for you to review and contribute upstream. Doctor is an opt-in command — not part of the default `ofa` path.
+If `ofa doctor` (see [Agent-assisted repair](#agent-assisted-repair-ofa-doctor)) finds a binary on your machine that doesn't match a catalog entry, it drafts a TOML for you to review, install into your user catalog, and contribute upstream. Doctor is an opt-in command — not part of the default `ofa` path.
 
 Cutting a release (version bump, tag, staged npm publish, Homebrew tap bump) is
 documented in [`docs/RELEASING.md`](https://github.com/KHAEntertainment/ofa/blob/main/docs/RELEASING.md).

@@ -538,3 +538,33 @@ func TestMergedFollowsFileSymlinksAndSkipsDirNamedToml(t *testing.T) {
 		t.Error("symlinked-dir catalog file was not read")
 	}
 }
+
+// UserCatalogFiles enumerates exactly the file set the merged loader
+// reads — the literal listing, never a glob — so doctor's duplicate-id
+// scan cannot diverge from the merge. A directory NAME containing glob
+// syntax is read as-is.
+func TestUserCatalogFilesMatchesLoaderListing(t *testing.T) {
+	for _, name := range []string{"catalog[1]", "cat[ab]", "plain"} {
+		t.Run(name, func(t *testing.T) {
+			dir := filepath.Join(t.TempDir(), name)
+			if err := os.MkdirAll(dir, 0o755); err != nil {
+				t.Fatal(err)
+			}
+			writeFile(t, dir, "b.toml", nativeTOML("b-harness", "B"))
+			writeFile(t, dir, "a.toml", nativeTOML("a-harness", "A"))
+			writeFile(t, dir, "c.txt", "not a catalog file")
+			// A directory named *.toml is not an entry file.
+			if err := os.MkdirAll(filepath.Join(dir, "d.toml"), 0o755); err != nil {
+				t.Fatal(err)
+			}
+			got := UserCatalogFiles(dir)
+			if want := []string{"a.toml", "b.toml"}; !reflect.DeepEqual(got, want) {
+				t.Errorf("UserCatalogFiles(%q) = %v, want %v", dir, got, want)
+			}
+		})
+	}
+	// An absent directory yields nothing, quietly.
+	if got := UserCatalogFiles(filepath.Join(t.TempDir(), "no-such-dir")); len(got) != 0 {
+		t.Errorf("UserCatalogFiles(absent) = %v, want none", got)
+	}
+}

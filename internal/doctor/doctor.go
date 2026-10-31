@@ -60,6 +60,12 @@ type Result struct {
 	Dir string
 	// Harness is the accepted, validated proposal; nil unless accepted.
 	Harness *catalog.Harness
+	// ProposalBytes is the exact TOML the validator parsed and accepted —
+	// the same bytes written to ProposalPath. The install flow carries
+	// these bytes in memory from validation to the catalog write and
+	// never re-reads the file, so what was validated and reviewed is
+	// what is installed. Empty unless accepted.
+	ProposalBytes []byte
 	// ProposalPath is proposed-catalog.toml; empty unless accepted.
 	ProposalPath string
 	// RejectedPath is rejected.txt; empty unless the draft was rejected.
@@ -121,6 +127,22 @@ func Run(bin string, opts Options) (*Result, error) {
 		}
 		return nil
 	}
+	// record stamps the session's verdict into session.json so --list can
+	// show it and --install can name the target back. Verdicts: proposed
+	// when a validated proposal waits for a human, rejected when the
+	// session ends without one (failed agent run or failed validation).
+	// "installed" is written later by the install flow, not here.
+	record := func(status, harnessID string) error {
+		if err := SaveSessionRecord(dir, SessionRecord{
+			Target:    bin,
+			HarnessID: harnessID,
+			Time:      now().UTC(),
+			Status:    status,
+		}); err != nil {
+			return fmt.Errorf("doctor: %w", err)
+		}
+		return nil
+	}
 	// context.md exists before the agent is ever spawned, so a timeout or
 	// crash still leaves the audit trail the failure-mode table requires.
 	if err := save(); err != nil {
@@ -143,18 +165,25 @@ func Run(bin string, opts Options) (*Result, error) {
 			if err := save(); err != nil {
 				return res, err
 			}
+			if err := record(StatusRejected, ""); err != nil {
+				return res, err
+			}
 			return res, fmt.Errorf("doctor: agent run failed: %w", aerr)
 		}
-		h, tomlSrc, verr := ValidateProposal(out, bin, facts.RealPath, opts.Runner)
+		cand, verr := ValidateProposal(out, bin, facts.RealPath, opts.Runner)
 		if verr == nil {
 			res.Attempts = append(res.Attempts, att)
-			res.Harness = &h
+			res.Harness = &cand.Harness
+			res.ProposalBytes = cand.Bytes
 			proposal := filepath.Join(dir, "proposed-catalog.toml")
-			if err := os.WriteFile(proposal, []byte(tomlSrc), 0o600); err != nil {
+			if err := os.WriteFile(proposal, cand.Bytes, 0o600); err != nil {
 				return res, fmt.Errorf("doctor: %w", err)
 			}
 			res.ProposalPath = proposal
 			if err := save(); err != nil {
+				return res, err
+			}
+			if err := record(StatusProposed, cand.Harness.ID); err != nil {
 				return res, err
 			}
 			return res, nil
@@ -172,5 +201,8 @@ func Run(bin string, opts Options) (*Result, error) {
 		return res, fmt.Errorf("doctor: %w", err)
 	}
 	res.RejectedPath = rejected
+	if err := record(StatusRejected, ""); err != nil {
+		return res, err
+	}
 	return res, fmt.Errorf("doctor: proposal rejected: %w", lastErr)
 }

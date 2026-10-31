@@ -143,6 +143,23 @@ func userEntries(dir string) ([]entry, []Problem) {
 	return entries, problems
 }
 
+// UserCatalogFiles lists the user catalog entry files in dir exactly as
+// the merged loader reads them: a literal directory listing (never a
+// glob — the path is a real name the user chose, and names like
+// `catalog[1]` are not character classes), *.toml suffix, regular files
+// and symlinks that resolve to regular files, sorted by name. It exists
+// so other commands (doctor's duplicate-id scan) enumerate the same file
+// set the loader would merge, and the two can never diverge. Files that
+// cannot be read are absent here exactly as the merge skips them.
+func UserCatalogFiles(dir string) []string {
+	files, _ := userEntries(dir)
+	names := make([]string, len(files))
+	for i, f := range files {
+		names[i] = f.name
+	}
+	return names
+}
+
 // isCatalogFile reports whether de is something to read as a catalog entry: a
 // regular file, or a symlink that resolves to one. A directory named *.toml is
 // skipped. A symlink that cannot be resolved is kept so the read reports it as
