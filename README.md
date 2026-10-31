@@ -214,9 +214,10 @@ version = { cmd = ["my-harness", "--version"] }
 
 Entries use the same keys as the embedded ones — `id`, `name`, `homepage`, and
 one `[[installs]]` block per install method (`brew-formula`, `brew-cask`, `npm`,
-`pipx`, `uv`, `native`). Nothing creates the directory for you, and OFA
-writes into it through exactly one door: `ofa doctor`'s install step, after
-an explicit confirmation (see [Agent-assisted repair](#agent-assisted-repair-ofa-doctor)).
+`pipx`, `uv`, `native`). Create the directory by hand, or let `ofa doctor`'s
+install step create it after its explicit confirmation — that step is the one
+door OFA writes through
+(see [Agent-assisted repair](#agent-assisted-repair-ofa-doctor)).
 Every other command — `scan`, `check`, `apply`, the picker — only reads it.
 
 Three limits worth knowing:
@@ -321,44 +322,55 @@ $ ofa doctor --install 20261028T123456Z   # install a proposal saved by an earli
 ```
 
 Each session writes `~/.config/ofa/doctor/history/<timestamp>/`: the facts
-and the full agent exchange in `context.md`, the proposal in
-`proposed-catalog.toml`, and a small `session.json` recording the target
-binary and the verdict (proposed, rejected, or installed).
+and the full agent exchange in `context.md`, and a small `session.json`
+recording the target binary and the verdict (proposed, rejected, or
+installed). A session whose draft validates also saves the proposal as
+`proposed-catalog.toml`; a rejected one keeps the raw draft in
+`rejected.txt` instead.
 
 A successful run ends with a review block — the harness id and name, every
 install with its method, package, bin, and paths, the version command, and
-the update command on its own line, verbatim. A drafted update command that
-isn't the usual package-manager or self-update form is flagged as
-non-standard so it gets read, not skimmed. Then the question:
+the update command on its own line, verbatim. Values are rendered
+terminal-safe: control characters and bidi overrides show up as visible
+escapes, so nothing can conceal or forge a review line. A drafted update
+command that isn't the usual package-manager or self-update form is flagged
+as non-standard so it gets read, not skimmed. Then the question:
 `Install to ~/.config/ofa/catalog/<id>.toml? [y/N]`. The default is No.
-Piped stdin is never prompted and never installs — it prints the
-`--install` command to run interactively instead. There is no `--yes`
-flag.
+Piped or redirected stdin — including `< /dev/null` — is never prompted and
+never installs; it prints the `--install` command to run interactively
+instead. There is no `--yes` flag.
 
 `--install` re-validates the saved proposal from scratch before writing
 anything: the same parse, the same command checks, the same detection test
-against the target recorded in the session. A proposal that was edited
-since, or whose target binary is gone, is rejected with the reason and
-nothing is written. An existing file for the id, or another user file
-already declaring it, gets a second explicit confirmation — the user
-catalog merges first-file-wins, so a silent duplicate would be ignored.
-The write is atomic (a synced temp file in the catalog directory, then
-linked into place), and afterwards doctor re-scans and prints what it
-bought (`gh 2.102.0 detected`) — or says plainly that the target still
-isn't detected and leaves the file in place for inspection.
+against the target recorded in the session. The whole file, as-is, must be
+one valid entry — no code-fence extraction happens at install time. A
+proposal whose edits leave it failing any check, or whose target binary is
+gone, is rejected with the reason and nothing is written; an edit that
+still passes every check installs on its own merits. An existing file for
+the id, or another user file already declaring it, gets a second explicit
+confirmation — the user catalog merges first-file-wins, so a silent
+duplicate would be ignored. The write is atomic (a synced temp file in the
+catalog directory, then linked into place), and afterwards doctor re-scans
+and prints what it bought (`gh 2.102.0 detected`) — or says plainly that
+the target still isn't detected and leaves the file in place for
+inspection.
 
 The trust model in five sentences. The agent runs headless with no tools,
 so it can only answer, never act. Everything it returns is untrusted
-input: the draft must parse as a valid entry, every command it declares
-must name the target binary, and the entry must actually detect that
-binary through the real scan path before you ever see it. Commands run
-through a pinned, bounded runner that executes nothing except the target
-binary's `--version` and the fixed registry queries — a drafted path can
-never choose what runs. The update command is the one thing in the draft
-that `ofa apply` will later execute, so doctor only ever displays it, and
-the decision to install is made by a person at a terminal with No as the
-default. At `--install` time nothing is trusted from disk: the proposal is
-revalidated end to end.
+input: the draft must parse as a valid entry, its version command must be
+exactly the target binary's `--version` (an update command may name any
+executable — doctor never runs it, it is only displayed for you to read),
+and the entry must actually detect that binary through the real scan path
+before you ever see it. Commands run through a pinned, bounded runner that
+executes nothing except the target binary itself — `--version` and
+`--help` while gathering facts, `--version` again during detection — and
+the fixed registry queries; a drafted path can never choose what runs.
+The update command is the one thing in the draft that `ofa apply` will
+later execute, so doctor only ever displays it, and the decision to
+install is made by a person at a terminal with No as the default. At
+`--install` time nothing is trusted from disk: the proposal is
+revalidated end to end, and the bytes that were validated are the bytes
+that are written.
 
 ## Roadmap
 

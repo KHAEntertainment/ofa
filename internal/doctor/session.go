@@ -59,16 +59,45 @@ func ValidSessionID(id string) bool {
 	return sessionIDPattern.MatchString(id)
 }
 
-// SaveSessionRecord writes rec to dir/session.json. 0600, like every file
-// doctor writes: the record names local binaries and paths.
+// SaveSessionRecord writes rec to dir/session.json: a private temp file
+// in the same directory, fsynced, then renamed into place — atomic, like
+// the catalog write, so a crash mid-write can never destroy the record
+// --install needs to work later. The rename also forces 0600 even over
+// an older, looser file: the record names local binaries and paths.
 func SaveSessionRecord(dir string, rec SessionRecord) error {
 	b, err := json.MarshalIndent(rec, "", "  ")
 	if err != nil {
 		return fmt.Errorf("session: %w", err)
 	}
-	if err := os.WriteFile(filepath.Join(dir, sessionName), append(b, '\n'), 0o600); err != nil {
+	b = append(b, '\n')
+	tmp, err := os.CreateTemp(dir, ".session-*.tmp")
+	if err != nil {
 		return fmt.Errorf("session: %w", err)
 	}
+	name := tmp.Name()
+	published := false
+	defer func() {
+		if !published {
+			tmp.Close()
+			os.Remove(name)
+		}
+	}()
+	if _, err := tmp.Write(b); err != nil {
+		return fmt.Errorf("session: %w", err)
+	}
+	if err := tmp.Chmod(0o600); err != nil {
+		return fmt.Errorf("session: %w", err)
+	}
+	if err := tmp.Sync(); err != nil {
+		return fmt.Errorf("session: %w", err)
+	}
+	if err := tmp.Close(); err != nil {
+		return fmt.Errorf("session: %w", err)
+	}
+	if err := os.Rename(name, filepath.Join(dir, sessionName)); err != nil {
+		return fmt.Errorf("session: %w", err)
+	}
+	published = true
 	return nil
 }
 

@@ -60,6 +60,12 @@ type Result struct {
 	Dir string
 	// Harness is the accepted, validated proposal; nil unless accepted.
 	Harness *catalog.Harness
+	// ProposalBytes is the exact TOML the validator parsed and accepted —
+	// the same bytes written to ProposalPath. The install flow carries
+	// these bytes in memory from validation to the catalog write and
+	// never re-reads the file, so what was validated and reviewed is
+	// what is installed. Empty unless accepted.
+	ProposalBytes []byte
 	// ProposalPath is proposed-catalog.toml; empty unless accepted.
 	ProposalPath string
 	// RejectedPath is rejected.txt; empty unless the draft was rejected.
@@ -164,19 +170,20 @@ func Run(bin string, opts Options) (*Result, error) {
 			}
 			return res, fmt.Errorf("doctor: agent run failed: %w", aerr)
 		}
-		h, tomlSrc, verr := ValidateProposal(out, bin, facts.RealPath, opts.Runner)
+		cand, verr := ValidateProposal(out, bin, facts.RealPath, opts.Runner)
 		if verr == nil {
 			res.Attempts = append(res.Attempts, att)
-			res.Harness = &h
+			res.Harness = &cand.Harness
+			res.ProposalBytes = cand.Bytes
 			proposal := filepath.Join(dir, "proposed-catalog.toml")
-			if err := os.WriteFile(proposal, []byte(tomlSrc), 0o600); err != nil {
+			if err := os.WriteFile(proposal, cand.Bytes, 0o600); err != nil {
 				return res, fmt.Errorf("doctor: %w", err)
 			}
 			res.ProposalPath = proposal
 			if err := save(); err != nil {
 				return res, err
 			}
-			if err := record(StatusProposed, h.ID); err != nil {
+			if err := record(StatusProposed, cand.Harness.ID); err != nil {
 				return res, err
 			}
 			return res, nil

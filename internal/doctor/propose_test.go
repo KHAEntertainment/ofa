@@ -363,7 +363,7 @@ func TestExtractTOML(t *testing.T) {
 func gateRejectedBeforeExecution(t *testing.T, draft, bin, targetReal string) {
 	t.Helper()
 	run := &fakeRunner{}
-	_, _, err := ValidateProposal(draft, bin, targetReal, run.Run)
+	_, err := ValidateProposal(draft, bin, targetReal, run.Run)
 	if err == nil {
 		t.Fatal("draft accepted, want rejection")
 	}
@@ -414,7 +414,7 @@ func TestValidateProposalVersionCmdMustBeExactlyDashDashVersion(t *testing.T) {
 	for _, cmd := range rejected {
 		draft := nativeDraftCmd("zztarget", target, cmd)
 		run := &fakeRunner{responses: map[string]string{target: "zztarget 1.0\n"}}
-		_, _, err := ValidateProposal(draft, "zztarget", targetReal, run.Run)
+		_, err := ValidateProposal(draft, "zztarget", targetReal, run.Run)
 		if err == nil {
 			t.Errorf("cmd %v accepted, want rejection", cmd)
 			continue
@@ -429,7 +429,7 @@ func TestValidateProposalVersionCmdMustBeExactlyDashDashVersion(t *testing.T) {
 
 	// The one accepted vector, through the real detect path.
 	run := &fakeRunner{responses: map[string]string{target: "zztarget 1.0\n"}}
-	if _, _, err := ValidateProposal(nativeEntryFor("zztarget", target), "zztarget", targetReal, run.Run); err != nil {
+	if _, err := ValidateProposal(nativeEntryFor("zztarget", target), "zztarget", targetReal, run.Run); err != nil {
 		t.Errorf("[bin, --version] rejected: %v", err)
 	}
 }
@@ -441,7 +441,7 @@ func TestValidateProposalRegistrySelfVersionCmdGated(t *testing.T) {
 	run := &fakeRunner{responses: map[string]string{
 		"npm": `{"dependencies":{"somepkg":{"version":"1.2.3"}}}`,
 	}}
-	_, _, err := ValidateProposal(draft, "zztarget", "/bin/zztarget", run.Run)
+	_, err := ValidateProposal(draft, "zztarget", "/bin/zztarget", run.Run)
 	if err == nil || !strings.Contains(err.Error(), `version.cmd must be exactly`) {
 		t.Errorf("registry latest=self draft: err = %v, want the version-command rule", err)
 	}
@@ -508,14 +508,14 @@ func TestValidateProposalNativePathBoundToTargetIdentity(t *testing.T) {
 		t.Fatal(err)
 	}
 	run := &fakeRunner{responses: map[string]string{okLink: "zzreview 1.0\n"}}
-	if _, _, err := ValidateProposal(nativeEntryFor("zzreview", okLink), "zzreview", targetReal, run.Run); err != nil {
+	if _, err := ValidateProposal(nativeEntryFor("zzreview", okLink), "zzreview", targetReal, run.Run); err != nil {
 		t.Errorf("symlink to the authorized target rejected: %v", err)
 	}
 
 	// A nonexistent path passes the gate (it is never executed) and is
 	// rejected by the correctness gate instead.
 	run2 := &fakeRunner{}
-	_, _, err = ValidateProposal(nativeEntryFor("zzreview", "/nonexistent/zzreview"), "zzreview", targetReal, run2.Run)
+	_, err = ValidateProposal(nativeEntryFor("zzreview", "/nonexistent/zzreview"), "zzreview", targetReal, run2.Run)
 	if err == nil || !strings.Contains(err.Error(), "does not detect") {
 		t.Errorf("nonexistent path: err = %v, want does-not-detect", err)
 	}
@@ -524,15 +524,20 @@ func TestValidateProposalNativePathBoundToTargetIdentity(t *testing.T) {
 // --- propose: the correctness gate ---
 
 func TestValidateProposalAcceptsDetectingNativeEntry(t *testing.T) {
-	h, tomlSrc, err := ValidateProposal(nativeEntryFor("sh", "/bin/sh"), "sh", shReal(t), shRunner().Run)
+	cand, err := ValidateProposal(nativeEntryFor("sh", "/bin/sh"), "sh", shReal(t), shRunner().Run)
 	if err != nil {
 		t.Fatalf("valid entry rejected: %v", err)
 	}
-	if h.ID != "sh-probe" {
-		t.Errorf("harness id = %q, want sh-probe", h.ID)
+	if cand.Harness.ID != "sh-probe" {
+		t.Errorf("harness id = %q, want sh-probe", cand.Harness.ID)
 	}
-	if tomlSrc == "" || !strings.Contains(tomlSrc, `bin = "sh"`) {
-		t.Errorf("extracted toml = %q", tomlSrc)
+	if string(cand.Bytes) == "" || !strings.Contains(string(cand.Bytes), `bin = "sh"`) {
+		t.Errorf("extracted toml = %q", string(cand.Bytes))
+	}
+	// The candidate is self-bound: its bytes parse back to exactly its
+	// harness.
+	if err := BindCheck(cand.Harness, cand.Bytes); err != nil {
+		t.Errorf("BindCheck on a fresh candidate: %v", err)
 	}
 }
 
@@ -542,7 +547,7 @@ func TestValidateProposalRejectsEntryThatDoesNotDetect(t *testing.T) {
 	// the key correctness gate: a syntactically perfect draft is worthless
 	// if it cannot see the binary.
 	run := &fakeRunner{}
-	_, _, err := ValidateProposal(nativeEntryFor("zztarget", "/nonexistent/zztarget"), "zztarget", "/bin/zztarget", run.Run)
+	_, err := ValidateProposal(nativeEntryFor("zztarget", "/nonexistent/zztarget"), "zztarget", "/bin/zztarget", run.Run)
 	if err == nil {
 		t.Fatal("non-detecting entry accepted")
 	}
@@ -556,7 +561,7 @@ func TestValidateProposalDetectsViaRegistry(t *testing.T) {
 	run := &fakeRunner{responses: map[string]string{
 		"npm": `{"dependencies":{"somepkg":{"version":"1.2.3"}}}`,
 	}}
-	_, _, err := ValidateProposal(draft, "zztarget", "/bin/zztarget", run.Run)
+	_, err := ValidateProposal(draft, "zztarget", "/bin/zztarget", run.Run)
 	if err != nil {
 		t.Fatalf("registry-detecting entry rejected: %v", err)
 	}
@@ -571,7 +576,74 @@ func TestValidateProposalDetectsViaRegistry(t *testing.T) {
 // is an override the install flow reports, not a defect of the entry.
 func TestValidateProposalEmbeddedIDCollisionStillDetects(t *testing.T) {
 	draft := strings.Replace(nativeEntryFor("sh", "/bin/sh"), `id = "sh-probe"`, `id = "claude"`, 1)
-	if _, _, err := ValidateProposal(draft, "sh", shReal(t), shRunner().Run); err != nil {
+	if _, err := ValidateProposal(draft, "sh", shReal(t), shRunner().Run); err != nil {
 		t.Errorf("embedded-id collision rejected: %v", err)
+	}
+}
+
+// --- B1: the candidate binds validated bytes to the reviewed entry ---
+
+func TestBindCheck(t *testing.T) {
+	toml := nativeEntryFor("sh", "/bin/sh")
+	h, err := catalog.ParseEntry("proposed-catalog.toml", []byte(toml))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := BindCheck(h, []byte(toml)); err != nil {
+		t.Errorf("BindCheck on the exact bytes: %v", err)
+	}
+	// Different content that parses to a different entry: refused.
+	other := strings.Replace(toml, `"sh probe"`, `"sh probex"`, 1)
+	if err := BindCheck(h, []byte(other)); err == nil {
+		t.Error("BindCheck accepted bytes that parse to a different entry")
+	}
+	if err := BindCheck(h, []byte("not toml at all")); err == nil {
+		t.Error("BindCheck accepted unparseable bytes")
+	}
+}
+
+// The reviewer's B1 fixture: a saved file whose whole content is a
+// valid outer entry wrapping a fenced, benign inner entry inside a
+// multiline name, while the outer entry declares an unreviewed version
+// vector. ValidateSavedProposal parses the WHOLE file with no fence
+// extraction: the outer entry is the proposal, and it is rejected — the
+// benign inner fence never stands in for it.
+func TestValidateSavedProposalNoFenceExtraction(t *testing.T) {
+	inner := "id = \"sh-probe\"\nname = \"Inner\"\n\n[[installs]]\nmethod = \"native\"\nbin = \"sh\"\npaths = [\"/bin/sh\"]\nversion = { cmd = [\"sh\", \"--version\"] }\nlatest = \"self\"\n"
+	outer := "id = \"sh-probe\"\nname = \"\"\"\nShell Probe\n```toml\n" + inner + "```\n\"\"\"\n\n[[installs]]\nmethod = \"native\"\nbin = \"sh\"\npaths = [\"/bin/sh\"]\nversion = { cmd = [\"sh\", \"-c\", \"UNREVIEWED_VERSION_MARKER\"] }\nlatest = \"self\"\n"
+
+	_, err := ValidateSavedProposal([]byte(outer), "sh", shReal(t), shRunner().Run)
+	if err == nil {
+		t.Fatal("fence-wrapped saved proposal accepted, want rejection")
+	}
+	if !strings.Contains(err.Error(), "version.cmd must be exactly") && !strings.Contains(err.Error(), "name") {
+		t.Errorf("error = %v, want the whole-file verdict (unreviewed version vector or non-graphic multiline name)", err)
+	}
+
+	// A clean outer entry whose single-line name merely MENTIONS a fence
+	// is a legitimate whole-file proposal: it validates as-is, and the
+	// candidate's bytes are the whole file — the fence text stays what
+	// it is, text inside the name.
+	single := "id = \"sh-probe\"\nname = \"Shell Probe ```toml id = \\\"sh-inner\\\" name = \\\"Inner\\\" ``` tail\"\n\n[[installs]]\nmethod = \"native\"\nbin = \"sh\"\npaths = [\"/bin/sh\"]\nversion = { cmd = [\"sh\", \"--version\"] }\nlatest = \"self\"\n"
+	cand, err := ValidateSavedProposal([]byte(single), "sh", shReal(t), shRunner().Run)
+	if err != nil {
+		t.Fatalf("clean fence-mentioning name rejected: %v", err)
+	}
+	if string(cand.Bytes) != single {
+		t.Errorf("candidate bytes are not the whole file:\n got %q\nwant %q", string(cand.Bytes), single)
+	}
+	if !strings.Contains(cand.Harness.Name, "```toml") {
+		t.Errorf("the name lost its fence text (was it extracted?): %q", cand.Harness.Name)
+	}
+
+	// Fence extraction still exists — for raw agent output, and only
+	// there: the same inner entry wrapped in agent prose validates with
+	// exactly the inner bytes.
+	cand2, err := ValidateProposal("prose before\n```toml\n"+inner+"```\nprose after", "sh", shReal(t), shRunner().Run)
+	if err != nil {
+		t.Fatalf("fenced agent output rejected: %v", err)
+	}
+	if want := strings.TrimSpace(inner); string(cand2.Bytes) != want {
+		t.Errorf("extracted bytes = %q, want the inner entry %q", string(cand2.Bytes), want)
 	}
 }

@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 
 	"ofa/internal/catalog"
@@ -25,26 +26,76 @@ type Attempt struct {
 	Err    string
 }
 
-// ValidateProposal runs one agent output through the full mechanical gate,
-// in the order that matters: extract, parse and validate, gate the commands
-// statically, and only then test-detect — the first point anything from the
-// draft executes. targetReal is the symlink-resolved path of the authorized
-// target binary (the LookPath winner); the native-path gate binds every
-// probe path to it. It returns the parsed harness and the extracted TOML
-// (what proposed-catalog.toml would contain) on success.
-func ValidateProposal(out, bin, targetReal string, run detect.Runner) (catalog.Harness, string, error) {
-	tomlSrc := ExtractTOML(out)
+// Candidate is the immutable content snapshot of a validated proposal:
+// Harness is the parsed entry and Bytes is exactly the TOML that was
+// parsed and validated to produce it. Everything downstream — the review
+// the human reads, the overwrite and duplicate checks, the catalog
+// write — must consume this one snapshot; nothing may re-read the
+// proposal from disk after validation, so the bytes that were reviewed
+// are, byte for byte, the bytes that are installed.
+type Candidate struct {
+	Harness catalog.Harness
+	Bytes   []byte
+}
+
+// ValidateProposal runs one agent output through the full mechanical
+// gate, in the order that matters: extract, parse and validate, gate the
+// commands statically, and only then test-detect — the first point
+// anything from the draft executes. targetReal is the symlink-resolved
+// path of the authorized target binary (the LookPath winner); the
+// native-path gate binds every probe path to it. Fence extraction
+// happens here and only here: it exists because raw agent output wraps
+// TOML in prose, never because a saved file might benefit from it. It
+// returns the validated harness bound to the exact extracted TOML bytes
+// that produced it.
+func ValidateProposal(out, bin, targetReal string, run detect.Runner) (Candidate, error) {
+	return validateTOML(ExtractTOML(out), bin, targetReal, run)
+}
+
+// ValidateSavedProposal validates the WHOLE content of a saved proposal
+// file — no fence extraction at all. A saved proposal is a file doctor
+// wrote (or a human edited); its whole content is the entry. Extracting
+// a fence from it instead would let a valid outer entry wrap a
+// benign-looking inner one and install unreviewed outer bytes, so the
+// file must parse, as-is and in full, as a single valid entry.
+func ValidateSavedProposal(src []byte, bin, targetReal string, run detect.Runner) (Candidate, error) {
+	return validateTOML(string(src), bin, targetReal, run)
+}
+
+// validateTOML is the one gate both flows share, over the exact TOML
+// text that will become the candidate's Bytes.
+func validateTOML(tomlSrc string, bin, targetReal string, run detect.Runner) (Candidate, error) {
 	h, err := catalog.ParseEntry("proposed-catalog.toml", []byte(tomlSrc))
 	if err != nil {
-		return catalog.Harness{}, tomlSrc, err
+		return Candidate{}, err
 	}
 	if err := shapeGate(h, bin, targetReal); err != nil {
-		return catalog.Harness{}, tomlSrc, err
+		return Candidate{}, err
 	}
 	if err := testDetect(h, bin, run); err != nil {
-		return catalog.Harness{}, tomlSrc, err
+		return Candidate{}, err
 	}
-	return h, tomlSrc, nil
+	if err := BindCheck(h, []byte(tomlSrc)); err != nil {
+		return Candidate{}, err
+	}
+	return Candidate{Harness: h, Bytes: []byte(tomlSrc)}, nil
+}
+
+// BindCheck re-establishes, independently, that tomlSrc parses to
+// exactly h. The bytes and the harness must be the same fact at every
+// boundary where they travel apart — validation returns them as a pair,
+// and the CLI re-checks the pair right before the confirmed write — so
+// no gap can open between what was validated, what was reviewed, and
+// what is installed.
+func BindCheck(h catalog.Harness, tomlSrc []byte) error {
+	recheck, err := catalog.ParseEntry("proposed-catalog.toml", tomlSrc)
+	if err != nil {
+		return fmt.Errorf("validated TOML does not parse: %w", err)
+	}
+	if !reflect.DeepEqual(recheck, h) {
+		return errors.New("validated TOML does not parse to the validated entry")
+	}
+	return nil
 }
 
 // ExtractTOML pulls the draft out of the agent's response: the first
@@ -76,6 +127,9 @@ func ExtractTOML(out string) string {
 // never executed by doctor (the install flow only displays it for human
 // review), so it is deliberately not gated here.
 func shapeGate(h catalog.Harness, bin, targetReal string) error {
+	if err := checkGraphicFields(h); err != nil {
+		return err
+	}
 	for i, in := range h.Installs {
 		if in.Bin != bin {
 			return fmt.Errorf("install[%d]: bin %q must be %q", i, in.Bin, bin)
@@ -86,6 +140,49 @@ func shapeGate(h catalog.Harness, bin, targetReal string) error {
 		if in.Method == "native" {
 			if err := checkNativePaths(i, in.Paths, bin, targetReal); err != nil {
 				return err
+			}
+		}
+	}
+	return nil
+}
+
+// checkGraphicFields rejects any control, bidi, or other non-graphic
+// rune in a value the review will display or the catalog will carry:
+// id, name, homepage, package, bin, paths, and every command argument.
+// Shell quoting and Visible() make such runes harmless to LOOK at, but
+// a draft that needs them is a draft forging terminal output, so it is
+// turned back at the gate — the reason names the field and the rune, so
+// the one retry can fix it.
+func checkGraphicFields(h catalog.Harness) error {
+	for _, f := range []struct{ name, val string }{
+		{"id", h.ID}, {"name", h.Name}, {"homepage", h.Homepage},
+	} {
+		if r, bad := firstNonGraphic(f.val); bad {
+			return fmt.Errorf("%s contains a control, bidi, or other non-printable rune (%s); use plain printable text", f.name, RuneEscape(r))
+		}
+	}
+	for i, in := range h.Installs {
+		inst := []struct{ name, val string }{
+			{"package", in.Package}, {"bin", in.Bin},
+		}
+		for _, f := range inst {
+			if r, bad := firstNonGraphic(f.val); bad {
+				return fmt.Errorf("install[%d]: %s contains a control, bidi, or other non-printable rune (%s); use plain printable text", i, f.name, RuneEscape(r))
+			}
+		}
+		for _, p := range in.Paths {
+			if r, bad := firstNonGraphic(p); bad {
+				return fmt.Errorf("install[%d]: path contains a control, bidi, or other non-printable rune (%s); use plain printable text", i, RuneEscape(r))
+			}
+		}
+		for _, a := range in.Version.Cmd {
+			if r, bad := firstNonGraphic(a); bad {
+				return fmt.Errorf("install[%d]: version.cmd argument contains a control, bidi, or other non-printable rune (%s); use plain printable text", i, RuneEscape(r))
+			}
+		}
+		for _, a := range in.Update.Cmd {
+			if r, bad := firstNonGraphic(a); bad {
+				return fmt.Errorf("install[%d]: update.cmd argument contains a control, bidi, or other non-printable rune (%s); use plain printable text", i, RuneEscape(r))
 			}
 		}
 	}

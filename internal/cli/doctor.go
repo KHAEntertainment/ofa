@@ -69,13 +69,29 @@ func boolFlag(fl *flag.Flag) bool {
 }
 
 // stdinIsTTY is the default StdinIsTTY gate for doctor's install prompt.
-// It mirrors stderrIsTTY (picker.go): the same cheap ModeCharDevice check,
-// so piped or redirected stdin is never mistaken for a terminal. Doctor
-// only ever prompts — and only ever installs — when this is true; a
-// non-interactive stdin gets the --install command printed instead.
+// It mirrors stderrIsTTY (picker.go) on the cheap ModeCharDevice check,
+// with one exception the mode check alone gets wrong: /dev/null IS a
+// character device, so `ofa doctor < /dev/null` would look interactive
+// and prompt at a bottomless EOF. A stdin that is the same file as
+// /dev/null is therefore not a terminal. Doctor only ever prompts — and
+// only ever installs — when this is true; a non-interactive stdin gets
+// the --install command printed instead.
 func stdinIsTTY(r io.Reader) bool {
 	f, ok := r.(*os.File)
-	return ok && isTerminal(f)
+	if !ok {
+		return false
+	}
+	if !isTerminal(f) {
+		return false
+	}
+	st, err := f.Stat()
+	if err != nil {
+		return false
+	}
+	if nullSt, nerr := os.Stat(os.DevNull); nerr == nil && os.SameFile(st, nullSt) {
+		return false
+	}
+	return true
 }
 
 // doctorCmd implements `ofa doctor [<bin>] [--agent claude]`,
@@ -211,33 +227,46 @@ func (a *App) doctorCmd(args []string) ExitCode {
 
 // doctorOfferInstall ends a successful drafting session: the review
 // block, then the Install? prompt. The default answer is No. Non-TTY
-// stdin (piped, redirected, or absent) never prompts and never installs —
-// an agent-drafted update command is executed later by `ofa apply`, so
-// only a human at an interactive terminal says yes — and the exact
-// --install command to run is printed instead.
+// stdin (piped, redirected, /dev/null, or absent) never prompts and
+// never installs — an agent-drafted update command is executed later by
+// `ofa apply`, so only a human at an interactive terminal says yes —
+// and the exact --install command to run is printed instead.
+//
+// The validated bytes travel in memory from validation to write. The
+// proposal file on disk is never re-read here, so nothing that swaps it
+// between the review and the confirm can change what is installed: the
+// bytes that were validated are the bytes that were reviewed are the
+// bytes that are written.
 func (a *App) doctorOfferInstall(res *doctor.Result) ExitCode {
 	h := *res.Harness
 	fmt.Fprintf(a.Stdout, "proposal ready: %s\n", res.ProposalPath)
-	a.printDoctorReview(h)
+	if err := a.printDoctorReview(h); err != nil {
+		fmt.Fprintf(a.Stderr, "ofa: doctor: could not display the review, so nothing was installed: %v\n", err)
+		return ExitError
+	}
 	sessionID := filepath.Base(res.Dir)
 	if !a.interactiveStdin() {
 		fmt.Fprintf(a.Stdout, "to install it, run: ofa doctor --install %s\n", sessionID)
 		return ExitOK
 	}
-	src, err := os.ReadFile(res.ProposalPath)
-	if err != nil {
-		fmt.Fprintf(a.Stderr, "ofa: doctor: %v\n", err)
-		return ExitError
-	}
-	return a.doctorConfirmAndWrite(sessionID, res.Dir, h, src)
+	return a.doctorConfirmAndWrite(sessionID, res.Dir, h, res.ProposalBytes)
 }
 
 // doctorConfirmAndWrite asks the install question (default No) and, on a
 // yes, performs the write: the second confirms, the atomic write, the
 // session bookkeeping, and the post-install scan.
 func (a *App) doctorConfirmAndWrite(sessionID, dir string, h catalog.Harness, src []byte) ExitCode {
+	// The write is bound to the review one more time, right before the
+	// question is asked: the bytes must parse to exactly the harness the
+	// human is about to decide on. This re-check makes the binding a
+	// property of the write path itself, not only of how the bytes
+	// traveled to it.
+	if err := doctor.BindCheck(h, src); err != nil {
+		fmt.Fprintf(a.Stderr, "ofa: doctor: the bytes to write no longer match the reviewed entry; nothing was written: %v\n", err)
+		return ExitError
+	}
 	target := filepath.Join(a.CatalogDir, h.ID+".toml")
-	ok, err := confirmPrompt(a.Stdin, a.Stderr, fmt.Sprintf("Install to %s? [y/N] ", target))
+	ok, err := confirmPrompt(a.Stdin, a.Stderr, fmt.Sprintf("Install to %s? [y/N] ", doctor.Visible(target)))
 	if err != nil {
 		fmt.Fprintf(a.Stderr, "ofa: confirm: %v\n", err)
 		return ExitError
@@ -277,7 +306,7 @@ func (a *App) doctorWriteInstalled(sessionID, dir string, h catalog.Harness, src
 		return ExitError
 	}
 	if dups := doctor.DuplicateIDFiles(a.CatalogDir, h.ID); len(dups) > 0 {
-		fmt.Fprintf(a.Stderr, "ofa: doctor: user catalog file(s) %s already define harness id %q; user files merge first-by-filename, so one of the two will be ignored\n", strings.Join(dups, ", "), h.ID)
+		fmt.Fprintf(a.Stderr, "ofa: doctor: user catalog file(s) %s already define harness id %q; user files merge first-by-filename, so one of the two will be ignored\n", doctor.Visible(strings.Join(dups, ", ")), h.ID)
 		ok, err := confirmPrompt(a.Stdin, a.Stderr, "Install anyway? [y/N] ")
 		if err != nil {
 			fmt.Fprintf(a.Stderr, "ofa: confirm: %v\n", err)
@@ -312,8 +341,12 @@ func (a *App) doctorWriteInstalled(sessionID, dir string, h catalog.Harness, src
 
 // doctorPostInstallScan re-scans through the normal catalog loader — the
 // same merged path every command uses — and reports whether the target is
-// now detected. A miss is reported plainly, never papered over: the file
-// stays in place for inspection, but the command does not claim success.
+// now detected. An ACTIVE instance is searched for across the whole scan
+// before any conclusion is drawn: scan order follows catalog order, not
+// PATH order, so an earlier shadowed install of the same binary must not
+// hide the live one behind it. A miss is reported plainly, never papered
+// over: the file stays in place for inspection, but the command does not
+// claim success.
 func (a *App) doctorPostInstallScan(h catalog.Harness) ExitCode {
 	// The shape gate bound every install to the session's target binary.
 	bin := h.Installs[0].Bin
@@ -326,21 +359,28 @@ func (a *App) doctorPostInstallScan(h catalog.Harness) ExitCode {
 		fmt.Fprintf(a.Stderr, "ofa: doctor: could not scan after install: %v\n", err)
 		return ExitError
 	}
+	var shadowed []detect.Instance
 	for _, in := range insts {
 		if in.Bin != bin {
 			continue
 		}
-		note := ""
-		if in.Status != detect.Active {
-			note = " (not the live install on PATH)"
+		if in.Status == detect.Active {
+			fmt.Fprintf(a.Stdout, "detected: %s %s (%s, %s)\n",
+				doctor.Visible(bin), doctor.Visible(in.Version), doctor.Visible(in.HarnessID), doctor.Visible(in.Method))
+			return ExitOK
 		}
-		fmt.Fprintf(a.Stdout, "detected: %s %s (%s, %s)%s\n", bin, in.Version, in.HarnessID, in.Method, note)
-		if in.Status != detect.Active {
-			return ExitError
-		}
-		return ExitOK
+		shadowed = append(shadowed, in)
 	}
-	fmt.Fprintf(a.Stderr, "ofa: doctor: %s was NOT detected after install; the entry is in place at %s but does not match this machine\n", bin, filepath.Join(a.CatalogDir, h.ID+".toml"))
+	// No active instance: report every shadowed one honestly — the
+	// entry matches something on this machine, just not the PATH winner.
+	for _, in := range shadowed {
+		fmt.Fprintf(a.Stdout, "detected: %s %s (%s, %s) (not the live install on PATH)\n",
+			doctor.Visible(bin), doctor.Visible(in.Version), doctor.Visible(in.HarnessID), doctor.Visible(in.Method))
+	}
+	if len(shadowed) > 0 {
+		return ExitError
+	}
+	fmt.Fprintf(a.Stderr, "ofa: doctor: %s was NOT detected after install; the entry is in place at %s but does not match this machine\n", doctor.Visible(bin), filepath.Join(a.CatalogDir, h.ID+".toml"))
 	return ExitError
 }
 
@@ -350,10 +390,13 @@ func (a *App) doctorPostInstallScan(h catalog.Harness) ExitCode {
 // edited since the run wrote it — so the same mechanical gate runs again
 // (parse with unknown keys rejected, the static shape gate, and
 // test-detect through the pinned bounded runner) against the target
-// recorded in session.json. A target taken from the proposal itself would
-// make the shape gate's identity check vacuous, which is why sessions
-// without a record are refused rather than guessed. A proposal that fails
-// any check is rejected with the reason and nothing is written.
+// recorded in session.json. The whole file, as-is, must parse as one
+// valid entry: no fence extraction happens here, so an outer entry
+// cannot wrap a benign inner one and smuggle unreviewed bytes past the
+// gate. A target taken from the proposal itself would make the shape
+// gate's identity check vacuous, which is why sessions without a record
+// are refused rather than guessed. A proposal that fails any check is
+// rejected with the reason and nothing is written.
 func (a *App) doctorInstallCmd(sessionID string) ExitCode {
 	if !doctor.ValidSessionID(sessionID) {
 		fmt.Fprintf(a.Stderr, "ofa: doctor: invalid session id %q\n", sessionID)
@@ -379,19 +422,25 @@ func (a *App) doctorInstallCmd(sessionID string) ExitCode {
 		a.markSessionRejected(dir, rec)
 		return ExitError
 	}
-	h, _, err := doctor.ValidateProposal(string(src), rec.Target, real, doctor.BoundedRunnerFor(a.DetectRunner, rec.Target))
+	cand, err := doctor.ValidateSavedProposal(src, rec.Target, real, doctor.BoundedRunnerFor(a.DetectRunner, rec.Target))
 	if err != nil {
-		fmt.Fprintf(a.Stderr, "ofa: doctor: proposal in session %s is no longer valid: %v\nnothing was written\n", sessionID, err)
+		// The reason can echo the file's own text; render it terminal-safe.
+		fmt.Fprintf(a.Stderr, "ofa: doctor: proposal in session %s is no longer valid: %s\nnothing was written\n", sessionID, doctor.Visible(err.Error()))
 		a.markSessionRejected(dir, rec)
 		return ExitError
 	}
-	fmt.Fprintf(a.Stdout, "revalidated proposal from session %s (target %s)\n", sessionID, rec.Target)
-	a.printDoctorReview(h)
+	fmt.Fprintf(a.Stdout, "revalidated proposal from session %s (target %s)\n", sessionID, doctor.Visible(rec.Target))
+	if err := a.printDoctorReview(cand.Harness); err != nil {
+		fmt.Fprintf(a.Stderr, "ofa: doctor: could not display the review, so nothing was installed: %v\n", err)
+		return ExitError
+	}
 	if !a.interactiveStdin() {
 		fmt.Fprintf(a.Stderr, "ofa: doctor: --install needs an interactive terminal to confirm; nothing was written\n")
 		return ExitError
 	}
-	return a.doctorConfirmAndWrite(sessionID, dir, h, src)
+	// cand is the one immutable snapshot: the harness the review just
+	// showed and the exact bytes that will be written are the same fact.
+	return a.doctorConfirmAndWrite(sessionID, dir, cand.Harness, cand.Bytes)
 }
 
 // markSessionRejected records a failed revalidation in session.json so
@@ -431,9 +480,11 @@ func (a *App) doctorListCmd() ExitCode {
 		if rec, err := doctor.LoadSessionRecord(filepath.Join(root, e.Name())); err == nil {
 			target, status, path = rec.Target, rec.Status, rec.InstalledPath
 		}
-		line := fmt.Sprintf("  %s  %s  %s", e.Name(), target, status)
+		// Directory names, session fields, and paths all come from a
+		// user-owned directory; nothing they carry is emitted raw.
+		line := fmt.Sprintf("  %s  %s  %s", doctor.Visible(e.Name()), doctor.Visible(target), doctor.Visible(status))
 		if path != "" {
-			line += fmt.Sprintf("  -> %s", path)
+			line += fmt.Sprintf("  -> %s", doctor.Visible(path))
 		}
 		fmt.Fprintln(a.Stdout, line)
 	}
@@ -443,12 +494,12 @@ func (a *App) doctorListCmd() ExitCode {
 	return ExitOK
 }
 
-// printDoctorReview prints the review block for one proposed harness,
-// naming the embedded entry it overrides when the id matches one. The
-// comparison is against the embedded catalog specifically: a same-id
-// entry in the user catalog is a duplicate the install flow warns about
-// separately, not an override.
-func (a *App) printDoctorReview(h catalog.Harness) {
+// printDoctorReview renders the review block to Stderr — the SAME stream
+// the confirm prompt is printed on — so a redirected stdout can never
+// separate the install question from the security review that justifies
+// it. A write failure is returned rather than ignored: the caller must
+// not install a proposal whose review could not be shown.
+func (a *App) printDoctorReview(h catalog.Harness) error {
 	var embedded *catalog.Harness
 	if embeddedList, err := catalog.Embedded(); err == nil {
 		for i := range embeddedList {
@@ -458,12 +509,18 @@ func (a *App) printDoctorReview(h catalog.Harness) {
 			}
 		}
 	}
-	fmt.Fprintln(a.Stdout)
+	w := a.Stderr
+	if _, err := fmt.Fprintln(w); err != nil {
+		return err
+	}
 	lines := doctor.Review{H: h, Overrides: embedded}.Lines()
 	for _, line := range lines {
-		fmt.Fprintln(a.Stdout, line)
+		if _, err := fmt.Fprintln(w, line); err != nil {
+			return err
+		}
 	}
-	fmt.Fprintln(a.Stdout)
+	_, err := fmt.Fprintln(w)
+	return err
 }
 
 // interactiveStdin reports whether the install prompts may ask a human:

@@ -24,23 +24,25 @@ type Review struct {
 	Overrides *catalog.Harness
 }
 
-// Lines renders the review block. Every command appears on exactly one
-// clearly labelled line, shell-quoted so spaces and metacharacters are
-// unambiguous, and never truncated.
+// Lines renders the review block. Every untrusted value goes through
+// Visible (terminal controls, bidi runes, and line breaks become visible
+// escapes — nothing raw can conceal or forge a line), every command
+// appears on exactly one clearly labelled line, shell-quoted so spaces
+// and metacharacters are unambiguous, and never truncated.
 func (r Review) Lines() []string {
 	var ls []string
-	ls = append(ls, fmt.Sprintf("harness id: %s", r.H.ID))
-	ls = append(ls, fmt.Sprintf("name: %s", r.H.Name))
+	ls = append(ls, fmt.Sprintf("harness id: %s", Visible(r.H.ID)))
+	ls = append(ls, fmt.Sprintf("name: %s", Visible(r.H.Name)))
 	ls = append(ls, "installs:")
 	hasUpdate := false
 	for i, in := range r.H.Installs {
-		ls = append(ls, fmt.Sprintf("  [%d] method: %s", i+1, in.Method))
+		ls = append(ls, fmt.Sprintf("  [%d] method: %s", i+1, Visible(in.Method)))
 		if in.Package != "" {
-			ls = append(ls, fmt.Sprintf("      package: %s", in.Package))
+			ls = append(ls, fmt.Sprintf("      package: %s", Visible(in.Package)))
 		}
-		ls = append(ls, fmt.Sprintf("      bin: %s", in.Bin))
+		ls = append(ls, fmt.Sprintf("      bin: %s", Visible(in.Bin)))
 		for _, p := range in.Paths {
-			ls = append(ls, fmt.Sprintf("      path: %s", p))
+			ls = append(ls, fmt.Sprintf("      path: %s", Visible(p)))
 		}
 		ls = append(ls, fmt.Sprintf("      version command: %s", QuoteCmd(in.Version.Cmd)))
 		if len(in.Update.Cmd) > 0 {
@@ -57,6 +59,12 @@ func (r Review) Lines() []string {
 		ls = append(ls, fmt.Sprintf("overrides embedded %q — the user catalog wins by id", r.H.ID))
 		ls = append(ls, fmt.Sprintf("      embedded: name %q, %d install(s)", r.Overrides.Name, len(r.Overrides.Installs)))
 		ls = append(ls, fmt.Sprintf("      proposed: name %q, %d install(s)", r.H.Name, len(r.H.Installs)))
+		for i, in := range r.Overrides.Installs {
+			ls = append(ls, fmt.Sprintf("      embedded install %d: version %s, update %s", i+1, cmdLine(in.Version.Cmd), cmdLine(in.Update.Cmd)))
+		}
+		for i, in := range r.H.Installs {
+			ls = append(ls, fmt.Sprintf("      proposed install %d: version %s, update %s", i+1, cmdLine(in.Version.Cmd), cmdLine(in.Update.Cmd)))
+		}
 	}
 	if hasUpdate {
 		ls = append(ls, "ofa apply will run the update command above when it updates this harness")
@@ -66,11 +74,23 @@ func (r Review) Lines() []string {
 	return ls
 }
 
-// QuoteCmd renders a command as one shell line, POSIX-style: each argument
-// is printed bare when it contains only characters no shell would touch,
-// and single-quoted otherwise (with ' escaped the usual '\” way). The
-// arguments themselves are never altered or truncated — the human must see
-// exactly what `ofa apply` would run.
+// cmdLine renders one command spec for the override comparison, with
+// "(none)" so an empty side is explicit next to a non-empty one.
+func cmdLine(cmd []string) string {
+	if len(cmd) == 0 {
+		return "(none)"
+	}
+	return QuoteCmd(cmd)
+}
+
+// QuoteCmd renders a command as one shell line, POSIX-style: each
+// argument is printed bare when it contains only characters no shell
+// would touch, and single-quoted otherwise (with ' escaped the usual '\”
+// way). Any argument holding a control, bidi, or other non-graphic rune
+// — or invalid UTF-8 — is single-quoted with every such rune as a
+// visible escape, so terminal controls can never conceal or forge what
+// the human reads. The arguments themselves are never altered or
+// truncated — the human must see exactly what `ofa apply` would run.
 func QuoteCmd(cmd []string) string {
 	parts := make([]string, 0, len(cmd))
 	for _, a := range cmd {
@@ -79,55 +99,56 @@ func QuoteCmd(cmd []string) string {
 	return strings.Join(parts, " ")
 }
 
-// quoteArg renders one argument. The safe set is deliberately small:
+// quoteArg renders one argument. The bare set is deliberately small:
 // letters, digits, and the punctuation POSIX leaves uninterpreted inside
-// an unquoted word. Everything else — spaces, quotes, globs, operators —
-// gets single quotes.
+// an unquoted word. Everything else — spaces, quotes, globs, operators,
+// and above all any non-graphic rune — gets single quotes with the
+// shared escaping in escapeBody.
 func quoteArg(s string) string {
 	if s == "" {
 		return "''"
 	}
 	for _, r := range s {
-		switch {
-		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9':
-		case strings.ContainsRune("._/@:=+,-", r):
-		default:
-			return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'"
+		if !bareRune(r) {
+			return "'" + escapeBody(s) + "'"
 		}
 	}
 	return s
 }
 
-// updateishArgs are the arguments that make `bin <arg> ...` recognisably
-// an update command for the binary itself: the self-updater pattern the
-// self-tier harnesses use (`claude update`, `agy update`, and the dashed
-// spellings).
-var updateishArgs = map[string]bool{
-	"update": true, "upgrade": true,
-	"self-update": true, "selfupdate": true,
-	"--update": true, "--upgrade": true, "-u": true,
+// bareRune reports whether r is safe inside an unquoted shell word.
+func bareRune(r rune) bool {
+	switch {
+	case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9':
+		return true
+	case strings.ContainsRune("._/@:=+,-", r):
+		return true
+	}
+	return false
 }
 
 // StandardUpdate reports whether in's update command is one of the two
 // recognisable forms: a known package manager upgrading the install's own
-// package, or the target binary updating itself with an update-ish
-// argument. Anything else is still installable — the human is the gate —
-// but the review flags it so unusual commands get read, not skimmed.
+// package, or the target binary updating itself with exactly one
+// update-ish argument. Anything else is still installable — the human is
+// the gate — but the review flags it so unusual commands get read, not
+// skimmed.
 //
-// The check is deliberately permissive within those two shapes (extra
-// flags after the package name, pkg@latest) and deliberately closed
-// outside them: it is a reading aid, not a security boundary.
+// The self-update form is exact: `[bin, "update"]`-shaped and nothing
+// more. An update-ish word anywhere ELSE in the vector means nothing —
+// `claude -p update` is a model prompt, not a self-updater, and must not
+// wear the standard label. This is a reading aid, not a security
+// boundary.
 func StandardUpdate(in catalog.Install) bool {
 	cmd := in.Update.Cmd
 	if len(cmd) == 0 {
 		return true // nothing to run, nothing to flag
 	}
-	// The target binary updating itself.
-	if cmd[0] == in.Bin && len(cmd) > 1 {
-		for _, a := range cmd[1:] {
-			if updateishArgs[a] {
-				return true
-			}
+	// The target binary updating itself: exactly two words.
+	if len(cmd) == 2 && cmd[0] == in.Bin {
+		switch cmd[1] {
+		case "update", "upgrade", "self-update", "--update", "--upgrade":
+			return true
 		}
 	}
 	if in.Package == "" {

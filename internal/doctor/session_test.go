@@ -4,6 +4,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -150,5 +151,45 @@ func TestLoadProposal(t *testing.T) {
 	b, err := LoadProposal(dir)
 	if err != nil || string(b) != "id = \"x\"\n" {
 		t.Errorf("LoadProposal = %q, %v", string(b), err)
+	}
+}
+
+// A3: the record is published atomically and its mode is forced to 0600
+// even over an older, looser file — a crash mid-write must not destroy
+// the record --install needs later.
+func TestSaveSessionRecordAtomicAndForcedMode(t *testing.T) {
+	dir := t.TempDir()
+	loose := "{\n  \"target\": \"sh\",\n  \"time\": \"2026-01-01T00:00:00Z\",\n  \"status\": \"proposed\"\n}\n"
+	if err := os.WriteFile(filepath.Join(dir, sessionName), []byte(loose), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	rec := SessionRecord{
+		Target: "sh",
+		Time:   time.Date(2026, 10, 30, 1, 2, 3, 0, time.UTC),
+		Status: StatusInstalled,
+	}
+	if err := SaveSessionRecord(dir, rec); err != nil {
+		t.Fatalf("SaveSessionRecord: %v", err)
+	}
+	st, err := os.Stat(filepath.Join(dir, sessionName))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if st.Mode().Perm() != 0o600 {
+		t.Errorf("mode = %o, want 600 forced over the old 644", st.Mode().Perm())
+	}
+	got, err := LoadSessionRecord(dir)
+	if err != nil || got != rec {
+		t.Errorf("round trip = %+v, %v; want %+v", got, err, rec)
+	}
+	// No temp files left behind.
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, e := range entries {
+		if strings.HasPrefix(e.Name(), ".session-") {
+			t.Errorf("leftover temp file %q", e.Name())
+		}
 	}
 }

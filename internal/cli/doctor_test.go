@@ -420,7 +420,10 @@ func TestDoctorCmd_ReviewBlockShownVerbatim(t *testing.T) {
 	if code := a.Run(); code != ExitOK {
 		t.Fatalf("exit = %d, want %d; stderr: %s", code, ExitOK, stderr.String())
 	}
-	out := stdout.String()
+	// The review block is printed on stderr — the same stream the
+	// confirm prompt uses — so a redirected stdout can never separate
+	// the question from the security review.
+	out := stderr.String()
 	for _, want := range []string{
 		"harness id: sh-probe",
 		"name: Shell Probe",
@@ -435,12 +438,15 @@ func TestDoctorCmd_ReviewBlockShownVerbatim(t *testing.T) {
 			t.Errorf("review block missing %q:\n%s", want, out)
 		}
 	}
+	if !strings.Contains(stdout.String(), "proposal ready") {
+		t.Errorf("stdout missing the proposal-ready line:\n%s", stdout.String())
+	}
 	// Non-TTY stdin: no prompt, no install, the --install command instead.
 	if strings.Contains(stderr.String(), "Install to") {
 		t.Errorf("non-TTY stdin was prompted: %s", stderr.String())
 	}
-	if !strings.Contains(out, "ofa doctor --install ") {
-		t.Errorf("stdout missing the --install command:\n%s", out)
+	if !strings.Contains(stdout.String(), "ofa doctor --install ") {
+		t.Errorf("stdout missing the --install command:\n%s", stdout.String())
 	}
 	if _, err := os.Stat(filepath.Join(a.CatalogDir, "sh-probe.toml")); !os.IsNotExist(err) {
 		t.Error("non-TTY run installed into the user catalog")
@@ -453,12 +459,13 @@ func TestDoctorCmd_ReviewBlockShownVerbatim(t *testing.T) {
 const claudeEntry = "```toml\nid = \"claude\"\nname = \"Claude (local draft)\"\n\n[[installs]]\nmethod = \"native\"\nbin = \"sh\"\npaths = [\"/bin/sh\"]\nversion = { cmd = [\"sh\", \"--version\"] }\nlatest = \"self\"\n```\n"
 
 func TestDoctorCmd_OverridesEmbeddedEntry(t *testing.T) {
-	a, stdout, stderr, _, _, _ := newTestApp(t, []string{"doctor", "sh"}, nil)
+	a, _, stderr, _, _, _ := newTestApp(t, []string{"doctor", "sh"}, nil)
 	wireDoctor(t, a, &stubAgent{responses: []string{claudeEntry}}, shRunner())
 	if code := a.Run(); code != ExitOK {
 		t.Fatalf("exit = %d, want 0; stderr: %s", code, stderr.String())
 	}
-	out := stdout.String()
+	// The override block rides the review, on stderr.
+	out := stderr.String()
 	for _, want := range []string{
 		`overrides embedded "claude"`,
 		"user catalog wins by id",
@@ -467,6 +474,16 @@ func TestDoctorCmd_OverridesEmbeddedEntry(t *testing.T) {
 	} {
 		if !strings.Contains(out, want) {
 			t.Errorf("override block missing %q:\n%s", want, out)
+		}
+	}
+	// The override comparison shows the old and new commands, not just
+	// names and counts.
+	for _, want := range []string{
+		"embedded install 1:",
+		"proposed install 1:",
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("override block missing the command comparison %q:\n%s", want, out)
 		}
 	}
 }
@@ -683,8 +700,8 @@ func TestDoctorInstallCmd_HappyPath(t *testing.T) {
 	for _, want := range []string{"revalidated proposal from session 20260101T000000Z", "harness id: sh-probe", "Install to"} {
 		_ = want
 	}
-	if !strings.Contains(out, "revalidated proposal") || !strings.Contains(out, "harness id: sh-probe") {
-		t.Errorf("stdout missing the review flow:\n%s", out)
+	if !strings.Contains(stdout.String(), "revalidated proposal") || !strings.Contains(stderr.String(), "harness id: sh-probe") {
+		t.Errorf("review flow missing: stdout:\n%s\nstderr:\n%s", stdout.String(), stderr.String())
 	}
 	if !strings.Contains(out, "installed: ") || !strings.Contains(out, "detected: sh 1.0") {
 		t.Errorf("stdout missing the install result:\n%s", out)
@@ -855,4 +872,256 @@ func readSessionRecord(t *testing.T, doctorDir string) (doctor.SessionRecord, er
 		return doctor.SessionRecord{}, fmt.Errorf("no session dir under %s (%v)", history, err)
 	}
 	return doctor.LoadSessionRecord(filepath.Join(history, entries[0].Name()))
+}
+
+// --- review-fix round: B1 binding, B4 scan order, A1/A2 ---
+
+// swapOnConfirm answers the first confirm prompt and, in that same
+// Read, rewrites the saved proposal file on disk — a local writer
+// racing the human's decision (the reviewer's writer-hook fixture). The
+// install must write the bytes that were validated and reviewed, not
+// whatever the file holds by the time the "y" arrives.
+type swapOnConfirm struct {
+	doctorDir   string
+	replacement string
+	answered    bool
+}
+
+func (f *swapOnConfirm) Read(p []byte) (int, error) {
+	if f.answered {
+		return 0, io.EOF
+	}
+	f.answered = true
+	history := filepath.Join(f.doctorDir, "history")
+	entries, err := os.ReadDir(history)
+	if err != nil || len(entries) == 0 {
+		return 0, fmt.Errorf("swapOnConfirm: no session directory: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(history, entries[0].Name(), "proposed-catalog.toml"), []byte(f.replacement), 0o600); err != nil {
+		return 0, err
+	}
+	return copy(p, "y\n"), nil
+}
+
+func TestDoctorCmd_SwapAfterReviewInstallsReviewedBytes(t *testing.T) {
+	a, _, stderr, _, _, _ := newTestApp(t, []string{"doctor", "sh"}, nil)
+	wireDoctor(t, a, &stubAgent{responses: []string{shEntry}}, shRunner())
+	detectingAfterInstall(a)
+	replacement := strings.Replace(bareToml, `name = "Shell Probe"`, `name = "Swapped Probe"`, 1)
+	a.Stdin = &swapOnConfirm{doctorDir: a.DoctorDir, replacement: replacement}
+	a.StdinIsTTY = func(io.Reader) bool { return true }
+
+	if code := a.Run(); code != ExitOK {
+		t.Fatalf("exit = %d, want 0; stderr: %s", code, stderr.String())
+	}
+	b, err := os.ReadFile(filepath.Join(a.CatalogDir, "sh-probe.toml"))
+	if err != nil {
+		t.Fatalf("catalog entry not written: %v", err)
+	}
+	// The fresh flow's validated bytes are the fence's inner TOML,
+	// trailing newline trimmed by extraction.
+	if want := strings.TrimSpace(bareToml); string(b) != want {
+		t.Errorf("installed = %q, want the reviewed bytes %q", string(b), want)
+	}
+	if strings.Contains(string(b), "Swapped Probe") {
+		t.Error("bytes swapped after the review were installed")
+	}
+	if !strings.Contains(stderr.String(), "name: Shell Probe") {
+		t.Errorf("review missing the reviewed name:\n%s", stderr.String())
+	}
+}
+
+// The reviewer's B1 fixture at --install: the saved file is a valid
+// outer entry whose multiline name wraps a fenced, benign inner entry,
+// and the outer entry declares an unreviewed version vector. The file
+// must be validated as-is (no fence extraction at install time): the
+// outer entry IS the proposal and it is rejected, with nothing written.
+func TestDoctorInstallCmd_FenceWrappedProposalRejected(t *testing.T) {
+	inner := "id = \"sh-probe\"\nname = \"Inner\"\n\n[[installs]]\nmethod = \"native\"\nbin = \"sh\"\npaths = [\"/bin/sh\"]\nversion = { cmd = [\"sh\", \"--version\"] }\nlatest = \"self\"\n"
+	outer := "id = \"sh-probe\"\nname = \"\"\"\nShell Probe\n```toml\n" + inner + "```\n\"\"\"\n\n[[installs]]\nmethod = \"native\"\nbin = \"sh\"\npaths = [\"/bin/sh\"]\nversion = { cmd = [\"sh\", \"-c\", \"UNREVIEWED_VERSION_MARKER\"] }\nlatest = \"self\"\n"
+	a, _, stderr, _, _, _ := newTestApp(t, []string{"doctor", "--install", "20260101T000000Z"}, nil)
+	wireDoctor(t, a, &stubAgent{}, shRunner())
+	makeInteractive(a, "y")
+	dir := seedSession(t, a.DoctorDir, "20260101T000000Z", "sh", "proposed", outer)
+
+	if code := a.Run(); code != ExitError {
+		t.Fatalf("exit = %d, want %d (fence-wrapped proposal)", code, ExitError)
+	}
+	if !strings.Contains(stderr.String(), "no longer valid") {
+		t.Errorf("stderr missing the rejection reason: %s", stderr.String())
+	}
+	if _, err := os.Stat(filepath.Join(a.CatalogDir, "sh-probe.toml")); !os.IsNotExist(err) {
+		t.Error("fence-wrapped proposal was installed")
+	}
+	rec, err := doctor.LoadSessionRecord(dir)
+	if err != nil || rec.Status != "rejected" {
+		t.Errorf("session record = %+v, %v; want rejected", rec, err)
+	}
+}
+
+// The binding counterpart: a clean saved file whose name merely
+// MENTIONS a fence is a legitimate whole-file proposal. The review shows
+// the entry the file actually declares, and the installed bytes are the
+// whole file — not an inner fence extraction.
+func TestDoctorInstallCmd_InstallsWholeFileBytes(t *testing.T) {
+	single := "id = \"sh-probe\"\nname = \"Shell Probe ```toml id = \\\"sh-inner\\\" name = \\\"Inner\\\" ``` tail\"\n\n[[installs]]\nmethod = \"native\"\nbin = \"sh\"\npaths = [\"/bin/sh\"]\nversion = { cmd = [\"sh\", \"--version\"] }\nlatest = \"self\"\n"
+	a, stdout, stderr, _, _, _ := newTestApp(t, []string{"doctor", "--install", "20260101T000000Z"}, nil)
+	wireDoctor(t, a, &stubAgent{}, shRunner())
+	makeInteractive(a, "y")
+	seedSession(t, a.DoctorDir, "20260101T000000Z", "sh", "proposed", single)
+	detectingAfterInstall(a)
+
+	if code := a.Run(); code != ExitOK {
+		t.Fatalf("exit = %d, want 0; stderr: %s", code, stderr.String())
+	}
+	// The reviewed entry and the installed bytes are the same whole
+	// file: the fence text stayed text inside the name.
+	if !strings.Contains(stderr.String(), "harness id: sh-probe") || !strings.Contains(stderr.String(), "Shell Probe ```toml") {
+		t.Errorf("review did not show the file's own entry:\n%s", stderr.String())
+	}
+	b, err := os.ReadFile(filepath.Join(a.CatalogDir, "sh-probe.toml"))
+	if err != nil || string(b) != single {
+		t.Errorf("installed = %q, %v; want the whole file's exact bytes", string(b), err)
+	}
+	if !strings.Contains(stdout.String(), "installed: ") {
+		t.Errorf("stdout missing the installed line:\n%s", stdout.String())
+	}
+}
+
+// B4: the post-install scan must find the ACTIVE instance even when a
+// shadowed one comes first — scan order follows catalog order, not PATH
+// order.
+func TestDoctorCmd_PostInstallScanPrefersActiveInstance(t *testing.T) {
+	ordered := []detect.Instance{
+		{HarnessID: "sh-probe", Method: "native", Bin: "sh", Status: detect.Shadowed, Version: "1.0"},
+		{HarnessID: "sh-probe", Method: "npm", Bin: "sh", Status: detect.Active, Version: "2.0"},
+	}
+	a, stdout, stderr, sd, _, _ := newTestApp(t, []string{"doctor", "sh"}, nil)
+	wireDoctor(t, a, &stubAgent{responses: []string{shEntry}}, shRunner())
+	makeInteractive(a, "y")
+	a.DetectFn = func([]catalog.Harness, detect.Runner) ([]detect.Instance, []detect.Failure, error) {
+		if _, err := os.Stat(filepath.Join(a.DoctorDir, "history")); err == nil {
+			return ordered, nil, nil
+		}
+		return nil, nil, nil
+	}
+	sd.instances = nil
+	if code := a.Run(); code != ExitOK {
+		t.Fatalf("exit = %d, want 0 (an active instance exists); stderr: %s", code, stderr.String())
+	}
+	if !strings.Contains(stdout.String(), "detected: sh 2.0 (sh-probe, npm)") {
+		t.Errorf("stdout missing the active instance:\n%s", stdout.String())
+	}
+	if strings.Contains(stdout.String(), "not the live install") {
+		t.Errorf("a shadowed instance was reported ahead of the active one:\n%s", stdout.String())
+	}
+
+	// Only a shadowed instance: reported honestly, never a success.
+	a2, stdout2, _, sd2, _, _ := newTestApp(t, []string{"doctor", "sh"}, nil)
+	wireDoctor(t, a2, &stubAgent{responses: []string{shEntry}}, shRunner())
+	makeInteractive(a2, "y")
+	shadowedOnly := []detect.Instance{ordered[0]}
+	a2.DetectFn = func([]catalog.Harness, detect.Runner) ([]detect.Instance, []detect.Failure, error) {
+		if _, err := os.Stat(filepath.Join(a2.DoctorDir, "history")); err == nil {
+			return shadowedOnly, nil, nil
+		}
+		return nil, nil, nil
+	}
+	sd2.instances = nil
+	if code := a2.Run(); code != ExitError {
+		t.Fatalf("exit = %d, want %d (shadowed only)", code, ExitError)
+	}
+	if !strings.Contains(stdout2.String(), "(not the live install on PATH)") {
+		t.Errorf("stdout missing the shadowed note:\n%s", stdout2.String())
+	}
+}
+
+// A2: the review goes to the same stream as the prompt, and a review
+// that cannot be written means no install.
+type failWriter struct{}
+
+func (failWriter) Write([]byte) (int, error) { return 0, errors.New("review stream broken") }
+
+func TestDoctorCmd_ReviewWriteErrorRefusesInstall(t *testing.T) {
+	a, _, _, sd, _, _ := newTestApp(t, []string{"doctor", "sh"}, nil)
+	wireDoctor(t, a, &stubAgent{responses: []string{shEntry}}, shRunner())
+	makeInteractive(a, "y")
+	detectingAfterInstall(a)
+	sd.instances = nil
+	a.Stderr = failWriter{}
+
+	if code := a.Run(); code != ExitError {
+		t.Fatalf("exit = %d, want %d (review not displayable)", code, ExitError)
+	}
+	if _, err := os.Stat(filepath.Join(a.CatalogDir, "sh-probe.toml")); !os.IsNotExist(err) {
+		t.Error("installed despite the review not being displayable")
+	}
+}
+
+// A1: /dev/null is a character device, so the mode check alone mistakes
+// it for a terminal. The SameFile exception must route it to the
+// non-interactive path: no prompt, no install, the --install command.
+func TestDoctorCmd_DevNullStdinIsNotInteractive(t *testing.T) {
+	a, stdout, stderr, sd, _, _ := newTestApp(t, []string{"doctor", "sh"}, nil)
+	wireDoctor(t, a, &stubAgent{responses: []string{shEntry}}, shRunner())
+	f, err := os.Open(os.DevNull)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { f.Close() })
+	a.Stdin = f
+	sd.instances = nil
+
+	if code := a.Run(); code != ExitOK {
+		t.Fatalf("exit = %d, want 0; stderr: %s", code, stderr.String())
+	}
+	if strings.Contains(stderr.String(), "Install to") {
+		t.Errorf("a /dev/null stdin was prompted: %s", stderr.String())
+	}
+	if !strings.Contains(stdout.String(), "to install it, run: ofa doctor --install") {
+		t.Errorf("stdout missing the --install suggestion:\n%s", stdout.String())
+	}
+	if _, err := os.Stat(filepath.Join(a.CatalogDir, "sh-probe.toml")); !os.IsNotExist(err) {
+		t.Error("a /dev/null stdin installed into the user catalog")
+	}
+}
+
+// B2: --list renders session.json fields — which come from a user-owned
+// directory — through the terminal-safe renderer.
+func TestDoctorListCmdEscapesUntrustedFields(t *testing.T) {
+	a, stdout, stderr, _, _, _ := newTestApp(t, []string{"doctor", "--list"}, nil)
+	wireDoctor(t, a, &stubAgent{}, shRunner())
+	rec := doctor.SessionRecord{
+		Target:        "sh\x1b[8m",
+		Status:        "proposed\r",
+		Time:          time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC),
+		InstalledPath: "/x/\u202epath",
+	}
+	dir := filepath.Join(a.DoctorDir, "history", "20260101T000000Z")
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := doctor.SaveSessionRecord(dir, rec); err != nil {
+		t.Fatal(err)
+	}
+
+	if code := a.Run(); code != ExitOK {
+		t.Fatalf("exit = %d, want 0; stderr: %s", code, stderr.String())
+	}
+	out := stdout.String()
+	// Assert on bytes: no raw ESC, CR, or bidi override anywhere.
+	if i := strings.IndexByte(out, 0x1b); i >= 0 {
+		t.Errorf("listing carries a raw ESC at %d: %q", i, out)
+	}
+	if i := strings.IndexByte(out, '\r'); i >= 0 {
+		t.Errorf("listing carries a raw CR at %d: %q", i, out)
+	}
+	if strings.ContainsRune(out, '\u202e') {
+		t.Errorf("listing carries a raw bidi override: %q", out)
+	}
+	for _, want := range []string{`\x1b[8m`, `\r`, `\u202e`} {
+		if !strings.Contains(out, want) {
+			t.Errorf("listing missing the visible escape %q:\n%s", want, out)
+		}
+	}
 }

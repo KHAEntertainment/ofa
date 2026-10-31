@@ -121,21 +121,20 @@ func WriteCatalogEntry(id string, tomlSrc []byte, dir string, overwrite bool) (s
 // declares that id means one of the two loses — the caller must warn and
 // get an explicit second confirmation.
 //
+// The directory is enumerated through catalog.UserCatalogFiles — the
+// merged loader's own literal listing, never a glob: a catalog directory
+// name may contain glob syntax (`catalog[1]` is a name, not a class),
+// and a glob would find nothing there while the loader finds the file.
 // Files that fail to parse are skipped: the merge skips them the same
 // way, so they cannot shadow anything.
 func DuplicateIDFiles(dir, id string) []string {
-	matches, err := filepath.Glob(filepath.Join(dir, "*.toml"))
-	if err != nil {
-		return nil
-	}
 	own := id + ".toml"
 	var out []string
-	for _, m := range matches {
-		name := filepath.Base(m)
+	for _, name := range catalog.UserCatalogFiles(dir) {
 		if name == own {
 			continue
 		}
-		b, err := os.ReadFile(m)
+		b, err := os.ReadFile(filepath.Join(dir, name))
 		if err != nil {
 			continue
 		}

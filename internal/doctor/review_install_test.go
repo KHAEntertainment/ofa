@@ -27,6 +27,11 @@ func TestQuoteCmd(t *testing.T) {
 		{"safe punctuation bare", []string{"npm", "i", "-g", "pkg@1.2.3"}, "npm i -g pkg@1.2.3"},
 		{"tilde quoted", []string{"bin", "~"}, "bin '~'"},
 		{"path with equals bare", []string{"bin", "--flag=a=b"}, "bin --flag=a=b"},
+		// B2: control and bidi runes are quoted with visible escapes,
+		// never emitted raw.
+		{"ansi conceal escaped", []string{"sh", "-c", "echo \x1b[8mx\x1b[0m"}, "sh -c 'echo \\x1b[8mx\\x1b[0m'"},
+		{"bidi arg escaped", []string{"x", "na\u202eme"}, "x 'na\\u202eme'"},
+		{"crlf arg escaped", []string{"x", "a\r\nb"}, "x 'a\\r\\nb'"},
 	}
 	for _, c := range cases {
 		if got := QuoteCmd(c.cmd); got != c.want {
@@ -144,6 +149,11 @@ func TestReviewLinesOverrides(t *testing.T) {
 		`name "GH Local"`,
 		"3 install(s)",
 		"1 install(s)",
+		// The override comparison shows the old and new COMMANDS, not
+		// only names and counts.
+		"embedded install 1: version (none), update (none)",
+		"embedded install 3: version (none), update (none)",
+		"proposed install 1: version gh --version, update brew upgrade gh",
 	} {
 		if !strings.Contains(joined, want) {
 			t.Errorf("override block missing %q:\n%s", want, joined)
@@ -165,6 +175,7 @@ func TestStandardUpdate(t *testing.T) {
 		{"uv tool upgrade", catalog.Install{Method: "uv", Package: "tool", Bin: "tool", Update: catalog.CmdSpec{Cmd: []string{"uv", "tool", "upgrade", "tool"}}}, true},
 		{"self update", catalog.Install{Method: "native", Bin: "claude", Update: catalog.CmdSpec{Cmd: []string{"claude", "update"}}}, true},
 		{"self --upgrade", catalog.Install{Method: "native", Bin: "agy", Update: catalog.CmdSpec{Cmd: []string{"agy", "--upgrade"}}}, true},
+		{"self self-update", catalog.Install{Method: "native", Bin: "x", Update: catalog.CmdSpec{Cmd: []string{"x", "self-update"}}}, true},
 		{"no update cmd", catalog.Install{Method: "native", Bin: "x"}, true},
 		{"brew other package", catalog.Install{Method: "brew-formula", Package: "gh", Bin: "gh", Update: catalog.CmdSpec{Cmd: []string{"brew", "upgrade", "something-else"}}}, false},
 		{"npm without -g", catalog.Install{Method: "npm", Package: "p", Bin: "p", Update: catalog.CmdSpec{Cmd: []string{"npm", "install", "p"}}}, false},
@@ -172,6 +183,13 @@ func TestStandardUpdate(t *testing.T) {
 		{"sudo rm", catalog.Install{Method: "native", Bin: "x", Update: catalog.CmdSpec{Cmd: []string{"sudo", "rm", "-rf", "/"}}}, false},
 		{"bin with non-update arg", catalog.Install{Method: "native", Bin: "x", Update: catalog.CmdSpec{Cmd: []string{"x", "uninstall"}}}, false},
 		{"pm without the package", catalog.Install{Method: "npm", Package: "p", Bin: "p", Update: catalog.CmdSpec{Cmd: []string{"npm", "install", "-g", "other-pkg"}}}, false},
+		// A5: the self-update form is EXACT. An update-ish word anywhere
+		// else in the vector — a model prompt like `claude -p update`,
+		// or a flag after the subcommand — does not make it standard.
+		{"model prompt with update word", catalog.Install{Method: "native", Bin: "claude", Update: catalog.CmdSpec{Cmd: []string{"claude", "-p", "update"}}}, false},
+		{"self update with extra flag", catalog.Install{Method: "native", Bin: "kimi", Update: catalog.CmdSpec{Cmd: []string{"kimi", "upgrade", "--yes"}}}, false},
+		{"update word in later arg", catalog.Install{Method: "native", Bin: "x", Update: catalog.CmdSpec{Cmd: []string{"x", "run", "update"}}}, false},
+		{"bare bin", catalog.Install{Method: "native", Bin: "x", Update: catalog.CmdSpec{Cmd: []string{"x"}}}, false},
 	}
 	for _, c := range cases {
 		if got := StandardUpdate(c.in); got != c.want {
@@ -354,5 +372,25 @@ func assertNoTempFiles(t *testing.T, dir string) {
 		if strings.HasPrefix(e.Name(), ".doctor-install-") {
 			t.Errorf("leftover temp file %q", e.Name())
 		}
+	}
+}
+
+// B3: a catalog directory whose NAME contains glob syntax is a literal
+// path. The duplicate scan reads it exactly like the merged loader
+// (ReadDir), so the duplicate is found where a glob would have matched
+// nothing.
+func TestDuplicateIDFilesBracketDirectory(t *testing.T) {
+	root := t.TempDir()
+	dir := filepath.Join(root, "catalog[1]")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	old := "id = \"sh-probe\"\nname = \"Old\"\n\n[[installs]]\nmethod = \"native\"\nbin = \"sh\"\npaths = [\"/bin/sh\"]\nversion = { cmd = [\"sh\", \"--version\"] }\n"
+	if err := os.WriteFile(filepath.Join(dir, "a-old.toml"), []byte(old), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	dups := DuplicateIDFiles(dir, "sh-probe")
+	if len(dups) != 1 || dups[0] != "a-old.toml" {
+		t.Errorf("DuplicateIDFiles in bracket dir = %v, want [a-old.toml]", dups)
 	}
 }
