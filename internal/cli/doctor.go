@@ -126,6 +126,20 @@ func (a *App) doctorCmd(args []string) ExitCode {
 		fmt.Fprintf(a.Stderr, "ofa: doctor: --agent %q is not supported: v1 drafts with claude only\n", *agent)
 		return ExitError
 	}
+	// An explicitly empty --install ('' or --install=) is a usage error,
+	// not "flag absent": falling through would run the gap check and could
+	// spend an agent run the user never asked for.
+	installSupplied := false
+	fs.Visit(func(f *flag.Flag) {
+		if f.Name == "install" {
+			installSupplied = true
+		}
+	})
+	if installSupplied && *install == "" {
+		fmt.Fprintf(a.Stderr, "ofa: doctor: --install needs a session id\n")
+		a.usage()
+		return ExitError
+	}
 	// --install, --list, and a positional <bin> are three different ways
 	// to say what this invocation does. Combining them is a usage error,
 	// not something to guess an order for.
@@ -319,9 +333,16 @@ func (a *App) doctorWriteInstalled(sessionID, dir string, h catalog.Harness, src
 	}
 	path, err := doctor.WriteCatalogEntry(h.ID, src, a.CatalogDir, overwrite)
 	if err != nil {
-		// The errors already carry the "doctor:" prefix.
-		fmt.Fprintf(a.Stderr, "ofa: %v\n", err)
-		return ExitError
+		var published *doctor.PublishedError
+		if !errors.As(err, &published) {
+			// The errors already carry the "doctor:" prefix, and may echo
+			// the configured catalog path: render them terminal-safe.
+			fmt.Fprintf(a.Stderr, "ofa: %s\n", doctor.Visible(err.Error()))
+			return ExitError
+		}
+		// The entry is in place; only housekeeping after the publish
+		// failed. A warning, never a failed install.
+		fmt.Fprintf(a.Stderr, "ofa: warning: %s\n", doctor.Visible(err.Error()))
 	}
 	fmt.Fprintf(a.Stdout, "installed: %s\n", doctor.Visible(path))
 	// Session bookkeeping. The entry is already published, so a failure
@@ -448,6 +469,11 @@ func (a *App) doctorInstallCmd(sessionID string) ExitCode {
 // --list shows the verdict. A bookkeeping failure here must not mask the
 // rejection; the proposal still does not install.
 func (a *App) markSessionRejected(dir string, rec doctor.SessionRecord) {
+	// An installed session stays installed: its entry is in the catalog,
+	// and a failed re-run of --install does not undo that.
+	if rec.Status == doctor.StatusInstalled {
+		return
+	}
 	rec.Status = doctor.StatusRejected
 	if err := doctor.SaveSessionRecord(dir, rec); err != nil {
 		fmt.Fprintf(a.Stderr, "ofa: warning: could not record the rejection: %v\n", err)

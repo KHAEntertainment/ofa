@@ -1288,3 +1288,105 @@ func TestDoctorListCmdEscapesUntrustedFields(t *testing.T) {
 		}
 	}
 }
+
+// F1: an explicitly empty --install is a usage error, not "flag absent";
+// it must not fall into the gap check and spend an agent run.
+func TestDoctorCmd_EmptyInstallIsUsageError(t *testing.T) {
+	for _, args := range [][]string{{"doctor", "--install", ""}, {"doctor", "--install="}} {
+		a, _, stderr, sd, _, _ := newTestApp(t, args, nil)
+		agent := &stubAgent{responses: []string{shEntry}}
+		wireDoctor(t, a, agent, shRunner())
+		a.CatalogLoader = fixtureLoader("sh") // exactly one gap
+		sd.instances = nil
+		if code := a.Run(); code != ExitError {
+			t.Fatalf("%q: exit = %d, want %d; stderr: %s", args, code, ExitError, stderr.String())
+		}
+		if agent.calls != 0 {
+			t.Errorf("%q: agent invoked %d time(s), want 0", args, agent.calls)
+		}
+		if !strings.Contains(stderr.String(), "--install needs a session id") {
+			t.Errorf("%q: stderr missing the usage reason: %s", args, stderr.String())
+		}
+	}
+}
+
+// F2: a failed revalidation of an already-installed session reports the
+// rejection but does not downgrade the session record.
+func TestDoctorInstallCmd_RevalidationFailureKeepsInstalledStatus(t *testing.T) {
+	tampered := "id = \"cat-probe\"\nname = \"Cat Probe\"\n\n[[installs]]\nmethod = \"native\"\nbin = \"cat\"\npaths = [\"/bin/cat\"]\nversion = { cmd = [\"cat\", \"--version\"] }\nlatest = \"self\"\n"
+	a, _, stderr, _, _, _ := newTestApp(t, []string{"doctor", "--install", "20260101T000000Z"}, nil)
+	wireDoctor(t, a, &stubAgent{}, shRunner())
+	makeInteractive(a, "y")
+	dir := seedSession(t, a.DoctorDir, "20260101T000000Z", "sh", doctor.StatusInstalled, tampered)
+	rec, err := doctor.LoadSessionRecord(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rec.InstalledPath = filepath.Join(a.CatalogDir, "sh-probe.toml")
+	if err := doctor.SaveSessionRecord(dir, rec); err != nil {
+		t.Fatal(err)
+	}
+	if code := a.Run(); code != ExitError {
+		t.Fatalf("exit = %d, want %d", code, ExitError)
+	}
+	if !strings.Contains(stderr.String(), "no longer valid") {
+		t.Errorf("stderr missing the rejection reason: %s", stderr.String())
+	}
+	got, err := doctor.LoadSessionRecord(dir)
+	if err != nil || got.Status != doctor.StatusInstalled || got.InstalledPath != rec.InstalledPath {
+		t.Errorf("session record = %+v, %v; want still installed with its path", got, err)
+	}
+}
+
+// F3: a directory-sync failure after the publish is a warning, not a
+// failed install: exit 0, the entry stays, the session is marked installed.
+func TestDoctorInstallCmd_DirSyncFailureIsWarning(t *testing.T) {
+	old := doctor.SyncDirFn
+	doctor.SyncDirFn = func(string) error { return errors.New("sync boom") }
+	t.Cleanup(func() { doctor.SyncDirFn = old })
+
+	a, stdout, stderr, sd, _, _ := newTestApp(t, []string{"doctor", "--install", "20260101T000000Z"}, nil)
+	wireDoctor(t, a, &stubAgent{}, shRunner())
+	makeInteractive(a, "y")
+	dir := seedSession(t, a.DoctorDir, "20260101T000000Z", "sh", "proposed", bareToml)
+	sd.instances = []detect.Instance{shInstance()}
+	if code := a.Run(); code != ExitOK {
+		t.Fatalf("exit = %d, want 0; stderr: %s", code, stderr.String())
+	}
+	if !strings.Contains(stderr.String(), "warning") || !strings.Contains(stderr.String(), "could not sync the directory") {
+		t.Errorf("stderr missing the sync warning: %s", stderr.String())
+	}
+	if !strings.Contains(stdout.String(), "installed: ") {
+		t.Errorf("stdout missing the install result: %s", stdout.String())
+	}
+	if b, err := os.ReadFile(filepath.Join(a.CatalogDir, "sh-probe.toml")); err != nil || string(b) != bareToml {
+		t.Errorf("entry was not left in place: %q, %v", string(b), err)
+	}
+	if rec, err := doctor.LoadSessionRecord(dir); err != nil || rec.Status != doctor.StatusInstalled {
+		t.Errorf("session record = %+v, %v; want installed", rec, err)
+	}
+}
+
+// Advisory: a write error that echoes the configured catalog path is
+// rendered terminal-safe.
+func TestDoctorCmd_WriteErrorRenderedSafely(t *testing.T) {
+	a, _, stderr, sd, _, _ := newTestApp(t, []string{"doctor", "sh"}, nil)
+	wireDoctor(t, a, &stubAgent{responses: []string{shEntry}}, shRunner())
+	makeInteractive(a, "y", "y")
+	a.CatalogDir = filepath.Join(a.CatalogDir, "cat\x1b[8m")
+	// A directory where the file should go: the overwrite rename fails
+	// with an error that names the path.
+	if err := os.MkdirAll(filepath.Join(a.CatalogDir, "sh-probe.toml"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	sd.instances = nil
+	if code := a.Run(); code != ExitError {
+		t.Fatalf("exit = %d, want %d; stderr: %s", code, ExitError, stderr.String())
+	}
+	if strings.ContainsRune(stderr.String(), '\x1b') {
+		t.Errorf("raw ESC in stderr: %q", stderr.String())
+	}
+	if !strings.Contains(stderr.String(), `cat\x1b[8m`) {
+		t.Errorf("stderr missing the visible escape: %q", stderr.String())
+	}
+}

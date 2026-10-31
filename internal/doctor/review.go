@@ -154,33 +154,44 @@ func StandardUpdate(in catalog.Install) bool {
 	if in.Package == "" {
 		return false
 	}
-	// The package must be named (npm also allows pkg@latest), and npm
-	// must be the global form.
-	hasPkg := func() bool {
-		for _, a := range cmd[1:] {
-			if a == in.Package || a == in.Package+"@latest" {
-				return true
-			}
-		}
-		return false
-	}
+	// The install's own package must be the ONLY non-flag argument after
+	// the subcommand (npm also allows pkg@latest, and must be the global
+	// form): a second package would be installed or upgraded by ofa apply
+	// with no warning.
 	switch cmd[0] {
 	case "brew":
 		// brew upgrade [--cask|--formula] <pkg> [flags...]
-		return len(cmd) >= 3 && cmd[1] == "upgrade" && hasPkg()
+		return len(cmd) >= 3 && cmd[1] == "upgrade" && onlyPackage(cmd[2:], in.Package, false)
 	case "npm":
 		// npm install|i|update -g <pkg|pkg@latest> [flags...]
 		return len(cmd) >= 4 &&
 			(cmd[1] == "install" || cmd[1] == "i" || cmd[1] == "update") &&
-			containsArg(cmd[2:], "-g") && hasPkg()
+			containsArg(cmd[2:], "-g") && onlyPackage(cmd[2:], in.Package, true)
 	case "pipx":
 		// pipx upgrade <pkg> [flags...]
-		return len(cmd) >= 3 && cmd[1] == "upgrade" && hasPkg()
+		return len(cmd) >= 3 && cmd[1] == "upgrade" && onlyPackage(cmd[2:], in.Package, false)
 	case "uv":
 		// uv tool upgrade <pkg> [flags...]
-		return len(cmd) >= 4 && cmd[1] == "tool" && cmd[2] == "upgrade" && hasPkg()
+		return len(cmd) >= 4 && cmd[1] == "tool" && cmd[2] == "upgrade" && onlyPackage(cmd[3:], in.Package, false)
 	}
 	return false
+}
+
+// onlyPackage reports whether args, after skipping flags (arguments that
+// start with "-"), name pkg exactly once and nothing else. pkg@latest
+// counts as pkg only when allowLatest is set (npm).
+func onlyPackage(args []string, pkg string, allowLatest bool) bool {
+	found := false
+	for _, a := range args {
+		if strings.HasPrefix(a, "-") {
+			continue
+		}
+		if found || !(a == pkg || allowLatest && a == pkg+"@latest") {
+			return false
+		}
+		found = true
+	}
+	return found
 }
 
 // containsArg reports whether args contains arg.

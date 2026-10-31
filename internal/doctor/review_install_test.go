@@ -190,6 +190,21 @@ func TestStandardUpdate(t *testing.T) {
 		{"self update with extra flag", catalog.Install{Method: "native", Bin: "kimi", Update: catalog.CmdSpec{Cmd: []string{"kimi", "upgrade", "--yes"}}}, false},
 		{"update word in later arg", catalog.Install{Method: "native", Bin: "x", Update: catalog.CmdSpec{Cmd: []string{"x", "run", "update"}}}, false},
 		{"bare bin", catalog.Install{Method: "native", Bin: "x", Update: catalog.CmdSpec{Cmd: []string{"x"}}}, false},
+		// The install's package must be the ONLY non-flag argument.
+		{"brew extra package", catalog.Install{Method: "brew-formula", Package: "gh", Bin: "gh", Update: catalog.CmdSpec{Cmd: []string{"brew", "upgrade", "gh", "evil"}}}, false},
+		{"npm extra package", catalog.Install{Method: "npm", Package: "p", Bin: "p", Update: catalog.CmdSpec{Cmd: []string{"npm", "install", "-g", "p", "evil"}}}, false},
+		{"npm extra package first", catalog.Install{Method: "npm", Package: "p", Bin: "p", Update: catalog.CmdSpec{Cmd: []string{"npm", "install", "-g", "evil", "p@latest"}}}, false},
+		{"pipx extra package", catalog.Install{Method: "pipx", Package: "aider", Bin: "aider", Update: catalog.CmdSpec{Cmd: []string{"pipx", "upgrade", "aider", "evil"}}}, false},
+		{"uv extra package", catalog.Install{Method: "uv", Package: "tool", Bin: "tool", Update: catalog.CmdSpec{Cmd: []string{"uv", "tool", "upgrade", "tool", "evil"}}}, false},
+		{"package twice", catalog.Install{Method: "pipx", Package: "aider", Bin: "aider", Update: catalog.CmdSpec{Cmd: []string{"pipx", "upgrade", "aider", "aider"}}}, false},
+		{"flags only, no package", catalog.Install{Method: "npm", Package: "p", Bin: "p", Update: catalog.CmdSpec{Cmd: []string{"npm", "install", "-g", "--force"}}}, false},
+		{"npm package with flags", catalog.Install{Method: "npm", Package: "p", Bin: "p", Update: catalog.CmdSpec{Cmd: []string{"npm", "install", "-g", "p", "--no-fund"}}}, true},
+		{"npm pkg@latest", catalog.Install{Method: "npm", Package: "p", Bin: "p", Update: catalog.CmdSpec{Cmd: []string{"npm", "update", "-g", "p@latest"}}}, true},
+		{"pipx pkg@latest is not the package", catalog.Install{Method: "pipx", Package: "aider", Bin: "aider", Update: catalog.CmdSpec{Cmd: []string{"pipx", "upgrade", "aider@latest"}}}, false},
+		{"brew pkg@latest is not the package", catalog.Install{Method: "brew-formula", Package: "gh", Bin: "gh", Update: catalog.CmdSpec{Cmd: []string{"brew", "upgrade", "gh@latest"}}}, false},
+		{"brew wrong subcommand", catalog.Install{Method: "brew-formula", Package: "gh", Bin: "gh", Update: catalog.CmdSpec{Cmd: []string{"brew", "uninstall", "gh"}}}, false},
+		{"uv wrong subcommand", catalog.Install{Method: "uv", Package: "tool", Bin: "tool", Update: catalog.CmdSpec{Cmd: []string{"uv", "tool", "uninstall", "tool"}}}, false},
+		{"npm wrong subcommand", catalog.Install{Method: "npm", Package: "p", Bin: "p", Update: catalog.CmdSpec{Cmd: []string{"npm", "uninstall", "-g", "p"}}}, false},
 	}
 	for _, c := range cases {
 		if got := StandardUpdate(c.in); got != c.want {
@@ -392,5 +407,55 @@ func TestDuplicateIDFilesBracketDirectory(t *testing.T) {
 	dups := DuplicateIDFiles(dir, "sh-probe")
 	if len(dups) != 1 || dups[0] != "a-old.toml" {
 		t.Errorf("DuplicateIDFiles in bracket dir = %v, want [a-old.toml]", dups)
+	}
+}
+
+// F3: the catalog directory is synced after the publish on both paths; a
+// sync failure leaves the entry in place and reports a PublishedError.
+func TestWriteCatalogEntrySyncsDirectory(t *testing.T) {
+	for _, overwrite := range []bool{false, true} {
+		dir := t.TempDir()
+		src := []byte("id = \"x\"\n")
+		if overwrite {
+			if err := os.WriteFile(filepath.Join(dir, "x.toml"), []byte("old"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+		}
+		var synced []string
+		old := SyncDirFn
+		SyncDirFn = func(d string) error { synced = append(synced, d); return nil }
+		_, err := WriteCatalogEntry("x", src, dir, overwrite)
+		SyncDirFn = old
+		if err != nil {
+			t.Fatalf("overwrite=%v: %v", overwrite, err)
+		}
+		if len(synced) != 1 || synced[0] != dir {
+			t.Errorf("overwrite=%v: synced %v, want [%s]", overwrite, synced, dir)
+		}
+	}
+}
+
+func TestWriteCatalogEntrySyncFailureKeepsEntry(t *testing.T) {
+	for _, overwrite := range []bool{false, true} {
+		dir := t.TempDir()
+		src := []byte("id = \"x\"\n")
+		old := SyncDirFn
+		SyncDirFn = func(string) error { return errors.New("sync boom") }
+		path, err := WriteCatalogEntry("x", src, dir, overwrite)
+		SyncDirFn = old
+		var pub *PublishedError
+		if !errors.As(err, &pub) {
+			t.Fatalf("overwrite=%v: err = %v, want a PublishedError", overwrite, err)
+		}
+		if !strings.Contains(err.Error(), "installed to") || !strings.Contains(err.Error(), "could not sync the directory") {
+			t.Errorf("overwrite=%v: err = %v", overwrite, err)
+		}
+		if b, rerr := os.ReadFile(path); rerr != nil || string(b) != string(src) {
+			t.Errorf("overwrite=%v: entry rolled back: %q, %v", overwrite, string(b), rerr)
+		}
+		ents, _ := os.ReadDir(dir)
+		if len(ents) != 1 {
+			t.Errorf("overwrite=%v: dir has %d entries, want just the entry", overwrite, len(ents))
+		}
 	}
 }

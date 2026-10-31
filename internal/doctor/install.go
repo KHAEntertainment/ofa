@@ -35,6 +35,34 @@ func ValidID(id string) bool {
 	return len(id) > 0 && len(id) <= maxIDLen && idPattern.MatchString(id)
 }
 
+// PublishedError reports that the catalog entry IS in place, but a step
+// after publishing it failed (removing the temp name, syncing the
+// directory). Callers treat it as a warning, never as a failed install:
+// the file must not be deleted or rolled back.
+type PublishedError struct {
+	Path string
+	Err  error
+}
+
+func (e *PublishedError) Error() string { return e.Err.Error() }
+func (e *PublishedError) Unwrap() error { return e.Err }
+
+// SyncDirFn makes directory-entry changes in a directory durable. It is a
+// variable only so tests can inject a failure.
+var SyncDirFn = syncDir
+
+// syncDir fsyncs the directory itself: fsyncing the file does not make
+// its directory entry durable, so after a power loss a published entry
+// could otherwise be missing.
+func syncDir(dir string) error {
+	d, err := os.Open(dir)
+	if err != nil {
+		return err
+	}
+	defer d.Close()
+	return d.Sync()
+}
+
 // ErrExists reports that the target catalog file already exists and the
 // caller did not authorize an overwrite. The existing file is untouched.
 var ErrExists = errors.New("doctor: catalog file already exists")
@@ -90,6 +118,11 @@ func WriteCatalogEntry(id string, tomlSrc []byte, dir string, overwrite bool) (s
 		if err := os.Rename(tmpName, target); err != nil {
 			return "", fmt.Errorf("doctor: %w", err)
 		}
+		published = true
+		if err := SyncDirFn(dir); err != nil {
+			return target, &PublishedError{target, fmt.Errorf("doctor: installed to %s, but could not sync the directory: %w", target, err)}
+		}
+		return target, nil
 	} else {
 		// Link fails atomically when target exists; rename would
 		// silently replace it. The temp file's content is the published
@@ -104,13 +137,14 @@ func WriteCatalogEntry(id string, tomlSrc []byte, dir string, overwrite bool) (s
 		if err := os.Remove(tmpName); err != nil {
 			// The entry is already published; a leftover .tmp file is
 			// cosmetic. Report it so the user can clean up knowingly.
-			return target, fmt.Errorf("doctor: installed to %s, but could not remove the temp file %s: %w", target, tmpName, err)
+			return target, &PublishedError{target, fmt.Errorf("doctor: installed to %s, but could not remove the temp file %s: %w", target, tmpName, err)}
 		}
 		published = true
+		if err := SyncDirFn(dir); err != nil {
+			return target, &PublishedError{target, fmt.Errorf("doctor: installed to %s, but could not sync the directory: %w", target, err)}
+		}
 		return target, nil
 	}
-	published = true
-	return target, nil
 }
 
 // DuplicateIDFiles returns the base names of user catalog files, other
