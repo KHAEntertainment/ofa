@@ -892,22 +892,51 @@ func (f *swapOnConfirm) Read(p []byte) (int, error) {
 		return 0, io.EOF
 	}
 	f.answered = true
-	history := filepath.Join(f.doctorDir, "history")
-	entries, err := os.ReadDir(history)
-	if err != nil || len(entries) == 0 {
-		return 0, fmt.Errorf("swapOnConfirm: no session directory: %v", err)
-	}
-	if err := os.WriteFile(filepath.Join(history, entries[0].Name(), "proposed-catalog.toml"), []byte(f.replacement), 0o600); err != nil {
+	if err := swapProposalFile(f.doctorDir, f.replacement); err != nil {
 		return 0, err
 	}
 	return copy(p, "y\n"), nil
 }
 
+// swapDuringReview wraps the review stream and rewrites the saved
+// proposal file the moment the review starts rendering — the other side
+// of the reviewer's hook: a writer swapping the file after validation
+// but before any post-review read of the file.
+type swapDuringReview struct {
+	inner       io.Writer
+	doctorDir   string
+	replacement string
+	swapped     bool
+}
+
+func (w *swapDuringReview) Write(p []byte) (int, error) {
+	if !w.swapped && strings.Contains(string(p), "harness id:") {
+		w.swapped = true
+		if err := swapProposalFile(w.doctorDir, w.replacement); err != nil {
+			return 0, err
+		}
+	}
+	return w.inner.Write(p)
+}
+
+// swapProposalFile overwrites the single session's proposed-catalog.toml.
+func swapProposalFile(doctorDir, replacement string) error {
+	history := filepath.Join(doctorDir, "history")
+	entries, err := os.ReadDir(history)
+	if err != nil || len(entries) == 0 {
+		return fmt.Errorf("swap: no session directory under %s (%v)", history, err)
+	}
+	return os.WriteFile(filepath.Join(history, entries[0].Name(), "proposed-catalog.toml"), []byte(replacement), 0o600)
+}
+
 func TestDoctorCmd_SwapAfterReviewInstallsReviewedBytes(t *testing.T) {
-	a, _, stderr, _, _, _ := newTestApp(t, []string{"doctor", "sh"}, nil)
+	a, stdout, stderr, _, _, _ := newTestApp(t, []string{"doctor", "sh"}, nil)
 	wireDoctor(t, a, &stubAgent{responses: []string{shEntry}}, shRunner())
 	detectingAfterInstall(a)
 	replacement := strings.Replace(bareToml, `name = "Shell Probe"`, `name = "Swapped Probe"`, 1)
+	// The file is swapped once as the review renders and again as the
+	// prompt is answered: neither may change what is installed.
+	a.Stderr = &swapDuringReview{inner: stderr, doctorDir: a.DoctorDir, replacement: replacement}
 	a.Stdin = &swapOnConfirm{doctorDir: a.DoctorDir, replacement: replacement}
 	a.StdinIsTTY = func(io.Reader) bool { return true }
 
@@ -928,6 +957,9 @@ func TestDoctorCmd_SwapAfterReviewInstallsReviewedBytes(t *testing.T) {
 	}
 	if !strings.Contains(stderr.String(), "name: Shell Probe") {
 		t.Errorf("review missing the reviewed name:\n%s", stderr.String())
+	}
+	if !strings.Contains(stdout.String(), "detected: sh 1.0") {
+		t.Errorf("stdout missing the post-install detection:\n%s", stdout.String())
 	}
 }
 
