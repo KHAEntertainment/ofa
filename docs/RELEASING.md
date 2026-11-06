@@ -81,8 +81,13 @@ Then commit and push the tap. Verify with `brew update && brew info ofa`.
 ```sh
 gh release view vX.Y.Z                 # assets + checksums present
 npm view @khaentertainment/ofa version # matches the tag
+brew trust khaentertainment/tap        # trust the tap first on a fresh machine
 brew info KHAEntertainment/tap/ofa     # formula version + url match
 ```
+
+A fresh machine has no trusted taps, and Homebrew 5.1.15 and newer refuse to
+load a formula from an untrusted tap, so `brew info` fails until the tap is
+trusted.
 
 ## Review capacity fallback
 
