@@ -1,7 +1,9 @@
 package state
 
 import (
+	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -81,5 +83,54 @@ func TestDiffNilPrev(t *testing.T) {
 	d := Diff(nil, current)
 	if len(d.Added)+len(d.Removed)+len(d.Changed) != 0 {
 		t.Errorf("nil prev should yield empty diff: %+v", d)
+	}
+}
+
+// TestSaveCreatesMissingParentDir covers the first run: the config directory
+// does not exist yet, and Save has to create it (issue #46). The dir a user
+// gets is the same one config.EnsureDir would make: 0755.
+func TestSaveCreatesMissingParentDir(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "config", "ofa")
+	path := filepath.Join(dir, "state.json")
+
+	if err := Save(path, &File{Harnesses: map[string]Harness{}}); err != nil {
+		t.Fatalf("Save: %v", err)
+	}
+
+	st, err := os.Stat(dir)
+	if err != nil {
+		t.Fatalf("Save did not create the parent dir %s: %v", dir, err)
+	}
+	if !st.IsDir() {
+		t.Fatalf("%s is not a directory", dir)
+	}
+	g, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if g == nil {
+		t.Fatal("Load returned nil for a file Save just wrote")
+	}
+}
+
+// TestSaveParentIsFileReturnsError covers the boundary case: the parent path
+// exists but is a regular file, so the directory cannot be created. Save has
+// to report that as an error — not panic, and not write anything.
+func TestSaveParentIsFileReturnsError(t *testing.T) {
+	blocker := filepath.Join(t.TempDir(), "not-a-dir")
+	if err := os.WriteFile(blocker, []byte("not a directory"), 0o644); err != nil {
+		t.Fatalf("write blocker file: %v", err)
+	}
+	path := filepath.Join(blocker, "state.json")
+
+	err := Save(path, &File{Harnesses: map[string]Harness{}})
+	if err == nil {
+		t.Fatal("Save should fail when the parent path is a regular file")
+	}
+	if !strings.Contains(err.Error(), blocker) {
+		t.Errorf("error should name the blocking path %s, got %v", blocker, err)
+	}
+	if _, statErr := os.Stat(path); statErr == nil {
+		t.Error("no state file should have been written")
 	}
 }
