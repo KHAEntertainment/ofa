@@ -2,6 +2,7 @@ package doctor
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -136,4 +137,156 @@ func LoadProposal(dir string) ([]byte, error) {
 		return nil, fmt.Errorf("session: %w", err)
 	}
 	return b, nil
+}
+
+// SessionEntry is one entry in the doctor sessions directory, as
+// `ofa doctor --list` renders it.
+type SessionEntry struct {
+	// Name is the entry's name inside the sessions directory.
+	Name string
+	// Dir is the session directory: resolved, and proven to be inside
+	// the sessions directory. It is empty when Skip is set.
+	Dir string
+	// Skip explains why the entry is not a session. It is empty for a
+	// session. It never carries a path — it says what KIND of entry it
+	// is — so a link target crafted to look like something else cannot
+	// put a path into the output.
+	Skip string
+}
+
+// ListSessions enumerates the entries of the sessions directory root.
+//
+// Three kinds of entry come back:
+//
+//   - a session: a real directory, or a symlink whose target resolves
+//     inside root. Both are listed. Only one whose name is a valid
+//     session ID can be installed from — the caller checks the name
+//     with ValidSessionID first.
+//   - a skipped entry: a symlink that leaves the sessions directory,
+//     dangles, or names a file. It carries the reason, so the caller
+//     can say so out loud instead of dropping it silently.
+//   - nothing at all: a plain file is not a session and carries no
+//     reason.
+//
+// A symlink is followed only while its target stays inside root, so
+// nothing here reads or writes outside the sessions directory.
+func ListSessions(root string) ([]SessionEntry, error) {
+	ents, err := os.ReadDir(root)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]SessionEntry, 0, len(ents))
+	for _, e := range ents {
+		name := e.Name()
+		// A plain file is not a session. A symlink to one is, and the
+		// reason it cannot be is reported rather than swallowed.
+		if !e.IsDir() && e.Type()&os.ModeSymlink == 0 {
+			continue
+		}
+		dir, reason := resolveSession(root, name)
+		if reason != "" {
+			out = append(out, SessionEntry{Name: name, Skip: reason})
+			continue
+		}
+		out = append(out, SessionEntry{Name: name, Dir: dir})
+	}
+	return out, nil
+}
+
+// ResolveSessionDir resolves the session directory named id inside the
+// sessions directory root.
+//
+// A session directory can be a symlink: `history/<id>` pointing at
+// another session directory is a legal thing for a user to make, and it
+// is followed when its target stays inside root. A link that leaves the
+// sessions directory, dangles, or names a file is refused with the
+// reason instead — nothing is read from it and nothing is written to
+// it. The boundary is the RESOLVED root, so a sessions directory that
+// is itself a symlink (a config directory kept in a dotfiles repo)
+// still contains its own sessions.
+//
+// The id is a session NAME: the caller checks it with ValidSessionID
+// first, because an entry whose name is not a valid session id cannot
+// be installed from at all, whatever it resolves to.
+//
+// The path returned is the resolved directory, not the link, so later
+// reads and writes go to the resolved path rather than through the
+// link.
+//
+// What this guarantees is the STATIC escape: a session directory that
+// points outside the sessions directory when it is resolved cannot be
+// used at all. It does not pin anything. EvalSymlinks returns a
+// pathname, not a pinned handle, so whoever can already write inside
+// the user's own config directory could still replace the resolved
+// directory or one of its ancestors between this check and the later
+// IO. Using the resolved path narrows that window; it does not close
+// it. This is an accepted limit of the local filesystem: someone who
+// can write there can already change what doctor reads.
+//
+// Leaf symlinks INSIDE a session directory are a separate matter and
+// are still followed: the readers open session.json and
+// proposed-catalog.toml by name, so a symlinked leaf still points
+// wherever it points. That is pre-existing behaviour, tracked
+// together with handle-pinned IO in issue #61.
+func ResolveSessionDir(root, id string) (string, error) {
+	dir, reason := resolveSession(root, id)
+	if reason != "" {
+		return "", errors.New("session: " + reason)
+	}
+	return dir, nil
+}
+
+// resolveSession resolves one entry of the sessions directory to the
+// directory doctor may use, and the reason it cannot when it cannot.
+// An empty reason means the entry is a usable session.
+//
+// The reasons never name a path: they say what kind of entry it is, so
+// a link target crafted to look like something else cannot put a path
+// into the output.
+func resolveSession(root, name string) (dir, reason string) {
+	entry := filepath.Join(root, name)
+	realRoot, err := filepath.EvalSymlinks(root)
+	if err != nil {
+		return "", "the sessions directory could not be resolved"
+	}
+	real, err := filepath.EvalSymlinks(entry)
+	if err != nil {
+		if os.IsNotExist(err) {
+			// The entry does not resolve. A symlink that points
+			// nowhere is one thing; an entry that is not there at all
+			// is another, and the two are told apart here.
+			if fi, lerr := os.Lstat(entry); lerr == nil && fi.Mode()&os.ModeSymlink != 0 {
+				return "", "dangling symlink"
+			}
+			return "", "no such session directory"
+		}
+		return "", "the session directory could not be resolved"
+	}
+	if real == realRoot {
+		return "", "symlink points at the sessions directory itself"
+	}
+	// Containment is checked BEFORE the shape: a target outside the
+	// sessions directory is refused without anything else being looked
+	// at, so nothing outside is read or written.
+	if !withinRoot(realRoot, real) {
+		return "", "symlink leaves the sessions directory"
+	}
+	st, err := os.Stat(real)
+	if err != nil {
+		return "", "the session directory could not be resolved"
+	}
+	if !st.IsDir() {
+		return "", "not a directory"
+	}
+	return real, ""
+}
+
+// withinRoot reports whether path is inside root. Both are absolute and
+// already resolved.
+func withinRoot(root, path string) bool {
+	rel, err := filepath.Rel(root, path)
+	if err != nil {
+		return false
+	}
+	return filepath.IsLocal(rel)
 }

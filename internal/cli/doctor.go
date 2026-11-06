@@ -10,6 +10,8 @@ import (
 	"path/filepath"
 	"strings"
 
+	"github.com/charmbracelet/x/term"
+
 	"ofa/internal/catalog"
 	"ofa/internal/detect"
 	"ofa/internal/doctor"
@@ -69,13 +71,25 @@ func boolFlag(fl *flag.Flag) bool {
 }
 
 // stdinIsTTY is the default StdinIsTTY gate for doctor's install prompt.
-// It mirrors stderrIsTTY (picker.go) on the cheap ModeCharDevice check,
-// with one exception the mode check alone gets wrong: /dev/null IS a
-// character device, so `ofa doctor < /dev/null` would look interactive
-// and prompt at a bottomless EOF. A stdin that is the same file as
-// /dev/null is therefore not a terminal. Doctor only ever prompts — and
-// only ever installs — when this is true; a non-interactive stdin gets
-// the --install command printed instead.
+// It keeps the cheap character-device check isTerminal does, and adds
+// the two exceptions that check alone gets wrong.
+//
+// The mode check is not enough: /dev/null IS a character device, so
+// `ofa doctor < /dev/null` would look interactive and prompt at a
+// bottomless EOF. A stdin that is the same file as /dev/null is
+// therefore not a terminal.
+//
+// But the exception list is endless. /dev/zero, /dev/random and every
+// other device node is a character device too, and each of them would
+// look interactive just the same. Only the device itself can tell them
+// apart: a real terminal is the one that answers the termios ioctl.
+// That check never reads, so it cannot block at EOF, and it can only
+// ever turn an interactive stdin into a non-interactive one — never
+// the other way round.
+//
+// Doctor only ever prompts — and only ever installs — when this is
+// true; a non-interactive stdin gets the --install command printed
+// instead.
 func stdinIsTTY(r io.Reader) bool {
 	f, ok := r.(*os.File)
 	if !ok {
@@ -91,7 +105,12 @@ func stdinIsTTY(r io.Reader) bool {
 	if nullSt, nerr := os.Stat(os.DevNull); nerr == nil && os.SameFile(st, nullSt) {
 		return false
 	}
-	return true
+	// The real question, asked of the device itself: is this a
+	// terminal? A character device that is not one — /dev/zero above
+	// all — answers no, and a non-interactive stdin must never look
+	// interactive. Fd() can switch a Go-managed nonblocking tty to
+	// blocking mode — harmless for the stdin of a one-shot command.
+	return term.IsTerminal(f.Fd())
 }
 
 // doctorCmd implements `ofa doctor [<bin>] [--agent claude]`,
@@ -467,7 +486,22 @@ func (a *App) doctorInstallCmd(sessionID string) ExitCode {
 		a.usage()
 		return ExitError
 	}
-	dir := filepath.Join(a.DoctorDir, "history", sessionID)
+	// The session directory is resolved and checked against the
+	// sessions directory before anything is read or written: a
+	// symlinked session that points outside it is refused, so no
+	// proposal is read from outside and no record is written outside
+	// either. The path used from here on is the resolved one, which
+	// keeps the later IO off the link. It does not pin it: a swap of
+	// the resolved directory, of one of its ancestors, or of a file
+	// inside it, by someone who can already write in the user's own
+	// config directory is still possible — an accepted limit of the
+	// local filesystem, not a guarantee this check makes.
+	root := filepath.Join(a.DoctorDir, "history")
+	dir, err := doctor.ResolveSessionDir(root, sessionID)
+	if err != nil {
+		fmt.Fprintf(a.Stderr, "ofa: doctor: cannot install %s: %v\n", sessionID, err)
+		return ExitError
+	}
 	rec, err := doctor.LoadSessionRecord(dir)
 	if err != nil {
 		fmt.Fprintf(a.Stderr, "ofa: doctor: cannot install %s: %v\n", sessionID, err)
@@ -525,9 +559,16 @@ func (a *App) markSessionRejected(dir string, rec doctor.SessionRecord) {
 // doctorListCmd implements `ofa doctor --list`: one line per history
 // session. Sessions from before session.json existed show "unknown"
 // rather than failing the listing; pruning is out of scope.
+//
+// A session directory that is a symlink is listed when it resolves
+// inside the sessions directory — --install can install from it — and
+// is named as skipped, with the reason, when it does not. It is never
+// dropped silently: a session the listing hides is a session the user
+// cannot find, and a link that leaves the sessions directory is a
+// thing worth saying out loud.
 func (a *App) doctorListCmd() ExitCode {
 	root := filepath.Join(a.DoctorDir, "history")
-	entries, err := os.ReadDir(root)
+	entries, err := doctor.ListSessions(root)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
 			fmt.Fprintln(a.Stdout, "no doctor sessions yet")
@@ -536,29 +577,38 @@ func (a *App) doctorListCmd() ExitCode {
 		fmt.Fprintf(a.Stderr, "ofa: doctor: %v\n", err)
 		return ExitError
 	}
-	n := 0
+	var sessions, skipped []doctor.SessionEntry
 	for _, e := range entries {
-		if !e.IsDir() {
+		if e.Skip != "" {
+			skipped = append(skipped, e)
 			continue
 		}
-		if n == 0 {
-			fmt.Fprintln(a.Stdout, "doctor sessions:")
-		}
-		n++
+		sessions = append(sessions, e)
+	}
+	if len(sessions) == 0 {
+		fmt.Fprintln(a.Stdout, "no doctor sessions yet")
+	} else {
+		fmt.Fprintln(a.Stdout, "doctor sessions:")
+	}
+	for _, e := range sessions {
 		target, status, path := "unknown", "unknown", ""
-		if rec, err := doctor.LoadSessionRecord(filepath.Join(root, e.Name())); err == nil {
+		if rec, err := doctor.LoadSessionRecord(e.Dir); err == nil {
 			target, status, path = rec.Target, rec.Status, rec.InstalledPath
 		}
 		// Directory names, session fields, and paths all come from a
 		// user-owned directory; nothing they carry is emitted raw.
-		line := fmt.Sprintf("  %s  %s  %s", doctor.Visible(e.Name()), doctor.Visible(target), doctor.Visible(status))
+		line := fmt.Sprintf("  %s  %s  %s", doctor.Visible(e.Name), doctor.Visible(target), doctor.Visible(status))
 		if path != "" {
 			line += fmt.Sprintf("  -> %s", doctor.Visible(path))
 		}
 		fmt.Fprintln(a.Stdout, line)
 	}
-	if n == 0 {
-		fmt.Fprintln(a.Stdout, "no doctor sessions yet")
+	// A session directory that could not be used is named, with the
+	// reason, rather than vanishing. The reason says what kind of entry
+	// it is and never carries a path, so a link target cannot put one
+	// into the output.
+	for _, e := range skipped {
+		fmt.Fprintf(a.Stdout, "  skipped %s: %s\n", doctor.Visible(e.Name), doctor.Visible(e.Skip))
 	}
 	return ExitOK
 }
