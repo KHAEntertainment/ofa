@@ -29,11 +29,7 @@ OFA never reimplements an updater. It runs the native one (`brew upgrade`, `npm 
 
 ### macOS (Homebrew)
 
-Homebrew 5.1.15 and newer refuse to load formulae from a tap you have not
-trusted. Trust it once, then install:
-
 ```sh
-$ brew trust khaentertainment/tap
 $ brew install KHAEntertainment/tap/ofa
 ```
 
