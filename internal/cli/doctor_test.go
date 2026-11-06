@@ -1747,6 +1747,203 @@ func TestDoctorInstallCmd_DirSyncFailureIsWarning(t *testing.T) {
 	}
 }
 
+// A session directory that is a symlink is listed when it resolves
+// inside the sessions directory — --install can install from it — and
+// is named as skipped, with the reason, when it does not. It is never
+// dropped silently: a session the listing hides is a session the user
+// cannot find.
+func TestDoctorListCmd_SymlinkedSession(t *testing.T) {
+	a, stdout, stderr, _, _, _ := newTestApp(t, []string{"doctor", "--list"}, nil)
+	wireDoctor(t, a, &stubAgent{}, shRunner())
+	root := filepath.Join(a.DoctorDir, "history")
+
+	// A plain session.
+	seedSession(t, a.DoctorDir, "20260101T000000Z", "sh", "proposed", bareToml)
+	// A symlink to a session that is also inside the sessions directory.
+	inside := seedSession(t, a.DoctorDir, "20260102T000000Z", "cat", "proposed", bareToml)
+	if err := os.Symlink(inside, filepath.Join(root, "20260103T000000Z")); err != nil {
+		t.Fatal(err)
+	}
+	// A symlink that leaves the sessions directory.
+	outside := filepath.Join(t.TempDir(), "outside-secret")
+	if err := os.MkdirAll(outside, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(outside, filepath.Join(root, "20260104T000000Z")); err != nil {
+		t.Fatal(err)
+	}
+	// A symlink that points nowhere.
+	if err := os.Symlink(filepath.Join(root, "20260109T000000Z"), filepath.Join(root, "20260105T000000Z")); err != nil {
+		t.Fatal(err)
+	}
+
+	if code := a.Run(); code != ExitOK {
+		t.Fatalf("exit = %d, want 0; stderr: %s", code, stderr.String())
+	}
+	out := stdout.String()
+	for _, want := range []string{
+		"20260101T000000Z  sh  proposed",
+		"20260102T000000Z  cat  proposed",
+		"20260103T000000Z  cat  proposed",
+		"skipped 20260104T000000Z: symlink leaves the sessions directory",
+		"skipped 20260105T000000Z: dangling symlink",
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("listing missing %q:\n%s", want, out)
+		}
+	}
+	// A skipped entry is not listed as a session.
+	for _, name := range []string{"20260104T000000Z", "20260105T000000Z"} {
+		if strings.Contains(out, "  "+name+"  ") {
+			t.Errorf("a skipped entry was listed as a session: %q", name)
+		}
+	}
+	// The reason says what kind of entry it is; it never carries the
+	// path the link points at.
+	if strings.Contains(out, "outside-secret") {
+		t.Errorf("the listing echoed the link target:\n%s", out)
+	}
+}
+
+// A session directory that is a symlink out of the sessions directory
+// is refused: the proposal is not read from outside, and the install
+// record is not written outside either.
+func TestDoctorInstallCmd_SymlinkOutsideRootRefused(t *testing.T) {
+	a, _, stderr, _, _, _ := newTestApp(t, []string{"doctor", "--install", "20260101T000000Z"}, nil)
+	wireDoctor(t, a, &stubAgent{}, shRunner())
+	makeInteractive(a, "y")
+
+	// A complete, valid session — but OUTSIDE the sessions directory.
+	outside := filepath.Join(t.TempDir(), "outside-secret")
+	if err := os.MkdirAll(outside, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	rec := doctor.SessionRecord{
+		Target:    "sh",
+		HarnessID: "sh-probe",
+		Time:      time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC),
+		Status:    doctor.StatusProposed,
+	}
+	if err := doctor.SaveSessionRecord(outside, rec); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(outside, "proposed-catalog.toml"), []byte(bareToml), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	before, err := os.ReadFile(filepath.Join(outside, "session.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The session directory is a symlink to it.
+	root := filepath.Join(a.DoctorDir, "history")
+	if err := os.MkdirAll(root, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(outside, filepath.Join(root, "20260101T000000Z")); err != nil {
+		t.Fatal(err)
+	}
+
+	if code := a.Run(); code != ExitError {
+		t.Fatalf("exit = %d, want %d; stderr: %s", code, ExitError, stderr.String())
+	}
+	if !strings.Contains(stderr.String(), "cannot install") {
+		t.Errorf("stderr = %q, want the refusal", stderr.String())
+	}
+	if !strings.Contains(stderr.String(), "symlink leaves the sessions directory") {
+		t.Errorf("stderr = %q, want the reason", stderr.String())
+	}
+	if strings.Contains(stderr.String(), "outside-secret") {
+		t.Errorf("the refusal echoed the link target: %q", stderr.String())
+	}
+	// Nothing outside the sessions directory was written.
+	after, err := os.ReadFile(filepath.Join(outside, "session.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(after) != string(before) {
+		t.Errorf("the record outside the sessions directory was rewritten:\n%s", after)
+	}
+	// And nothing was installed.
+	if _, err := os.Stat(filepath.Join(a.CatalogDir, "sh-probe.toml")); !os.IsNotExist(err) {
+		t.Error("installed from a session outside the sessions directory")
+	}
+}
+
+// A symlink that stays inside the sessions directory is a session:
+// --install installs from it, so the listing and the install agree.
+func TestDoctorInstallCmd_SymlinkInsideRootInstalls(t *testing.T) {
+	a, stdout, stderr, sd, _, _ := newTestApp(t, []string{"doctor", "--install", "20260101T000000Z"}, nil)
+	wireDoctor(t, a, &stubAgent{}, shRunner())
+	makeInteractive(a, "y")
+	// The real session, and a symlink to it that is also inside the
+	// sessions directory.
+	real := seedSession(t, a.DoctorDir, "20260102T000000Z", "sh", "proposed", bareToml)
+	if err := os.Symlink(real, filepath.Join(a.DoctorDir, "history", "20260101T000000Z")); err != nil {
+		t.Fatal(err)
+	}
+	sd.instances = []detect.Instance{shInstance()}
+
+	if code := a.Run(); code != ExitOK {
+		t.Fatalf("exit = %d, want 0; stderr: %s", code, stderr.String())
+	}
+	if !strings.Contains(stdout.String(), "installed: ") {
+		t.Errorf("stdout missing the install result:\n%s", stdout.String())
+	}
+	b, err := os.ReadFile(filepath.Join(a.CatalogDir, "sh-probe.toml"))
+	if err != nil || string(b) != bareToml {
+		t.Errorf("installed content = %q, %v", string(b), err)
+	}
+	// The record lands in the session the link points at.
+	rec, err := doctor.LoadSessionRecord(real)
+	if err != nil || rec.Status != doctor.StatusInstalled {
+		t.Errorf("session record = %+v, %v; want installed", rec, err)
+	}
+}
+
+// A sessions directory that is itself a symlink — a config directory
+// kept in a dotfiles repo is a common way to get one — still contains
+// its own sessions: the boundary is the RESOLVED root.
+func TestDoctorCmd_SessionsRootIsSymlink(t *testing.T) {
+	// The doctor directory's history/ is a symlink to somewhere else.
+	elsewhere := filepath.Join(t.TempDir(), "elsewhere")
+	if err := os.MkdirAll(filepath.Join(elsewhere, "history"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	doctorDir := filepath.Join(t.TempDir(), "doctor")
+	if err := os.MkdirAll(doctorDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(filepath.Join(elsewhere, "history"), filepath.Join(doctorDir, "history")); err != nil {
+		t.Fatal(err)
+	}
+
+	a, stdout, stderr, _, _, _ := newTestApp(t, []string{"doctor", "--list"}, nil)
+	wireDoctor(t, a, &stubAgent{}, shRunner())
+	a.DoctorDir = doctorDir
+	seedSession(t, a.DoctorDir, "20260101T000000Z", "sh", "proposed", bareToml)
+
+	if code := a.Run(); code != ExitOK {
+		t.Fatalf("exit = %d, want 0; stderr: %s", code, stderr.String())
+	}
+	if !strings.Contains(stdout.String(), "20260101T000000Z  sh  proposed") {
+		t.Errorf("the listing missed the session behind a symlinked root:\n%s", stdout.String())
+	}
+
+	// And the install reaches it too.
+	b, _, stderr2, sd, _, _ := newTestApp(t, []string{"doctor", "--install", "20260101T000000Z"}, nil)
+	wireDoctor(t, b, &stubAgent{}, shRunner())
+	b.DoctorDir = doctorDir
+	makeInteractive(b, "y")
+	sd.instances = []detect.Instance{shInstance()}
+
+	if code := b.Run(); code != ExitOK {
+		t.Fatalf("exit = %d, want 0; stderr: %s", code, stderr2.String())
+	}
+	if _, err := os.Stat(filepath.Join(b.CatalogDir, "sh-probe.toml")); err != nil {
+		t.Errorf("installed behind a symlinked sessions root: %v", err)
+	}
+}
+
 // Advisory: a write error that echoes the configured catalog path is
 // rendered terminal-safe.
 func TestDoctorCmd_WriteErrorRenderedSafely(t *testing.T) {
