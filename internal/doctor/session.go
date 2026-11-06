@@ -159,7 +159,9 @@ type SessionEntry struct {
 // Three kinds of entry come back:
 //
 //   - a session: a real directory, or a symlink whose target resolves
-//     inside root. Both are listed, and both can be installed from.
+//     inside root. Both are listed. Only one whose name is a valid
+//     session ID can be installed from — the caller checks the name
+//     with ValidSessionID first.
 //   - a skipped entry: a symlink that leaves the sessions directory,
 //     dangles, or names a file. It carries the reason, so the caller
 //     can say so out loud instead of dropping it silently.
@@ -203,6 +205,10 @@ func ListSessions(root string) ([]SessionEntry, error) {
 // is itself a symlink (a config directory kept in a dotfiles repo)
 // still contains its own sessions.
 //
+// The id is a session NAME: the caller checks it with ValidSessionID
+// first, because an entry whose name is not a valid session id cannot
+// be installed from at all, whatever it resolves to.
+//
 // The path returned is the resolved directory, not the link, so later
 // reads and writes go to the resolved path rather than through the
 // link.
@@ -212,11 +218,16 @@ func ListSessions(root string) ([]SessionEntry, error) {
 // used at all. It does not pin anything. EvalSymlinks returns a
 // pathname, not a pinned handle, so whoever can already write inside
 // the user's own config directory could still replace the resolved
-// directory, one of its ancestors, or a file inside it — a symlinked
-// session.json, say — between this check and the later IO. Using the
-// resolved path narrows that window; it does not close it. This is an
-// accepted limit of the local filesystem: someone who can write there
-// can already change what doctor reads.
+// directory or one of its ancestors between this check and the later
+// IO. Using the resolved path narrows that window; it does not close
+// it. This is an accepted limit of the local filesystem: someone who
+// can write there can already change what doctor reads.
+//
+// Leaf symlinks INSIDE a session directory are a separate matter and
+// are still followed: the readers open session.json and
+// proposed-catalog.toml by name, so a symlinked leaf still points
+// wherever it points. That is pre-existing behaviour, tracked
+// together with handle-pinned IO in issue #61.
 func ResolveSessionDir(root, id string) (string, error) {
 	dir, reason := resolveSession(root, id)
 	if reason != "" {
@@ -256,7 +267,7 @@ func resolveSession(root, name string) (dir, reason string) {
 	}
 	// Containment is checked BEFORE the shape: a target outside the
 	// sessions directory is refused without anything else being looked
-	// at, so nothing outside is even stat'ed.
+	// at, so nothing outside is read or written.
 	if !withinRoot(realRoot, real) {
 		return "", "symlink leaves the sessions directory"
 	}
