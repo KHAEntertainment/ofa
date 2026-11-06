@@ -3,7 +3,9 @@ package state
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
+	"path/filepath"
 	"time"
 
 	"ofa/internal/detect"
@@ -69,11 +71,26 @@ func statusString(s detect.Status) string {
 	return "active"
 }
 
-// Save writes f to path as JSON.
+// Save writes f to path as JSON, creating the parent directory when it is
+// missing.
+//
+// The config directory is created here, in the writing path, rather than by
+// the caller: on a first run there is no ~/.config/ofa yet, and writing the
+// state file into a directory that does not exist failed with "no such file
+// or directory" (issue #46). Every state writer goes through Save — scan,
+// the picker's first run, the latest-version cache write-back — so creating
+// the parent here fixes them all at once.
+//
+// The mode matches config.EnsureDir: 0755, what a user gets creating the
+// directory by hand.
 func Save(path string, f *File) error {
 	b, err := json.MarshalIndent(f, "", "  ")
 	if err != nil {
 		return err
+	}
+	dir := filepath.Dir(path)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return fmt.Errorf("create %s: %w", dir, err)
 	}
 	return os.WriteFile(path, b, 0o644)
 }
