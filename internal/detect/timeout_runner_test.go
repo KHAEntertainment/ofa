@@ -221,20 +221,29 @@ func TestDefaultCommandKillsTheProcessGroup(t *testing.T) {
 // was cut short is a failure, not a successful read: a package inventory
 // read from a truncated stream is a lie the caller cannot see, while a
 // failed detector is one it can.
+//
+// The straggler must escape the command's process group: the group kill
+// takes a same-group child with the leader, and only a detached child can
+// hold the pipes open past the leader's exit. A helper that detaches with
+// setsid and holds stdout open is what such a child looks like.
 func TestDefaultCommandReportsATruncatedRead(t *testing.T) {
-	pidfile := filepath.Join(t.TempDir(), "pid")
-	// The leader succeeds at once. The child holds the pipe open past
-	// the WaitDelay and prints a line too late to be read.
+	statusfile := filepath.Join(t.TempDir(), "status")
+	self, err := filepath.Abs(os.Args[0])
+	if err != nil {
+		t.Fatalf("resolve the test binary: %v", err)
+	}
+	// The helper detaches and holds stdout open; the leader waits until
+	// the helper says it has, then exits at once — so the pipes stay
+	// open past the leader's exit.
 	script := writeScript(t, fmt.Sprintf(
-		"printf 'first line\\n'\n( /bin/sleep 3; printf 'late line\\n' ) &\necho $! > '%s.tmp'\nmv '%s.tmp' '%s'\nexit 0\n",
-		pidfile, pidfile, pidfile))
-
+		"printf 'first line\\n'\nOFA_DETACH_HELPER=1 OFA_DETACH_LATE=1 OFA_DETACH_STATUS='%s' '%s' -test.run=TestDetachedGrandchildHelper &\nwhile [ ! -f '%s' ]; do sleep 1; done\nexit 0\n",
+		statusfile, self, statusfile))
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 	out, err := DefaultCommand(ctx, script)
-	// The leader recorded its child before it exited, so the pid is
+	// The helper recorded its status before the leader exited, so it is
 	// there now; the cleanup kills it if the test fails first.
-	pid := readPID(t, pidfile)
+	pid := readDetachedStatus(t, statusfile)
 	t.Cleanup(func() { _ = syscall.Kill(pid, syscall.SIGKILL) })
 	if err == nil {
 		t.Fatalf("a truncated read returned no error (out = %q)", out)
@@ -441,6 +450,12 @@ func TestDetachedGrandchildHelper(t *testing.T) {
 		os.Exit(1)
 	}
 	writeStatus(status, fmt.Sprintf("%d %d", os.Getpid(), pgid))
+	if os.Getenv("OFA_DETACH_LATE") == "1" {
+		// A line that arrives after the reader closed the pipe is lost:
+		// that is the truncation the runner has to report.
+		time.Sleep(5 * time.Second)
+		fmt.Fprintln(os.Stdout, "late line")
+	}
 	// Hold stdout open for longer than any bound in the test.
 	time.Sleep(60 * time.Second)
 }

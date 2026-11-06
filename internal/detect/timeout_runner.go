@@ -7,8 +7,9 @@ import (
 	"os/exec"
 	"reflect"
 	"strings"
-	"syscall"
 	"time"
+
+	"ofa/internal/procgroup"
 )
 
 // This file holds the deadline-bounded runner: the same scan, but every
@@ -62,34 +63,20 @@ func (e *TimeoutError) Error() string {
 // reported as the failure it is — never as a successful read. A truncated
 // package inventory is a lie the caller cannot see, and a failed detector
 // is one the caller can.
+//
+// The process group is procgroup's: the child leads its own group, and the
+// group is killed while the leader still pins its PGID, so a timeout leaves
+// no orphan behind and the kill can never name a recycled PGID.
 func DefaultCommand(ctx context.Context, name string, args ...string) (string, error) {
 	cmd := exec.CommandContext(ctx, name, args...)
-	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
-	cmd.Cancel = func() error { return killProcessGroup(cmd) }
 	cmd.WaitDelay = commandWaitDelay
-	out, err := cmd.Output()
+	out, err := procgroup.Output(cmd)
 	return string(out), err
 }
 
 // commandWaitDelay bounds how long a command's pipes may stay open after
 // the command itself is gone.
 const commandWaitDelay = 2 * time.Second
-
-// killProcessGroup kills the child's whole process group. The child is
-// the group's leader (Setpgid), so the group takes every descendant with
-// it — a `brew` that spawned helpers must not outlive its own timeout.
-//
-// Residual window: this kill runs from os/exec's watchdog goroutine, so
-// it can fire after Process.Wait has freed the PID, which may by then
-// belong to another process; the fix is pending the sibling review's
-// verdict, so nothing changes here yet.
-func killProcessGroup(cmd *exec.Cmd) error {
-	if cmd.Process != nil {
-		_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
-		_ = cmd.Process.Kill()
-	}
-	return nil
-}
 
 // TimeoutRunner returns a Runner that runs every command through cmd
 // under a deadline of limit.
