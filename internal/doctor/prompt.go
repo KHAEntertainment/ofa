@@ -138,9 +138,11 @@ func BuildPrompt(bin string, f Facts) string {
 
 // RetryPrompt appends the previous attempt's validation error to the
 // original prompt, so the single retry the spec allows starts from the same
-// grounding plus the concrete reason the draft failed.
+// grounding plus the concrete reason the draft failed. The reason is
+// redacted: a validation error can quote a value the draft decoded, and
+// the retry prompt is both sent to the agent and persisted in context.md.
 func RetryPrompt(prompt string, verr error) string {
 	return prompt + "\n\n---\nYour previous response was rejected by ofa's mechanical validation:\n\n" +
-		verr.Error() +
+		redactSecrets(verr.Error()) +
 		"\n\nRespond again with a corrected TOML entry that satisfies every rule above."
 }

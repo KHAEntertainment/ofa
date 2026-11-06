@@ -64,7 +64,16 @@ func ValidSessionID(id string) bool {
 // the catalog write, so a crash mid-write can never destroy the record
 // --install needs to work later. The rename also forces 0600 even over
 // an older, looser file: the record names local binaries and paths.
+//
+// Every string field is redacted before encoding, as defence in depth: the
+// proposal gate already refuses an entry carrying a credential, but the
+// writer must not depend on that (redacting the JSON bytes instead would
+// miss a value that JSON encoding escaped).
 func SaveSessionRecord(dir string, rec SessionRecord) error {
+	rec.Target = redactSecrets(rec.Target)
+	rec.HarnessID = redactSecrets(rec.HarnessID)
+	rec.Status = redactSecrets(rec.Status)
+	rec.InstalledPath = redactSecrets(rec.InstalledPath)
 	b, err := json.MarshalIndent(rec, "", "  ")
 	if err != nil {
 		return fmt.Errorf("session: %w", err)
