@@ -1,13 +1,16 @@
 //go:build linux || darwin
 
-package doctor
+package procgroup
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
+	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -28,6 +31,108 @@ import (
 // generous bounds every wait. It is far above any plausible scheduling
 // delay and well below the fixtures' 60s sleeps.
 const generous = 20 * time.Second
+
+// script writes an executable bash script into a temp dir and returns its
+// path.
+func script(t *testing.T, body string) string {
+	t.Helper()
+	dir := t.TempDir()
+	p := filepath.Join(dir, "script.sh")
+	if err := os.WriteFile(p, []byte("#!/bin/bash\n"+body), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	return p
+}
+
+// parsePIDFile reads a fixture's "<grandchild> <leader>" pidfile.
+func parsePIDFile(path string) (child, leader int, ok bool) {
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return 0, 0, false
+	}
+	f := strings.Fields(string(b))
+	if len(f) != 2 {
+		return 0, 0, false
+	}
+	child, err = strconv.Atoi(f[0])
+	if err != nil {
+		return 0, 0, false
+	}
+	leader, err = strconv.Atoi(f[1])
+	if err != nil {
+		return 0, 0, false
+	}
+	return child, leader, true
+}
+
+// processGone reports whether pid is no longer running.
+func processGone(pid int) bool {
+	return syscall.Kill(pid, syscall.Signal(0)) != nil
+}
+
+// waitProcessGone polls until pid disappears or the budget expires.
+func waitProcessGone(t *testing.T, pid int, budget time.Duration) {
+	t.Helper()
+	deadline := time.Now().Add(budget)
+	for time.Now().Before(deadline) {
+		if processGone(pid) {
+			return
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	t.Fatalf("process %d still alive after %v", pid, budget)
+}
+
+// waitInLeaderGroup is the readiness handshake that lets timing-sensitive
+// assertions arm only after the fixture is in place. It returns once the
+// grandchild named in the pidfile is a member of the leader's process
+// group (its pgid is the leader's pid, which Setpgid made the group id).
+// A pidfile that merely exists proves only that the shell ran the echo,
+// and the group kill is what the assertions depend on. The fixtures write
+// "<grandchild> <leader>" to a temp file and rename it into place, so a
+// half-written pidfile is never read.
+func waitInLeaderGroup(t *testing.T, path string, budget time.Duration) int {
+	t.Helper()
+	deadline := time.Now().Add(budget)
+	for time.Now().Before(deadline) {
+		if child, leader, ok := parsePIDFile(path); ok {
+			if pgid, err := syscall.Getpgid(child); err == nil && pgid == leader {
+				return child
+			}
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	t.Fatalf("grandchild in %s never joined the leader's process group within %v", path, budget)
+	return 0
+}
+
+// hangScript: spawns a /bin/sleep 60 grandchild, then sleeps 60 itself.
+const hangScript = `#!/bin/bash
+echo started
+/bin/sleep 60 &
+echo "$! $$" > %[1]s.tmp && /bin/mv %[1]s.tmp %[1]s
+/bin/sleep 60
+`
+
+// killFixtureOnFailure kills the processes a fixture recorded when the test
+// ends, so a failed assertion leaves no sleep 60 behind. The fixtures
+// record their pids in a pidfile, so the cleanup reads it at the end: a
+// test that dies before the pidfile exists has no process to clean up.
+func killFixtureOnFailure(t *testing.T, pidfile string) {
+	t.Helper()
+	t.Cleanup(func() {
+		child, leader, ok := parsePIDFile(pidfile)
+		if !ok {
+			return
+		}
+		if child > 0 {
+			_ = syscall.Kill(child, syscall.SIGKILL)
+		}
+		if leader > 0 {
+			_ = syscall.Kill(leader, syscall.SIGKILL)
+		}
+	})
+}
 
 // startChild starts cmd and registers a cleanup that kills and reaps it if
 // the test ends before it did, so a fatal path leaves no process behind.
@@ -164,16 +269,19 @@ func TestGroupGuardRefusesAfterRelease(t *testing.T) {
 // guard's release and Wait, exactly where a late Cancel would land. The
 // post-exit kill must have been sent before release, and the late Cancel
 // must send nothing.
-func TestExecBoundedLateCancelSendsNoGroupKill(t *testing.T) {
+func TestRunLateCancelSendsNoGroupKill(t *testing.T) {
 	lateCancelRan := false
 	calls := recordGroupKills(t, func(cmd *exec.Cmd, g *groupGuard) {
 		_ = killProcessGroup(cmd, g)
 		lateCancelRan = true
 	})
 	pidfile := filepath.Join(t.TempDir(), "pid")
+	killFixtureOnFailure(t, pidfile)
 	s := script(t, fmt.Sprintf("/bin/sleep 60 &\necho \"$! $$\" > %[1]s.tmp && /bin/mv %[1]s.tmp %[1]s\nexit 0\n", pidfile))
-	if _, _, _, err := execBounded(context.Background(), s, nil, execSpec{timeout: generous}); err != nil {
-		t.Fatalf("execBounded: %v", err)
+	cmd := exec.CommandContext(context.Background(), s)
+	cmd.WaitDelay = generous
+	if err := Run(cmd); err != nil {
+		t.Fatalf("Run: %v", err)
 	}
 	if !lateCancelRan {
 		t.Fatal("beforeWait seam never ran")
@@ -192,21 +300,26 @@ func TestExecBoundedLateCancelSendsNoGroupKill(t *testing.T) {
 // before release, on a clean and on a failing exit alike. Behaviour change
 // of #28: it used to get WaitDelay longer. Without the kill, the grandchild
 // would outlive these bounded waits (it sleeps 60s).
-func TestExecBoundedKillsGroupAtLeaderExit(t *testing.T) {
+func TestRunKillsGroupAtLeaderExit(t *testing.T) {
 	for _, code := range []int{0, 3} {
 		t.Run(fmt.Sprintf("exit %d", code), func(t *testing.T) {
 			calls := recordGroupKills(t, nil)
 			pidfile := filepath.Join(t.TempDir(), "pid")
+			killFixtureOnFailure(t, pidfile)
 			s := script(t, fmt.Sprintf("/bin/sleep 60 &\necho \"$! $$\" > %[1]s.tmp && /bin/mv %[1]s.tmp %[1]s\necho done\nexit %[2]d\n", pidfile, code))
-			out, _, _, err := execBounded(context.Background(), s, nil, execSpec{timeout: generous})
+			var stdout bytes.Buffer
+			cmd := exec.CommandContext(context.Background(), s)
+			cmd.Stdout = &stdout
+			cmd.WaitDelay = generous
+			err := Run(cmd)
 			if code == 0 && err != nil {
-				t.Fatalf("execBounded: %v", err)
+				t.Fatalf("Run: %v", err)
 			}
 			if code != 0 && err == nil {
 				t.Fatal("expected the exit error")
 			}
-			if out != "done\n" {
-				t.Errorf("stdout = %q, want the parent's output", out)
+			if stdout.String() != "done\n" {
+				t.Errorf("stdout = %q, want the parent's output", stdout.String())
 			}
 			child, leader, ok := parsePIDFile(pidfile)
 			if !ok {
@@ -236,19 +349,21 @@ func waitGroupGone(t *testing.T, pgid int) {
 
 // Cancelling while the leader is blocked kills the whole group through the
 // guarded Cancel, before release. The no-reap wait is then released by the
-// leader's death and execBounded returns: no group member is left, and no
-// goroutine either (execBounded returning is the proof: the no-reap wait
-// runs on its caller's goroutine and starts none).
-func TestExecBoundedCancelWhileLeaderBlocked(t *testing.T) {
+// leader's death and Run returns: no group member is left, and no goroutine
+// either (Run returning is the proof: the no-reap wait runs on its caller's
+// goroutine and starts none).
+func TestRunCancelWhileLeaderBlocked(t *testing.T) {
 	calls := recordGroupKills(t, nil)
 	pidfile := filepath.Join(t.TempDir(), "pid")
+	killFixtureOnFailure(t, pidfile)
 	s := script(t, fmt.Sprintf(hangScript, pidfile))
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	done := make(chan error, 1)
 	go func() {
-		_, _, _, err := execBounded(ctx, s, nil, execSpec{timeout: 2 * generous})
-		done <- err
+		cmd := exec.CommandContext(ctx, s)
+		cmd.WaitDelay = 2 * generous
+		done <- Run(cmd)
 	}()
 	child := waitInLeaderGroup(t, pidfile, generous)
 	_, leader, _ := parsePIDFile(pidfile)
@@ -258,7 +373,13 @@ func TestExecBoundedCancelWhileLeaderBlocked(t *testing.T) {
 	select {
 	case err = <-done:
 	case <-time.After(generous):
-		t.Fatalf("execBounded did not return within %v of cancellation", generous)
+		t.Fatalf("Run did not return within %v of cancellation", generous)
+	}
+	// Run reports the kill; the caller maps a cancelled context to its own
+	// error, which is what doctor's execBounded does with the very same
+	// call.
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		err = ctxErr
 	}
 	if !errors.Is(err, context.Canceled) {
 		t.Errorf("err = %v, want context.Canceled", err)
@@ -274,4 +395,56 @@ func TestExecBoundedCancelWhileLeaderBlocked(t *testing.T) {
 	}
 	waitProcessGone(t, child, generous)
 	waitGroupGone(t, leader)
+}
+
+// A failing command's stderr reaches the caller through the ExitError, the
+// way exec.Cmd.Output delivers it, and never through stdout.
+func TestOutputCarriesStderrOnFailure(t *testing.T) {
+	cmd := exec.CommandContext(context.Background(), "/bin/sh", "-c", "printf oops >&2; exit 3")
+	out, err := Output(cmd)
+	if err == nil {
+		t.Fatal("a failing command returned no error")
+	}
+	var ee *exec.ExitError
+	if !errors.As(err, &ee) {
+		t.Fatalf("err = %v (%T), want an ExitError", err, err)
+	}
+	if len(out) != 0 {
+		t.Errorf("stdout = %q, want it empty", out)
+	}
+	if !strings.Contains(string(ee.Stderr), "oops") {
+		t.Errorf("ExitError.Stderr = %q, want the command's stderr", ee.Stderr)
+	}
+}
+
+// A command that wrote more than the window keeps its head and its tail,
+// and says how many bytes were left out — the window exec.Cmd.Output
+// exposes.
+func TestOutputKeepsTheStderrWindow(t *testing.T) {
+	cmd := exec.CommandContext(context.Background(), "/bin/sh", "-c",
+		`printf HEAD-MARKER >&2; head -c 100000 /dev/zero | tr "\0" "x" >&2; printf TAIL-MARKER >&2; exit 3`)
+	out, err := Output(cmd)
+	if err == nil {
+		t.Fatal("a failing command returned no error")
+	}
+	var ee *exec.ExitError
+	if !errors.As(err, &ee) {
+		t.Fatalf("err = %v (%T), want an ExitError", err, err)
+	}
+	if len(out) != 0 {
+		t.Errorf("stdout = %q, want it empty", out)
+	}
+	stderr := string(ee.Stderr)
+	if !strings.Contains(stderr, "HEAD-MARKER") {
+		t.Error("the stderr window lost the head")
+	}
+	if !strings.Contains(stderr, "TAIL-MARKER") {
+		t.Error("the stderr window lost the tail")
+	}
+	if !strings.Contains(stderr, "omitting") {
+		t.Errorf("stderr = %q, want it to report the bytes left out", stderr)
+	}
+	if len(stderr) > 64*1024+64 {
+		t.Errorf("stderr window = %d bytes, want at most 64KB plus the marker", len(stderr))
+	}
 }

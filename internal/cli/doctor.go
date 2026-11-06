@@ -171,7 +171,7 @@ func (a *App) doctorCmd(args []string) ExitCode {
 	if code != ExitOK {
 		return code
 	}
-	insts, _, code := a.runDetect(cat)
+	insts, _, code := a.doctorDetect(cat)
 	if code != ExitOK {
 		return code
 	}
@@ -264,6 +264,43 @@ func (a *App) doctorOfferInstall(res *doctor.Result) ExitCode {
 		return ExitOK
 	}
 	return a.doctorConfirmAndWrite(sessionID, res.Dir, h, res.ProposalBytes)
+}
+
+// doctorScanRunner returns the runner doctor's own scans use: the
+// unbounded production default is swapped for the deadline-bounded one,
+// so a hung package manager degrades into a failure for its method
+// instead of stalling the command. An injected runner passes through
+// untouched — the same swap pattern as doctor.BoundedRunnerFor.
+func (a *App) doctorScanRunner() detect.Runner {
+	return detect.TimeoutRunnerFor(a.DetectRunner, detect.DefaultCommandTimeout)
+}
+
+// doctorDetect is doctor's own detect step: the policy runDetect
+// applies — a detector that failed is reported, and a scan that found
+// nothing because every detector failed is an error rather than an empty
+// report — over a runner whose every command has a deadline.
+//
+// It is deliberately NOT runDetect: runDetect is shared with scan,
+// check, apply and the picker, and those keep the unbounded default, so
+// their behaviour is unchanged.
+func (a *App) doctorDetect(cat []catalog.Harness) ([]detect.Instance, []detect.Failure, ExitCode) {
+	insts, failures, err := a.DetectFn(cat, a.doctorScanRunner())
+	if err != nil {
+		fmt.Fprintf(a.Stderr, "ofa: doctor: scan: %v\n", err)
+		return nil, nil, ExitError
+	}
+	if len(failures) > 0 {
+		// One report, in the shared format: the warning names the method
+		// and the reason, and the undetectable lines name the harnesses
+		// the failed detector left unknown.
+		a.reportDetectionFailures(cat, insts, failures)
+		if len(insts) == 0 {
+			// Every result we would have shown came from a detector that
+			// failed, so an empty report would be a lie about this machine.
+			return nil, failures, ExitError
+		}
+	}
+	return insts, failures, ExitOK
 }
 
 // doctorConfirmAndWrite asks the install question (default No) and, on a
@@ -376,10 +413,15 @@ func (a *App) doctorPostInstallScan(h catalog.Harness) ExitCode {
 	if code != ExitOK {
 		return code
 	}
-	insts, _, err := a.DetectFn(cat, a.DetectRunner)
+	insts, failures, err := a.DetectFn(cat, a.doctorScanRunner())
 	if err != nil {
 		fmt.Fprintf(a.Stderr, "ofa: doctor: could not scan after install: %v\n", err)
 		return ExitError
+	}
+	if len(failures) > 0 {
+		// The same shared report the gap check uses: these failures were
+		// discarded outright before.
+		a.reportDetectionFailures(cat, insts, failures)
 	}
 	var shadowed []detect.Instance
 	for _, in := range insts {

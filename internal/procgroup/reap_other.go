@@ -1,6 +1,6 @@
 //go:build !linux && !darwin
 
-package doctor
+package procgroup
 
 import "errors"
 
@@ -14,5 +14,5 @@ import "errors"
 // the runner, and a timeout is enforced only by os/exec killing the leader
 // WaitDelay after the deadline. ofa ships only for Linux and macOS.
 func waitLeaderExit(int) error {
-	return errors.New("doctor runner: no exit wait without reaping on this platform")
+	return errors.New("procgroup: no exit wait without reaping on this platform")
 }

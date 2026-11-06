@@ -1,6 +1,6 @@
 //go:build darwin
 
-package doctor
+package procgroup
 
 import "syscall"
 

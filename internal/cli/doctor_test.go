@@ -276,6 +276,163 @@ func TestDoctorCmd_AgentFlagClaudeOnly(t *testing.T) {
 	}
 }
 
+// registryFixtureLoader returns a catalog with one harness installed two
+// ways: through npm (which answers) and through brew (which can hang).
+// The bins are names that are not on PATH, so the gap list is empty
+// whatever the machine running the suite looks like.
+//
+// One harness, not two: a harness that some detector DID find is not
+// reported as undetectable, so the failed brew method is reported once
+// and only once.
+func registryFixtureLoader() func() ([]catalog.Harness, []catalog.Problem, error) {
+	return func() ([]catalog.Harness, []catalog.Problem, error) {
+		return []catalog.Harness{
+			{
+				ID:   "tool",
+				Name: "tool",
+				Installs: []catalog.Install{
+					{
+						Method:  "npm",
+						Package: "ofa-npm-tool",
+						Bin:     "ofa-npm-tool-bin",
+						Version: catalog.CmdSpec{Cmd: []string{"ofa-npm-tool-bin", "--version"}},
+					},
+					{
+						Method:  "brew-formula",
+						Package: "ofa-brew-tool",
+						Bin:     "ofa-brew-tool-bin",
+						Version: catalog.CmdSpec{Cmd: []string{"ofa-brew-tool-bin", "--version"}},
+					},
+				},
+			},
+		}, nil, nil
+	}
+}
+
+// hungBrewCommand answers npm and hangs on brew until its deadline.
+func hungBrewCommand() detect.Command {
+	return func(ctx context.Context, name string, args ...string) (string, error) {
+		switch name {
+		case "brew":
+			<-ctx.Done()
+			return "", ctx.Err()
+		case "npm":
+			return `{"dependencies":{"ofa-npm-tool":{"version":"1.2.3"}}}`, nil
+		}
+		return "", errors.New("hungBrewCommand: no response for " + name)
+	}
+}
+
+// A hung registry query must degrade into a failure for that method:
+// doctor prints which method timed out, and the gap check still
+// completes with the installs it did get.
+func TestDoctorCmd_GapCheckTimesOutAHungRegistry(t *testing.T) {
+	a, stdout, stderr, _, _, _ := newTestApp(t, []string{"doctor"}, nil)
+	agent := &stubAgent{}
+	wireDoctor(t, a, agent, shRunner())
+	a.CatalogLoader = registryFixtureLoader()
+	// The real scan, over a runner whose commands have a deadline.
+	a.DetectFn = detect.Scan
+	a.DetectRunner = detect.TimeoutRunner(hungBrewCommand(), 50*time.Millisecond)
+
+	start := time.Now()
+	code := a.Run()
+	elapsed := time.Since(start)
+	if code != ExitOK {
+		t.Fatalf("exit = %d, want %d (the gap check continues); stderr: %s", code, ExitOK, stderr.String())
+	}
+	// The failure is reported once, naming the method and the reason, in
+	// the shared format every command uses.
+	if got := strings.Count(stderr.String(), "brew-formula"); got != 1 {
+		t.Errorf("stderr names brew-formula %d times, want 1: %s", got, stderr.String())
+	}
+	if got := strings.Count(stderr.String(), "timed out"); got != 1 {
+		t.Errorf("stderr reports the timeout %d times, want 1: %s", got, stderr.String())
+	}
+	if !strings.Contains(stderr.String(), "brew-formula detector failed: timed out") {
+		t.Errorf("stderr = %q, want the failed method and its reason", stderr.String())
+	}
+	// The method that answered is not reported as failed.
+	if strings.Contains(stderr.String(), "npm detector failed") {
+		t.Errorf("stderr = %q, want the healthy method left alone", stderr.String())
+	}
+	// The gap check completed with what it had.
+	if !strings.Contains(stdout.String(), "no gaps") {
+		t.Errorf("stdout = %q, want the gap check to complete", stdout.String())
+	}
+	if agent.calls != 0 {
+		t.Errorf("the agent ran %d times for a gap check with no gaps", agent.calls)
+	}
+	// Generous bound: the deadline is 50ms, so a runner that waited for
+	// the hung command would blow straight past this.
+	if elapsed > 10*time.Second {
+		t.Errorf("the gap check took %v for a 50ms deadline", elapsed)
+	}
+}
+
+// The gap check bounds the production default and leaves an injected
+// runner exactly as it was.
+func TestDoctorScanBoundsOnlyTheDefaultRunner(t *testing.T) {
+	a, _, _, _, _, _ := newTestApp(t, []string{"doctor"}, nil)
+	wireDoctor(t, a, &stubAgent{}, shRunner())
+	a.CatalogLoader = fixtureLoader("sh")
+	var got detect.Runner
+	a.DetectFn = func(cat []catalog.Harness, run detect.Runner) ([]detect.Instance, []detect.Failure, error) {
+		got = run
+		return nil, nil, nil
+	}
+	a.DetectRunner = detect.DefaultRunner
+	a.Run()
+	if got == nil {
+		t.Fatal("the gap check passed no runner to the scan")
+	}
+	if detect.IsDefaultRunner(got) {
+		t.Error("the gap check ran with the unbounded default runner")
+	}
+
+	// An injected runner is passed through untouched.
+	b, _, _, _, _, _ := newTestApp(t, []string{"doctor"}, nil)
+	wireDoctor(t, b, &stubAgent{}, shRunner())
+	b.CatalogLoader = fixtureLoader("sh")
+	var gotInjected detect.Runner
+	b.DetectFn = func(cat []catalog.Harness, run detect.Runner) ([]detect.Instance, []detect.Failure, error) {
+		gotInjected = run
+		return nil, nil, nil
+	}
+	injected := func(name string, args ...string) (string, error) { return "sentinel", nil }
+	b.DetectRunner = injected
+	b.Run()
+	if gotInjected == nil {
+		t.Fatal("the gap check passed no runner to the scan")
+	}
+	if out, err := gotInjected("anything"); out != "sentinel" || err != nil {
+		t.Errorf("the injected runner was replaced: out = %q, err = %v", out, err)
+	}
+}
+
+// scan and check keep the unbounded default: only doctor's own scans are
+// bounded, so the other commands behave exactly as before.
+func TestScanAndCheckKeepTheUnboundedRunner(t *testing.T) {
+	for _, cmd := range []string{"scan", "check"} {
+		t.Run(cmd, func(t *testing.T) {
+			a, _, _, _, _, _ := newTestApp(t, []string{cmd}, nil)
+			var got detect.Runner
+			a.DetectFn = func(cat []catalog.Harness, run detect.Runner) ([]detect.Instance, []detect.Failure, error) {
+				got = run
+				return nil, nil, nil
+			}
+			a.DetectRunner = detect.DefaultRunner
+			a.Run()
+			if got == nil {
+				t.Fatalf("%s passed no runner to the scan", cmd)
+			}
+			if !detect.IsDefaultRunner(got) {
+				t.Errorf("%s received a wrapped runner; it must keep the unbounded default", cmd)
+			}
+		})
+	}
+}
+
 func TestDoctorCmd_DetectFailurePropagates(t *testing.T) {
 	a, _, stderr, sd, _, _ := newTestApp(t, []string{"doctor", "sh"}, nil)
 	agent := &stubAgent{}
@@ -1196,6 +1353,67 @@ func TestDoctorCmd_PostInstallScanPrefersActiveInstance(t *testing.T) {
 	}
 	if !strings.Contains(stdout2.String(), "(not the live install on PATH)") {
 		t.Errorf("stdout missing the shadowed note:\n%s", stdout2.String())
+	}
+}
+
+// postInstallScanRun drives the install flow and returns what the
+// post-install re-scan reported, together with the runner it was given.
+// The re-scan's scan is stubbed: it fails, and records the runner it
+// received.
+func postInstallScanRun(t *testing.T, runner detect.Runner) (string, detect.Runner) {
+	t.Helper()
+	a, _, stderr, _, _, _ := newTestApp(t, []string{"doctor", "sh"}, nil)
+	wireDoctor(t, a, &stubAgent{responses: []string{shEntry}}, shRunner())
+	makeInteractive(a, "y")
+	a.CatalogLoader = fixtureLoader("sh")
+	var got detect.Runner
+	a.DetectFn = func(_ []catalog.Harness, run detect.Runner) ([]detect.Instance, []detect.Failure, error) {
+		// The gap check runs before the install; the re-scan after it.
+		if _, err := os.Stat(filepath.Join(a.DoctorDir, "history")); err == nil {
+			got = run
+			return nil, []detect.Failure{{
+				Method: "brew-formula",
+				Err:    errors.New("timed out after 30s running brew list --versions"),
+			}}, nil
+		}
+		return nil, nil, nil
+	}
+	a.DetectRunner = runner
+	if code := a.Run(); code != ExitError {
+		t.Fatalf("exit = %d, want %d (the install was not detected); stderr: %s", code, ExitError, stderr.String())
+	}
+	return stderr.String(), got
+}
+
+// The post-install re-scan used to discard its failures outright. It now
+// reports them, in the same shared format the gap check uses.
+func TestDoctorCmd_PostInstallScanReportsFailures(t *testing.T) {
+	stderr, got := postInstallScanRun(t, detect.DefaultRunner)
+	if !strings.Contains(stderr, "brew-formula detector failed: timed out after 30s running brew list --versions") {
+		t.Errorf("stderr = %q, want the post-install failure reported", stderr)
+	}
+	if n := strings.Count(stderr, "brew-formula"); n != 1 {
+		t.Errorf("stderr names brew-formula %d times, want 1: %s", n, stderr)
+	}
+	// The re-scan ran over the bounded runner, not the unbounded default:
+	// the swap is the only thing that can change the runner here.
+	if got == nil {
+		t.Fatal("the post-install re-scan passed no runner to the scan")
+	}
+	if detect.IsDefaultRunner(got) {
+		t.Error("the post-install re-scan ran with the unbounded default runner")
+	}
+}
+
+// The post-install re-scan leaves an injected runner exactly as it was.
+func TestDoctorCmd_PostInstallScanKeepsAnInjectedRunner(t *testing.T) {
+	injected := func(name string, args ...string) (string, error) { return "sentinel", nil }
+	_, got := postInstallScanRun(t, injected)
+	if got == nil {
+		t.Fatal("the post-install re-scan passed no runner to the scan")
+	}
+	if out, err := got("anything"); out != "sentinel" || err != nil {
+		t.Errorf("the injected runner was replaced: out = %q, err = %v", out, err)
 	}
 }
 

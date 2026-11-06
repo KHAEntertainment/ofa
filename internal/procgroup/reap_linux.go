@@ -1,6 +1,6 @@
 //go:build linux
 
-package doctor
+package procgroup
 
 import (
 	"syscall"
