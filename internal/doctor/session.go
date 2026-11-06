@@ -203,9 +203,20 @@ func ListSessions(root string) ([]SessionEntry, error) {
 // is itself a symlink (a config directory kept in a dotfiles repo)
 // still contains its own sessions.
 //
-// The path returned is the resolved directory, not the link: every read
-// and write after this call goes to the place that was verified, so a
-// link swapped afterwards cannot redirect them.
+// The path returned is the resolved directory, not the link, so later
+// reads and writes go to the resolved path rather than through the
+// link.
+//
+// What this guarantees is the STATIC escape: a session directory that
+// points outside the sessions directory when it is resolved cannot be
+// used at all. It does not pin anything. EvalSymlinks returns a
+// pathname, not a pinned handle, so whoever can already write inside
+// the user's own config directory could still replace the resolved
+// directory, one of its ancestors, or a file inside it — a symlinked
+// session.json, say — between this check and the later IO. Using the
+// resolved path narrows that window; it does not close it. This is an
+// accepted limit of the local filesystem: someone who can write there
+// can already change what doctor reads.
 func ResolveSessionDir(root, id string) (string, error) {
 	dir, reason := resolveSession(root, id)
 	if reason != "" {
@@ -215,8 +226,8 @@ func ResolveSessionDir(root, id string) (string, error) {
 }
 
 // resolveSession resolves one entry of the sessions directory to the
-// directory doctor may read and write, and the reason it cannot when it
-// cannot. An empty reason means the entry is a usable session.
+// directory doctor may use, and the reason it cannot when it cannot.
+// An empty reason means the entry is a usable session.
 //
 // The reasons never name a path: they say what kind of entry it is, so
 // a link target crafted to look like something else cannot put a path

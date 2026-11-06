@@ -1536,16 +1536,19 @@ func TestStdinIsTTY_NonTerminalInputs(t *testing.T) {
 	}
 
 	// The positive case needs a real terminal, which a machine without a
-	// controlling terminal (a CI runner) does not have.
-	tty, err := os.OpenFile("/dev/tty", os.O_RDWR, 0)
-	if err != nil {
-		t.Logf("no controlling terminal here (%v): the positive case is not exercised", err)
-		return
-	}
-	t.Cleanup(func() { tty.Close() })
-	if !stdinIsTTY(tty) {
-		t.Error("stdinIsTTY(a controlling terminal) = false, want true")
-	}
+	// controlling terminal (a CI runner) does not have. It is a skip
+	// rather than a pass: the default output says SKIP, so a run that
+	// never checked the positive case cannot read as one that did.
+	t.Run("a controlling terminal is a terminal", func(t *testing.T) {
+		tty, err := os.OpenFile("/dev/tty", os.O_RDWR, 0)
+		if err != nil {
+			t.Skipf("no controlling terminal here (%v)", err)
+		}
+		defer tty.Close()
+		if !stdinIsTTY(tty) {
+			t.Error("stdinIsTTY(a controlling terminal) = false, want true")
+		}
+	})
 }
 
 // The issue's exact case: /dev/zero is a character device, so the mode

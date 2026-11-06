@@ -108,7 +108,8 @@ func stdinIsTTY(r io.Reader) bool {
 	// The real question, asked of the device itself: is this a
 	// terminal? A character device that is not one — /dev/zero above
 	// all — answers no, and a non-interactive stdin must never look
-	// interactive.
+	// interactive. Fd() can switch a Go-managed nonblocking tty to
+	// blocking mode — harmless for the stdin of a one-shot command.
 	return term.IsTerminal(f.Fd())
 }
 
@@ -489,8 +490,12 @@ func (a *App) doctorInstallCmd(sessionID string) ExitCode {
 	// sessions directory before anything is read or written: a
 	// symlinked session that points outside it is refused, so no
 	// proposal is read from outside and no record is written outside
-	// either. The path used from here on is the resolved one, so a
-	// link swapped later cannot redirect the read or the write.
+	// either. The path used from here on is the resolved one, which
+	// keeps the later IO off the link. It does not pin it: a swap of
+	// the resolved directory, of one of its ancestors, or of a file
+	// inside it, by someone who can already write in the user's own
+	// config directory is still possible — an accepted limit of the
+	// local filesystem, not a guarantee this check makes.
 	root := filepath.Join(a.DoctorDir, "history")
 	dir, err := doctor.ResolveSessionDir(root, sessionID)
 	if err != nil {

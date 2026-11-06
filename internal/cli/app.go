@@ -115,8 +115,10 @@ type App struct {
 	StderrIsTTY func(io.Writer) bool
 
 	// StdinIsTTY reports whether doctor's install prompt may read an
-	// interactive answer from Stdin. Same stat-based check as
-	// StderrIsTTY; tests override it so the prompt and the
+	// interactive answer from Stdin. The default is stricter than
+	// StderrIsTTY's stat-based check: it asks the device itself (a
+	// termios ioctl) whether stdin is a real terminal, and excludes
+	// /dev/null; tests override it so the prompt and the
 	// non-interactive branch are both reachable without a real terminal.
 	StdinIsTTY func(io.Reader) bool
 
