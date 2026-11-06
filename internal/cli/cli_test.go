@@ -683,14 +683,51 @@ func TestApplyCmd_NoPromptSkipsOnN(t *testing.T) {
 	sr.res = []resolve.Resolution{
 		{HarnessID: "claude", Method: "native", Bin: "claude", Cur: "2.1.300", Tier: "self"},
 	}
-	if code := a.Run(); code != ExitOK {
-		t.Errorf("apply with 'n' exit = %d, want %d", code, ExitOK)
+	if code := a.Run(); code != ExitCancelled {
+		t.Errorf("apply with 'n' exit = %d, want %d", code, ExitCancelled)
 	}
 	if !strings.Contains(err.String(), "aborted") {
 		t.Errorf("stderr should say aborted, got %q", err.String())
 	}
 	if len(exec.calls) != 0 {
 		t.Errorf("executor should not run when user says 'n', got %d calls", len(exec.calls))
+	}
+}
+
+// An EOF on stdin (empty input — a pipe, /dev/null, a closed fd) is a
+// declined confirmation: it must exit ExitCancelled, not ExitOK, so scripts
+// can tell a cancelled update from a completed one.
+func TestApplyCmd_DeclinedEOF(t *testing.T) {
+	a, _, err, sd, sr, exec := newTestApp(t, []string{"apply"}, strings.NewReader(""))
+	sd.instances = []detect.Instance{
+		{HarnessID: "claude", Method: "native", Bin: "claude", Version: "2.1.300", Status: detect.Active},
+	}
+	sr.res = []resolve.Resolution{
+		{HarnessID: "claude", Method: "native", Bin: "claude", Cur: "2.1.300", Tier: "self"},
+	}
+	if code := a.Run(); code != ExitCancelled {
+		t.Errorf("apply with EOF stdin exit = %d, want %d", code, ExitCancelled)
+	}
+	if !strings.Contains(err.String(), "aborted") {
+		t.Errorf("stderr should say aborted, got %q", err.String())
+	}
+	if len(exec.calls) != 0 {
+		t.Errorf("executor should not run on EOF, got %d calls", len(exec.calls))
+	}
+}
+
+// The usage text documents the exit codes; this pins ExitCancelled's
+// meaning there so the docs cannot silently drift from the constant.
+func TestUsage_MentionsExitCancelled(t *testing.T) {
+	var out bytes.Buffer
+	a := New(nil, nil, io.Discard, &out)
+	a.usage()
+	got := out.String()
+	if !strings.Contains(got, "3  cancelled") {
+		t.Errorf("usage text missing exit code 3 line, got:\n%s", got)
+	}
+	if !strings.Contains(got, "confirmation declined") {
+		t.Errorf("usage text missing ExitCancelled meaning, got:\n%s", got)
 	}
 }
 

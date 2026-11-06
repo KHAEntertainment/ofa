@@ -144,6 +144,10 @@ $ ofa scan              # detect + write state, report drift since last scan
 $ ofa doctor <bin>      # agent-drafted catalog entry for an undetected binary
 ```
 
+`ofa apply` without `--yes` exits `3` (cancelled) when the confirmation is
+declined or stdin is EOF — so a script can tell a cancelled update from a
+completed one (`--yes` and `--dry-run` exit codes are unchanged).
+
 `ofa check --json` is the scriptable variant:
 
 ```json

@@ -9,6 +9,7 @@
 //	0  success — no updates available, apply had no failures, scan succeeded
 //	1  updates pending (check) OR apply had failures
 //	2  usage / scan / runtime error
+//	3  cancelled — apply's confirmation was declined (or stdin hit EOF)
 //
 // The CLI never assumes a TTY; the apply command prompts only when the
 // user did not pass --yes.
@@ -36,6 +37,10 @@ const (
 	ExitOK             ExitCode = 0
 	ExitUpdatesPending ExitCode = 1
 	ExitError          ExitCode = 2
+	// ExitCancelled is a declined confirmation (or EOF on stdin) during
+	// `ofa apply` without --yes. Distinct from ExitUpdatesPending, which
+	// `check` reserves for "updates pending" and apply uses for failures.
+	ExitCancelled ExitCode = 3
 )
 
 // version is the build version. It is a var, not a const, so the
@@ -231,7 +236,13 @@ Usage:
   --refresh           re-query registries instead of cached latest versions
                       (accepted by: ofa, ofa check, ofa apply)
   ofa --version       print version
-  ofa --help          this message`)
+  ofa --help          this message
+
+Exit codes:
+  0  success
+  1  updates pending (check) OR apply had failures
+  2  usage / scan / runtime error
+  3  cancelled — apply confirmation declined or stdin EOF (no --yes)`)
 }
 
 // loadConfig reads the user config and records its pins on the App. A
