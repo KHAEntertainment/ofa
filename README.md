@@ -2,7 +2,7 @@
 
 A single command to detect, version-check, and update every coding harness on your machine.
 
-[![Built with Showrunner](https://svg.khaentertainment.com/badge.svg?theme=midnight&anim=both)](https://svg.khaentertainment.com/go)
+[![Built with Showrunner](https://svg.khaentertainment.com/badge.svg?theme=midnight&anim=both&project=KHAEntertainment/ofa)](https://svg.khaentertainment.com/go?project=KHAEntertainment/ofa)
 
 <p align="center">
   <img src="./docs/screenshot.png" alt="The OFA interactive picker listing installed harnesses and their available updates" width="638">
