@@ -10,6 +10,8 @@ import (
 	"path/filepath"
 	"strings"
 
+	"github.com/charmbracelet/x/term"
+
 	"ofa/internal/catalog"
 	"ofa/internal/detect"
 	"ofa/internal/doctor"
@@ -69,13 +71,25 @@ func boolFlag(fl *flag.Flag) bool {
 }
 
 // stdinIsTTY is the default StdinIsTTY gate for doctor's install prompt.
-// It mirrors stderrIsTTY (picker.go) on the cheap ModeCharDevice check,
-// with one exception the mode check alone gets wrong: /dev/null IS a
-// character device, so `ofa doctor < /dev/null` would look interactive
-// and prompt at a bottomless EOF. A stdin that is the same file as
-// /dev/null is therefore not a terminal. Doctor only ever prompts — and
-// only ever installs — when this is true; a non-interactive stdin gets
-// the --install command printed instead.
+// It keeps the cheap character-device check isTerminal does, and adds
+// the two exceptions that check alone gets wrong.
+//
+// The mode check is not enough: /dev/null IS a character device, so
+// `ofa doctor < /dev/null` would look interactive and prompt at a
+// bottomless EOF. A stdin that is the same file as /dev/null is
+// therefore not a terminal.
+//
+// But the exception list is endless. /dev/zero, /dev/random and every
+// other device node is a character device too, and each of them would
+// look interactive just the same. Only the device itself can tell them
+// apart: a real terminal is the one that answers the termios ioctl.
+// That check never reads, so it cannot block at EOF, and it can only
+// ever turn an interactive stdin into a non-interactive one — never
+// the other way round.
+//
+// Doctor only ever prompts — and only ever installs — when this is
+// true; a non-interactive stdin gets the --install command printed
+// instead.
 func stdinIsTTY(r io.Reader) bool {
 	f, ok := r.(*os.File)
 	if !ok {
@@ -91,7 +105,11 @@ func stdinIsTTY(r io.Reader) bool {
 	if nullSt, nerr := os.Stat(os.DevNull); nerr == nil && os.SameFile(st, nullSt) {
 		return false
 	}
-	return true
+	// The real question, asked of the device itself: is this a
+	// terminal? A character device that is not one — /dev/zero above
+	// all — answers no, and a non-interactive stdin must never look
+	// interactive.
+	return term.IsTerminal(f.Fd())
 }
 
 // doctorCmd implements `ofa doctor [<bin>] [--agent claude]`,

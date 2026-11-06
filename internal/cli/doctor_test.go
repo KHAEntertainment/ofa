@@ -1467,6 +1467,168 @@ func TestDoctorCmd_DevNullStdinIsNotInteractive(t *testing.T) {
 	}
 }
 
+// The install prompt may only be shown to someone who is actually
+// there. A regular file, a directory, /dev/null, /dev/zero and a pipe
+// are all non-interactive — and the last two are character devices, so
+// the mode check alone calls them terminals.
+func TestStdinIsTTY_NonTerminalInputs(t *testing.T) {
+	type tc struct {
+		name string
+		r    io.Reader
+		want bool
+	}
+	dir := t.TempDir()
+
+	regular := filepath.Join(dir, "regular")
+	if err := os.WriteFile(regular, []byte("y\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	regularFile, err := os.Open(regular)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { regularFile.Close() })
+
+	// A directory: openable and statable, and not something to read an
+	// answer from.
+	dirFile, err := os.Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { dirFile.Close() })
+
+	devNull, err := os.Open(os.DevNull)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { devNull.Close() })
+
+	// /dev/zero is where the device-node case shows up: a character
+	// device that is not a terminal. It is not present everywhere.
+	devZero, err := os.Open("/dev/zero")
+	if err != nil {
+		t.Logf("/dev/zero is not available here: %v", err)
+	} else {
+		t.Cleanup(func() { devZero.Close() })
+	}
+
+	pipeReader, pipeWriter, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { pipeReader.Close(); pipeWriter.Close() })
+
+	cases := []tc{
+		{"regular file", regularFile, false},
+		{"directory", dirFile, false},
+		{"/dev/null", devNull, false},
+		{"pipe", pipeReader, false},
+		{"bytes buffer", &bytes.Buffer{}, false},
+		{"nil", nil, false},
+	}
+	if devZero != nil {
+		cases = append(cases, tc{"/dev/zero", devZero, false})
+	}
+	for _, c := range cases {
+		if got := stdinIsTTY(c.r); got != c.want {
+			t.Errorf("stdinIsTTY(%s) = %v, want %v", c.name, got, c.want)
+		}
+	}
+
+	// The positive case needs a real terminal, which a machine without a
+	// controlling terminal (a CI runner) does not have.
+	tty, err := os.OpenFile("/dev/tty", os.O_RDWR, 0)
+	if err != nil {
+		t.Logf("no controlling terminal here (%v): the positive case is not exercised", err)
+		return
+	}
+	t.Cleanup(func() { tty.Close() })
+	if !stdinIsTTY(tty) {
+		t.Error("stdinIsTTY(a controlling terminal) = false, want true")
+	}
+}
+
+// The issue's exact case: /dev/zero is a character device, so the mode
+// check alone mistakes it for a terminal. The install prompt must not
+// appear for it — a device that never answers cannot be answered — and
+// nothing may be installed.
+func TestDoctorCmd_DevZeroStdinIsNotInteractive(t *testing.T) {
+	f, err := os.Open("/dev/zero")
+	if err != nil {
+		t.Skipf("/dev/zero is not available: %v", err)
+	}
+	t.Cleanup(func() { f.Close() })
+	a, stdout, stderr, sd, _, _ := newTestApp(t, []string{"doctor", "sh"}, nil)
+	wireDoctor(t, a, &stubAgent{responses: []string{shEntry}}, shRunner())
+	a.Stdin = f
+	sd.instances = nil
+
+	if code := a.Run(); code != ExitOK {
+		t.Fatalf("exit = %d, want 0; stderr: %s", code, stderr.String())
+	}
+	if strings.Contains(stderr.String(), "Install to") {
+		t.Errorf("a /dev/zero stdin was prompted: %s", stderr.String())
+	}
+	if !strings.Contains(stdout.String(), "to install it, run: ofa doctor --install") {
+		t.Errorf("stdout missing the --install suggestion:\n%s", stdout.String())
+	}
+	if _, err := os.Stat(filepath.Join(a.CatalogDir, "sh-probe.toml")); !os.IsNotExist(err) {
+		t.Error("a /dev/zero stdin installed into the user catalog")
+	}
+}
+
+// A non-interactive stdin must never install, whatever it carries: a
+// file or a pipe holding "y" is not a person saying yes.
+func TestDoctorCmd_NonInteractiveStdinNeverInstalls(t *testing.T) {
+	type tc struct {
+		name string
+		r    io.Reader
+	}
+	dir := t.TempDir()
+
+	yesFile := filepath.Join(dir, "yes")
+	if err := os.WriteFile(yesFile, []byte("y\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	file, err := os.Open(yesFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { file.Close() })
+
+	pipeReader, pipeWriter, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { pipeReader.Close(); pipeWriter.Close() })
+	if _, err := pipeWriter.WriteString("y\n"); err != nil {
+		t.Fatal(err)
+	}
+
+	for _, c := range []tc{
+		{"a file holding y", file},
+		{"a pipe holding y", pipeReader},
+	} {
+		a, stdout, stderr, sd, _, _ := newTestApp(t, []string{"doctor", "sh"}, nil)
+		wireDoctor(t, a, &stubAgent{responses: []string{shEntry}}, shRunner())
+		a.Stdin = c.r
+		sd.instances = nil
+
+		if code := a.Run(); code != ExitOK {
+			t.Errorf("%s: exit = %d, want 0; stderr: %s", c.name, code, stderr.String())
+		}
+		if strings.Contains(stderr.String(), "Install to") {
+			t.Errorf("%s: was prompted: %s", c.name, stderr.String())
+		}
+		if !strings.Contains(stdout.String(), "to install it, run: ofa doctor --install") {
+			t.Errorf("%s: stdout missing the --install suggestion:\n%s", c.name, stdout.String())
+		}
+		if _, err := os.Stat(filepath.Join(a.CatalogDir, "sh-probe.toml")); !os.IsNotExist(err) {
+			t.Errorf("%s: installed into the user catalog", c.name)
+		}
+	}
+}
+
 // B2: --list renders session.json fields — which come from a user-owned
 // directory — through the terminal-safe renderer.
 func TestDoctorListCmdEscapesUntrustedFields(t *testing.T) {
