@@ -60,17 +60,37 @@ func (e *TimeoutError) Error() string {
 // The child leads its own process group and the group is killed when ctx
 // is done, so a timed-out package manager leaves no orphan behind: the
 // grandchildren it spawned die with it.
+//
+// commandWaitDelay bounds the wait on the pipes themselves: a grandchild
+// that detached from the process group can keep stdout open long after
+// the command is gone, and without the bound the abandoned goroutine
+// would wait on it forever.
 func DefaultCommand(ctx context.Context, name string, args ...string) (string, error) {
 	cmd := exec.CommandContext(ctx, name, args...)
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	cmd.Cancel = func() error { return killProcessGroup(cmd) }
+	cmd.WaitDelay = commandWaitDelay
 	out, err := cmd.Output()
+	if err != nil && ctx.Err() == nil && errors.Is(err, exec.ErrWaitDelay) {
+		// The command finished on its own and only a straggler held the
+		// pipe open: what it printed is the answer.
+		err = nil
+	}
 	return string(out), err
 }
+
+// commandWaitDelay bounds how long a command's pipes may stay open after
+// the command itself is gone.
+const commandWaitDelay = 2 * time.Second
 
 // killProcessGroup kills the child's whole process group. The child is
 // the group's leader (Setpgid), so the group takes every descendant with
 // it — a `brew` that spawned helpers must not outlive its own timeout.
+//
+// Residual window: this kill runs from os/exec's watchdog goroutine, so
+// it can fire after Process.Wait has freed the PID, which may by then
+// belong to another process; the fix is pending the sibling review's
+// verdict, so nothing changes here yet.
 func killProcessGroup(cmd *exec.Cmd) error {
 	if cmd.Process != nil {
 		_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
