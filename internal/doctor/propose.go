@@ -64,7 +64,17 @@ func ValidateSavedProposal(src []byte, bin, targetReal string, run detect.Runner
 
 // validateTOML is the one gate both flows share, over the exact TOML
 // text that will become the candidate's Bytes.
+//
+// A proposal carrying any form of a credential value is refused first,
+// before it is parsed or anything in it runs. It is rejected, not
+// redacted: the candidate's bytes are what the human reviews and what is
+// installed, so rewriting them would break that binding, and an entry that
+// embeds a token is wrong whatever the token's position. The error names
+// no value, so the retry prompt and the session files cannot echo it.
 func validateTOML(tomlSrc string, bin, targetReal string, run detect.Runner) (Candidate, error) {
+	if containsSecret(tomlSrc) {
+		return Candidate{}, errors.New("proposal contains the value of a credential variable (ANTHROPIC_API_KEY, ANTHROPIC_AUTH_TOKEN or CLAUDE_CODE_OAUTH_TOKEN); a catalog entry must never embed one")
+	}
 	h, err := catalog.ParseEntry("proposed-catalog.toml", []byte(tomlSrc))
 	if err != nil {
 		return Candidate{}, err

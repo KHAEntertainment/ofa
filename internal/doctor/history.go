@@ -55,18 +55,20 @@ func NewSessionDir(root string, now time.Time) (string, error) {
 }
 
 // writeSession writes context.md, the audit trail: the facts, every prompt
-// sent, every raw response, and every verdict. Raw responses are redacted
-// first — a successful draft that echoes a credential must not persist it
-// here. 0600, like everything doctor writes: the facts contain local paths
-// and binary output the user may not want world-readable. Prompts and
-// responses are indented as code blocks so the TOML fences inside them
-// cannot restructure the document.
+// sent, every raw response, and every verdict. The WHOLE rendered document
+// is redacted at the write, not field by field: a credential can reach any
+// section — a raw response that echoes it, a verdict quoting the draft, the
+// retry prompt that carries that verdict back — and a new section must not
+// be able to forget the call. 0600, like everything doctor writes: the
+// facts contain local paths and binary output the user may not want
+// world-readable. Prompts and responses are indented as code blocks so the
+// TOML fences inside them cannot restructure the document.
 func writeSession(dir, bin string, f Facts, attempts []Attempt) error {
 	var b strings.Builder
 	fmt.Fprintf(&b, "# ofa doctor — %s\n\nSession directory: %s\n\n## Facts\n\n%s\n", bin, dir, f)
 	for i, att := range attempts {
 		fmt.Fprintf(&b, "## Attempt %d\n\n### Prompt sent\n\n%s\n\n", i+1, indentBlock(att.Prompt))
-		out := redactSecrets(att.Output)
+		out := att.Output
 		if out == "" {
 			out = "(no output)"
 		}
@@ -77,18 +79,20 @@ func writeSession(dir, bin string, f Facts, attempts []Attempt) error {
 			fmt.Fprintf(&b, "### Verdict\n\nrejected: %s\n\n", att.Err)
 		}
 	}
-	return os.WriteFile(filepath.Join(dir, contextName), []byte(b.String()), 0o600)
+	return os.WriteFile(filepath.Join(dir, contextName), []byte(redactSecrets(b.String())), 0o600)
 }
 
 // rejectedContent renders rejected.txt: the reason the draft failed after
-// the retry, plus the raw output of the last attempt so nothing is lost.
+// the retry, plus the raw output of the last attempt so nothing is lost —
+// except credentials. The whole file is redacted exactly like context.md:
+// the failed draft is the likeliest place for an echoed token to land.
 func rejectedContent(reason error, attempts []Attempt) string {
 	var b strings.Builder
 	fmt.Fprintf(&b, "ofa doctor rejected the agent's draft.\n\nReason: %s\n", reason)
 	if len(attempts) > 0 {
 		fmt.Fprintf(&b, "\n--- raw output of the final attempt ---\n%s\n", attempts[len(attempts)-1].Output)
 	}
-	return b.String()
+	return redactSecrets(b.String())
 }
 
 // indentBlock renders s as an indented (4-space) code block, one line per

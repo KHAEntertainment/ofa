@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -359,25 +360,56 @@ func streamSnippet(stdout, stderr string) string {
 // diagnostics and persisted output.
 var credentialVars = []string{"ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "CLAUDE_CODE_OAUTH_TOKEN"}
 
-// redactSecrets replaces the exact values of the credential variables
-// doctor passes to the agent with [redacted], longest value first so an
-// overlapping pair (one value a prefix of the other) cannot leave the
-// longer secret's suffix behind. Matching is EXACT-VALUE only: it is not a
-// credential-format scanner, and values that never crossed the agent
-// boundary are not guessed at — URL-encoded or partial echoes of a value
-// are out of scope.
-func redactSecrets(s string) string {
-	var secrets []string
+// credentialForms returns every form of the credential values that
+// redaction and the proposal gate match: each set value raw, and its
+// url.QueryEscape and url.PathEscape encodings (the two encodings an agent
+// echoing a token into a URL or a query string produces). Duplicates are
+// dropped, and the result is sorted longest first so an overlapping pair
+// (one form a prefix or substring of another) cannot leave the longer
+// form's remainder behind.
+func credentialForms() []string {
+	seen := map[string]bool{}
+	var forms []string
 	for _, k := range credentialVars {
-		if v := os.Getenv(k); v != "" {
-			secrets = append(secrets, v)
+		v := os.Getenv(k)
+		if v == "" {
+			continue
+		}
+		for _, f := range []string{v, url.QueryEscape(v), url.PathEscape(v)} {
+			if !seen[f] {
+				seen[f] = true
+				forms = append(forms, f)
+			}
 		}
 	}
-	sort.Slice(secrets, func(i, j int) bool { return len(secrets[i]) > len(secrets[j]) })
-	for _, v := range secrets {
-		s = strings.ReplaceAll(s, v, "[redacted]")
+	sort.Slice(forms, func(i, j int) bool { return len(forms[i]) > len(forms[j]) })
+	return forms
+}
+
+// redactSecrets replaces every credentialForms form of the credential
+// variables doctor passes to the agent with [redacted]. Matching is by
+// exact value and these two encodings only: it is not a credential-format
+// scanner, and values that never crossed the agent boundary are not
+// guessed at. PARTIAL echoes (a prefix, a suffix, a value split across
+// lines) are out of scope by decision: any fixed-length fragment rule
+// either misses a shorter fragment or starts redacting ordinary text that
+// happens to share characters with a token, and a corrupted audit trail is
+// worse than a documented limit.
+func redactSecrets(s string) string {
+	for _, f := range credentialForms() {
+		s = strings.ReplaceAll(s, f, "[redacted]")
 	}
 	return s
+}
+
+// containsSecret reports whether s holds any credentialForms form.
+func containsSecret(s string) bool {
+	for _, f := range credentialForms() {
+		if strings.Contains(s, f) {
+			return true
+		}
+	}
+	return false
 }
 
 // cappedBuffer is a bytes.Buffer that stops storing after limit bytes,
