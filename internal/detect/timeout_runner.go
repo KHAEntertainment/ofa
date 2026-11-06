@@ -50,32 +50,24 @@ func (e *TimeoutError) Error() string {
 
 // DefaultCommand runs name with args under ctx and returns its stdout.
 //
-// It is exec.Command(...).Output() with a deadline attached and nothing
-// else: the child inherits the caller's environment, reads from the null
-// device, keeps its stderr off stdout (a failing command's stderr
-// reaches the caller through the exec.ExitError), and its output is
-// returned untrimmed — byte for byte what DefaultRunner returns for the
-// same command, so a command behaves the same through either runner.
+// It is exec.Command(...).Output() with a deadline attached: the child
+// inherits the caller's environment, reads from the null device, keeps its
+// stderr off stdout (a failing command's stderr reaches the caller through
+// the exec.ExitError), and its output is returned untrimmed — the same
+// shape DefaultRunner returns for the same command.
 //
-// The child leads its own process group and the group is killed when ctx
-// is done, so a timed-out package manager leaves no orphan behind: the
-// grandchildren it spawned die with it.
-//
-// commandWaitDelay bounds the wait on the pipes themselves: a grandchild
-// that detached from the process group can keep stdout open long after
-// the command is gone, and without the bound the abandoned goroutine
-// would wait on it forever.
+// One thing differs from DefaultRunner: the WaitDelay. DefaultRunner waits
+// on the pipes forever when a grandchild holds them open; DefaultCommand
+// bounds that wait, and a command whose output was cut short by it is
+// reported as the failure it is — never as a successful read. A truncated
+// package inventory is a lie the caller cannot see, and a failed detector
+// is one the caller can.
 func DefaultCommand(ctx context.Context, name string, args ...string) (string, error) {
 	cmd := exec.CommandContext(ctx, name, args...)
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	cmd.Cancel = func() error { return killProcessGroup(cmd) }
 	cmd.WaitDelay = commandWaitDelay
 	out, err := cmd.Output()
-	if err != nil && ctx.Err() == nil && errors.Is(err, exec.ErrWaitDelay) {
-		// The command finished on its own and only a straggler held the
-		// pipe open: what it printed is the answer.
-		err = nil
-	}
 	return string(out), err
 }
 
