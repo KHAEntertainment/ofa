@@ -276,32 +276,34 @@ func TestDoctorCmd_AgentFlagClaudeOnly(t *testing.T) {
 	}
 }
 
-// registryFixtureLoader returns a catalog with one npm install and one
-// brew-formula install. Both bins are names that are not on PATH, so
-// the gap list is empty whatever the machine running the suite looks
-// like, and the scan has one method that answers and one that can hang.
+// registryFixtureLoader returns a catalog with one harness installed two
+// ways: through npm (which answers) and through brew (which can hang).
+// The bins are names that are not on PATH, so the gap list is empty
+// whatever the machine running the suite looks like.
+//
+// One harness, not two: a harness that some detector DID find is not
+// reported as undetectable, so the failed brew method is reported once
+// and only once.
 func registryFixtureLoader() func() ([]catalog.Harness, []catalog.Problem, error) {
 	return func() ([]catalog.Harness, []catalog.Problem, error) {
 		return []catalog.Harness{
 			{
-				ID:   "npm-tool",
-				Name: "npm tool",
-				Installs: []catalog.Install{{
-					Method:  "npm",
-					Package: "ofa-npm-tool",
-					Bin:     "ofa-npm-tool-bin",
-					Version: catalog.CmdSpec{Cmd: []string{"ofa-npm-tool-bin", "--version"}},
-				}},
-			},
-			{
-				ID:   "brew-tool",
-				Name: "brew tool",
-				Installs: []catalog.Install{{
-					Method:  "brew-formula",
-					Package: "ofa-brew-tool",
-					Bin:     "ofa-brew-tool-bin",
-					Version: catalog.CmdSpec{Cmd: []string{"ofa-brew-tool-bin", "--version"}},
-				}},
+				ID:   "tool",
+				Name: "tool",
+				Installs: []catalog.Install{
+					{
+						Method:  "npm",
+						Package: "ofa-npm-tool",
+						Bin:     "ofa-npm-tool-bin",
+						Version: catalog.CmdSpec{Cmd: []string{"ofa-npm-tool-bin", "--version"}},
+					},
+					{
+						Method:  "brew-formula",
+						Package: "ofa-brew-tool",
+						Bin:     "ofa-brew-tool-bin",
+						Version: catalog.CmdSpec{Cmd: []string{"ofa-brew-tool-bin", "--version"}},
+					},
+				},
 			},
 		}, nil, nil
 	}
@@ -339,13 +341,19 @@ func TestDoctorCmd_GapCheckTimesOutAHungRegistry(t *testing.T) {
 	if code != ExitOK {
 		t.Fatalf("exit = %d, want %d (the gap check continues); stderr: %s", code, ExitOK, stderr.String())
 	}
-	// The failure names the method and the reason, in the canonical
-	// "method: reason" shape.
-	if !strings.Contains(stderr.String(), "brew-formula: timed out") {
-		t.Errorf("stderr = %q, want the timed-out method reported", stderr.String())
+	// The failure is reported once, naming the method and the reason, in
+	// the shared format every command uses.
+	if got := strings.Count(stderr.String(), "brew-formula"); got != 1 {
+		t.Errorf("stderr names brew-formula %d times, want 1: %s", got, stderr.String())
+	}
+	if got := strings.Count(stderr.String(), "timed out"); got != 1 {
+		t.Errorf("stderr reports the timeout %d times, want 1: %s", got, stderr.String())
+	}
+	if !strings.Contains(stderr.String(), "brew-formula detector failed: timed out") {
+		t.Errorf("stderr = %q, want the failed method and its reason", stderr.String())
 	}
 	// The method that answered is not reported as failed.
-	if strings.Contains(stderr.String(), "npm: timed out") {
+	if strings.Contains(stderr.String(), "npm detector failed") {
 		t.Errorf("stderr = %q, want the healthy method left alone", stderr.String())
 	}
 	// The gap check completed with what it had.
@@ -1345,6 +1353,34 @@ func TestDoctorCmd_PostInstallScanPrefersActiveInstance(t *testing.T) {
 	}
 	if !strings.Contains(stdout2.String(), "(not the live install on PATH)") {
 		t.Errorf("stdout missing the shadowed note:\n%s", stdout2.String())
+	}
+}
+
+// The post-install re-scan used to discard its failures outright. It now
+// reports them, in the same shared format the gap check uses.
+func TestDoctorCmd_PostInstallScanReportsFailures(t *testing.T) {
+	a, _, stderr, _, _, _ := newTestApp(t, []string{"doctor", "sh"}, nil)
+	wireDoctor(t, a, &stubAgent{responses: []string{shEntry}}, shRunner())
+	makeInteractive(a, "y")
+	a.CatalogLoader = fixtureLoader("sh")
+	a.DetectFn = func([]catalog.Harness, detect.Runner) ([]detect.Instance, []detect.Failure, error) {
+		// The gap check runs before the install; the re-scan after it.
+		if _, err := os.Stat(filepath.Join(a.DoctorDir, "history")); err == nil {
+			return nil, []detect.Failure{{
+				Method: "brew-formula",
+				Err:    errors.New("timed out after 30s running brew list --versions"),
+			}}, nil
+		}
+		return nil, nil, nil
+	}
+	if code := a.Run(); code != ExitError {
+		t.Fatalf("exit = %d, want %d (the install was not detected)", code, ExitError)
+	}
+	if !strings.Contains(stderr.String(), "brew-formula detector failed: timed out after 30s running brew list --versions") {
+		t.Errorf("stderr = %q, want the post-install failure reported", stderr.String())
+	}
+	if got := strings.Count(stderr.String(), "brew-formula"); got != 1 {
+		t.Errorf("stderr names brew-formula %d times, want 1: %s", got, stderr.String())
 	}
 }
 

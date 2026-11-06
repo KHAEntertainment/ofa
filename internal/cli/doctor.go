@@ -289,8 +289,10 @@ func (a *App) doctorDetect(cat []catalog.Harness) ([]detect.Instance, []detect.F
 		fmt.Fprintf(a.Stderr, "ofa: doctor: scan: %v\n", err)
 		return nil, nil, ExitError
 	}
-	a.reportDoctorFailures(failures)
 	if len(failures) > 0 {
+		// One report, in the shared format: the warning names the method
+		// and the reason, and the undetectable lines name the harnesses
+		// the failed detector left unknown.
 		a.reportDetectionFailures(cat, insts, failures)
 		if len(insts) == 0 {
 			// Every result we would have shown came from a detector that
@@ -299,15 +301,6 @@ func (a *App) doctorDetect(cat []catalog.Harness) ([]detect.Instance, []detect.F
 		}
 	}
 	return insts, failures, ExitOK
-}
-
-// reportDoctorFailures prints the failures the scan degraded with, one
-// "method: reason" line each, so a registry query that timed out is
-// visible instead of quietly missing from the gap check.
-func (a *App) reportDoctorFailures(failures []detect.Failure) {
-	for _, f := range failures {
-		fmt.Fprintf(a.Stderr, "ofa: doctor: %s\n", f.Error())
-	}
 }
 
 // doctorConfirmAndWrite asks the install question (default No) and, on a
@@ -425,7 +418,11 @@ func (a *App) doctorPostInstallScan(h catalog.Harness) ExitCode {
 		fmt.Fprintf(a.Stderr, "ofa: doctor: could not scan after install: %v\n", err)
 		return ExitError
 	}
-	a.reportDoctorFailures(failures)
+	if len(failures) > 0 {
+		// The same shared report the gap check uses: these failures were
+		// discarded outright before.
+		a.reportDetectionFailures(cat, insts, failures)
+	}
 	var shadowed []detect.Instance
 	for _, in := range insts {
 		if in.Bin != bin {
