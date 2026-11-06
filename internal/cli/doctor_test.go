@@ -1356,16 +1356,21 @@ func TestDoctorCmd_PostInstallScanPrefersActiveInstance(t *testing.T) {
 	}
 }
 
-// The post-install re-scan used to discard its failures outright. It now
-// reports them, in the same shared format the gap check uses.
-func TestDoctorCmd_PostInstallScanReportsFailures(t *testing.T) {
+// postInstallScanRun drives the install flow and returns what the
+// post-install re-scan reported, together with the runner it was given.
+// The re-scan's scan is stubbed: it fails, and records the runner it
+// received.
+func postInstallScanRun(t *testing.T, runner detect.Runner) (string, detect.Runner) {
+	t.Helper()
 	a, _, stderr, _, _, _ := newTestApp(t, []string{"doctor", "sh"}, nil)
 	wireDoctor(t, a, &stubAgent{responses: []string{shEntry}}, shRunner())
 	makeInteractive(a, "y")
 	a.CatalogLoader = fixtureLoader("sh")
-	a.DetectFn = func([]catalog.Harness, detect.Runner) ([]detect.Instance, []detect.Failure, error) {
+	var got detect.Runner
+	a.DetectFn = func(_ []catalog.Harness, run detect.Runner) ([]detect.Instance, []detect.Failure, error) {
 		// The gap check runs before the install; the re-scan after it.
 		if _, err := os.Stat(filepath.Join(a.DoctorDir, "history")); err == nil {
+			got = run
 			return nil, []detect.Failure{{
 				Method: "brew-formula",
 				Err:    errors.New("timed out after 30s running brew list --versions"),
@@ -1373,14 +1378,42 @@ func TestDoctorCmd_PostInstallScanReportsFailures(t *testing.T) {
 		}
 		return nil, nil, nil
 	}
+	a.DetectRunner = runner
 	if code := a.Run(); code != ExitError {
-		t.Fatalf("exit = %d, want %d (the install was not detected)", code, ExitError)
+		t.Fatalf("exit = %d, want %d (the install was not detected); stderr: %s", code, ExitError, stderr.String())
 	}
-	if !strings.Contains(stderr.String(), "brew-formula detector failed: timed out after 30s running brew list --versions") {
-		t.Errorf("stderr = %q, want the post-install failure reported", stderr.String())
+	return stderr.String(), got
+}
+
+// The post-install re-scan used to discard its failures outright. It now
+// reports them, in the same shared format the gap check uses.
+func TestDoctorCmd_PostInstallScanReportsFailures(t *testing.T) {
+	stderr, got := postInstallScanRun(t, detect.DefaultRunner)
+	if !strings.Contains(stderr, "brew-formula detector failed: timed out after 30s running brew list --versions") {
+		t.Errorf("stderr = %q, want the post-install failure reported", stderr)
 	}
-	if got := strings.Count(stderr.String(), "brew-formula"); got != 1 {
-		t.Errorf("stderr names brew-formula %d times, want 1: %s", got, stderr.String())
+	if n := strings.Count(stderr, "brew-formula"); n != 1 {
+		t.Errorf("stderr names brew-formula %d times, want 1: %s", n, stderr)
+	}
+	// The re-scan ran over the bounded runner, not the unbounded default:
+	// the swap is the only thing that can change the runner here.
+	if got == nil {
+		t.Fatal("the post-install re-scan passed no runner to the scan")
+	}
+	if detect.IsDefaultRunner(got) {
+		t.Error("the post-install re-scan ran with the unbounded default runner")
+	}
+}
+
+// The post-install re-scan leaves an injected runner exactly as it was.
+func TestDoctorCmd_PostInstallScanKeepsAnInjectedRunner(t *testing.T) {
+	injected := func(name string, args ...string) (string, error) { return "sentinel", nil }
+	_, got := postInstallScanRun(t, injected)
+	if got == nil {
+		t.Fatal("the post-install re-scan passed no runner to the scan")
+	}
+	if out, err := got("anything"); out != "sentinel" || err != nil {
+		t.Errorf("the injected runner was replaced: out = %q, err = %v", out, err)
 	}
 }
 

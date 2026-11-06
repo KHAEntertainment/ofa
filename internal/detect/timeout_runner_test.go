@@ -15,8 +15,9 @@ import (
 )
 
 // These tests run real subprocesses — /bin/sh, /bin/sleep — because the
-// guarantees they verify (a deadline, a process-group kill) only exist
-// against real processes. None of them spawns an agent or the test suite.
+// guarantees they verify (a deadline, a process-group kill, a bounded pipe
+// wait) only exist against real processes. None of them spawns an agent or
+// the test suite.
 
 // TestDefaultCommandMatchesDefaultRunner pins the bounded runner's
 // execution to the unbounded one's: the same command must produce the
@@ -163,29 +164,49 @@ func TestTimeoutRunnerForSwapsOnlyTheDefaultRunner(t *testing.T) {
 
 // TestDefaultCommandKillsTheProcessGroup proves the timeout leaves no
 // orphan behind: the command's own child dies with it.
+//
+// The deadline is armed only after the readiness handshake. The script
+// records its child's pid — atomically, so a reader never sees a partial
+// file — and the test reads that pid BEFORE the command is cancelled, so
+// the test never asserts about a process it has not seen, and a slow
+// machine cannot make the deadline fire before the child exists.
 func TestDefaultCommandKillsTheProcessGroup(t *testing.T) {
 	pidfile := filepath.Join(t.TempDir(), "pid")
 	// The shell starts a long sleep in the background and then waits.
 	// Both are in the shell's process group, so the group kill takes the
 	// grandchild with it.
-	body := fmt.Sprintf("/bin/sleep 60 &\necho $! > %s\n/bin/sleep 60\n", pidfile)
-	run := TimeoutRunner(DefaultCommand, time.Second)
-	start := time.Now()
-	_, err := run("/bin/sh", "-c", body)
-	elapsed := time.Since(start)
-	if err == nil {
-		t.Fatal("the long-running command returned no error")
+	script := writeScript(t, fmt.Sprintf(
+		"/bin/sleep 60 &\necho $! > '%s.tmp'\nmv '%s.tmp' '%s'\n/bin/sleep 60\n",
+		pidfile, pidfile, pidfile))
+
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	done := make(chan error, 1)
+	go func() {
+		_, err := DefaultCommand(ctx, script)
+		done <- err
+	}()
+
+	// The readiness handshake: the pid is read before the deadline is
+	// armed, and the cleanup kills the group if the test fails first.
+	pid := readPID(t, pidfile)
+	t.Cleanup(func() {
+		_ = syscall.Kill(-pid, syscall.SIGKILL)
+		_ = syscall.Kill(pid, syscall.SIGKILL)
+	})
+
+	cancel() // the deadline fires
+	select {
+	case err := <-done:
+		if err == nil {
+			t.Fatal("the cancelled command returned no error")
+		}
+	case <-time.After(15 * time.Second):
+		t.Fatal("the cancelled command never returned")
 	}
-	var te *TimeoutError
-	if !errors.As(err, &te) {
-		t.Fatalf("err = %v (%T), want a TimeoutError", err, err)
-	}
-	if elapsed > 10*time.Second {
-		t.Errorf("the runner returned after %v for a 1s deadline", elapsed)
-	}
+
 	// The grandchild must be gone: an orphaned `brew` (or `npm`) would
 	// keep running after doctor moved on.
-	pid := readPID(t, pidfile)
 	deadline := time.Now().Add(5 * time.Second)
 	for time.Now().Before(deadline) {
 		if syscall.Kill(pid, syscall.Signal(0)) != nil {
@@ -196,22 +217,109 @@ func TestDefaultCommandKillsTheProcessGroup(t *testing.T) {
 	t.Fatalf("grandchild %d is still alive after the timeout", pid)
 }
 
-// readPID waits for the script to write its child's pid and returns it.
-func readPID(t *testing.T, path string) int {
-	t.Helper()
-	deadline := time.Now().Add(5 * time.Second)
-	for time.Now().Before(deadline) {
-		b, err := os.ReadFile(path)
-		if err == nil {
-			pid := 0
-			if _, serr := fmt.Sscanf(strings.TrimSpace(string(b)), "%d", &pid); serr == nil && pid > 0 {
-				return pid
-			}
-		}
-		time.Sleep(50 * time.Millisecond)
+// TestDefaultCommandReportsATruncatedRead proves a command whose output
+// was cut short is a failure, not a successful read: a package inventory
+// read from a truncated stream is a lie the caller cannot see, while a
+// failed detector is one it can.
+func TestDefaultCommandReportsATruncatedRead(t *testing.T) {
+	pidfile := filepath.Join(t.TempDir(), "pid")
+	// The leader succeeds at once. The child holds the pipe open past
+	// the WaitDelay and prints a line too late to be read.
+	script := writeScript(t, fmt.Sprintf(
+		"printf 'first line\\n'\n( /bin/sleep 3; printf 'late line\\n' ) &\necho $! > '%s.tmp'\nmv '%s.tmp' '%s'\nexit 0\n",
+		pidfile, pidfile, pidfile))
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	out, err := DefaultCommand(ctx, script)
+	// The leader recorded its child before it exited, so the pid is
+	// there now; the cleanup kills it if the test fails first.
+	pid := readPID(t, pidfile)
+	t.Cleanup(func() { _ = syscall.Kill(pid, syscall.SIGKILL) })
+	if err == nil {
+		t.Fatalf("a truncated read returned no error (out = %q)", out)
 	}
-	t.Fatalf("no pid written to %s", path)
-	return 0
+	if !errors.Is(err, exec.ErrWaitDelay) {
+		t.Errorf("err = %v (%T), want an ErrWaitDelay", err, err)
+	}
+	if strings.Contains(out, "late line") {
+		t.Errorf("out = %q, want the late line to be missing", out)
+	}
+	if !strings.Contains(out, "first line") {
+		t.Errorf("out = %q, want the output collected before the cut", out)
+	}
+}
+
+// TestTimeoutRunnerEndsTheAbandonedCommand proves the runner does not
+// wait on a command whose detached grandchild holds the pipe open: the
+// deadline ends the call, and WaitDelay ends the abandoned goroutine
+// behind it.
+//
+// The readiness handshake runs while the command is running: the helper
+// records its pid and the group it ended up in, and the test reads both
+// before the deadline fires.
+func TestTimeoutRunnerEndsTheAbandonedCommand(t *testing.T) {
+	statusfile := filepath.Join(t.TempDir(), "status")
+	self, err := filepath.Abs(os.Args[0])
+	if err != nil {
+		t.Fatalf("resolve the test binary: %v", err)
+	}
+	// The helper leaves the process group, so the group kill cannot
+	// reach it: only WaitDelay can end the wait on the pipe it holds.
+	script := writeScript(t, fmt.Sprintf(
+		"OFA_DETACH_HELPER=1 OFA_DETACH_STATUS='%s' '%s' -test.run=TestDetachedGrandchildHelper &\n/bin/sleep 60\n",
+		statusfile, self))
+
+	finished := make(chan struct{})
+	cmd := func(ctx context.Context, name string, args ...string) (string, error) {
+		out, err := DefaultCommand(ctx, name, args...)
+		close(finished)
+		return out, err
+	}
+	run := TimeoutRunner(cmd, 5*time.Second)
+
+	start := time.Now()
+	done := make(chan error, 1)
+	go func() {
+		_, err := run(script)
+		done <- err
+	}()
+
+	// The readiness handshake: the helper reports the pid and the group
+	// it detached into, before the deadline fires.
+	pid := readDetachedStatus(t, statusfile)
+	t.Cleanup(func() { _ = syscall.Kill(pid, syscall.SIGKILL) })
+
+	select {
+	case err := <-done:
+		elapsed := time.Since(start)
+		if err == nil {
+			t.Fatal("the hung command returned no error")
+		}
+		var te *TimeoutError
+		if !errors.As(err, &te) {
+			t.Fatalf("err = %v (%T), want a TimeoutError", err, err)
+		}
+		// The deadline ends the call; it does not wait for the grandchild.
+		if elapsed > 15*time.Second {
+			t.Errorf("the runner returned after %v for a 5s deadline", elapsed)
+		}
+	case <-time.After(30 * time.Second):
+		t.Fatal("the runner never returned")
+	}
+
+	// The grandchild left the process group, so the group kill could not
+	// reach it: it is still holding the pipe the command was reading.
+	if syscall.Kill(pid, syscall.Signal(0)) != nil {
+		t.Fatalf("grandchild %d did not survive the group kill: it never detached", pid)
+	}
+	// The abandoned goroutine must finish once WaitDelay expires, rather
+	// than waiting for the grandchild to let go of the pipe.
+	select {
+	case <-finished:
+	case <-time.After(30 * time.Second):
+		t.Fatal("the abandoned command never finished")
+	}
 }
 
 // TestTimeoutErrorMessage pins the wording the failure carries into the
@@ -254,83 +362,98 @@ func writeScript(t *testing.T, body string) string {
 	return p
 }
 
+// readPID waits for a script to record its child's pid and returns it.
+// The file is written atomically, so the content is always complete.
+func readPID(t *testing.T, path string) int {
+	t.Helper()
+	deadline := time.Now().Add(15 * time.Second)
+	for time.Now().Before(deadline) {
+		b, err := os.ReadFile(path)
+		if err == nil {
+			pid := 0
+			if _, serr := fmt.Sscanf(strings.TrimSpace(string(b)), "%d", &pid); serr == nil && pid > 0 {
+				return pid
+			}
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	t.Fatalf("no pid written to %s", path)
+	return 0
+}
+
+// readDetachedStatus reads the detached helper's status file: its pid and
+// the process group it ended up in. A helper that could not leave the
+// group is a failure, not a status to wait for.
+func readDetachedStatus(t *testing.T, path string) int {
+	t.Helper()
+	deadline := time.Now().Add(15 * time.Second)
+	for time.Now().Before(deadline) {
+		b, err := os.ReadFile(path)
+		if err == nil {
+			s := strings.TrimSpace(string(b))
+			if strings.HasPrefix(s, "failed") {
+				t.Fatalf("the detached helper could not detach: %s", s)
+			}
+			fields := strings.Fields(s)
+			if len(fields) == 2 {
+				pid, perr := strconv.Atoi(fields[0])
+				pgid, gerr := strconv.Atoi(fields[1])
+				if perr != nil || gerr != nil {
+					t.Fatalf("unreadable helper status %q", s)
+				}
+				if pgid != pid {
+					t.Fatalf("the helper is in group %d, not its own group %d: it never detached", pgid, pid)
+				}
+				return pid
+			}
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	t.Fatalf("the detached helper never reported its status to %s", path)
+	return 0
+}
+
 // TestDetachedGrandchildHelper is not a standalone test: it is the child
 // the detached-grandchild test spawns. With OFA_DETACH_HELPER set it
-// leaves the process group — a new session — records its pid, and holds
-// stdout open, which is exactly what a process-group kill cannot reach.
+// leaves the process group — a new session — records its pid and the
+// group it ended up in, and holds stdout open, which is exactly what a
+// process-group kill cannot reach.
 func TestDetachedGrandchildHelper(t *testing.T) {
 	if os.Getenv("OFA_DETACH_HELPER") != "1" {
 		t.Skip("helper process for TestTimeoutRunnerEndsTheAbandonedCommand")
 	}
+	status := os.Getenv("OFA_DETACH_STATUS")
 	if _, err := syscall.Setsid(); err != nil {
-		// Already a session leader: there is nothing to leave.
-		_ = err
+		// The helper must leave the process group, or the group kill
+		// would reach it and the test would prove nothing.
+		writeStatus(status, fmt.Sprintf("failed to detach: %v", err))
+		os.Exit(1)
 	}
-	if path := os.Getenv("OFA_DETACH_PIDFILE"); path != "" {
-		if err := os.WriteFile(path, []byte(strconv.Itoa(os.Getpid())), 0o644); err != nil {
-			t.Fatalf("write pid file: %v", err)
-		}
+	// A session leader leads its own process group: that is the
+	// relationship the test asserts.
+	pgid, err := syscall.Getpgid(0)
+	if err != nil {
+		writeStatus(status, fmt.Sprintf("failed to read the process group: %v", err))
+		os.Exit(1)
 	}
+	if pgid != os.Getpid() {
+		writeStatus(status, fmt.Sprintf("failed to detach: pid %d is in group %d", os.Getpid(), pgid))
+		os.Exit(1)
+	}
+	writeStatus(status, fmt.Sprintf("%d %d", os.Getpid(), pgid))
 	// Hold stdout open for longer than any bound in the test.
 	time.Sleep(60 * time.Second)
 }
 
-// TestTimeoutRunnerEndsTheAbandonedCommand proves the runner does not
-// wait on a command whose detached grandchild holds the pipe open: the
-// deadline ends the call, and WaitDelay ends the abandoned goroutine
-// behind it.
-func TestTimeoutRunnerEndsTheAbandonedCommand(t *testing.T) {
-	dir := t.TempDir()
-	pidfile := filepath.Join(dir, "pid")
-	self, err := filepath.Abs(os.Args[0])
-	if err != nil {
-		t.Fatalf("resolve the test binary: %v", err)
+// writeStatus records a status atomically, so a reader never sees a
+// half-written file.
+func writeStatus(path, content string) {
+	if path == "" {
+		return
 	}
-	// The helper leaves the process group, so the group kill cannot
-	// reach it: only WaitDelay can end the wait on the pipe it holds.
-	script := writeScript(t, fmt.Sprintf(
-		"OFA_DETACH_HELPER=1 OFA_DETACH_PIDFILE='%s' '%s' -test.run=TestDetachedGrandchildHelper &\n/bin/sleep 60\n",
-		pidfile, self))
-	t.Cleanup(func() {
-		if b, err := os.ReadFile(pidfile); err == nil {
-			if pid, perr := strconv.Atoi(strings.TrimSpace(string(b))); perr == nil && pid > 0 {
-				_ = syscall.Kill(pid, syscall.SIGKILL)
-			}
-		}
-	})
-
-	finished := make(chan struct{})
-	cmd := func(ctx context.Context, name string, args ...string) (string, error) {
-		out, err := DefaultCommand(ctx, name, args...)
-		close(finished)
-		return out, err
+	tmp := path + ".tmp"
+	if err := os.WriteFile(tmp, []byte(content), 0o644); err != nil {
+		return
 	}
-	run := TimeoutRunner(cmd, 5*time.Second)
-	start := time.Now()
-	_, err = run(script)
-	elapsed := time.Since(start)
-	if err == nil {
-		t.Fatal("the hung command returned no error")
-	}
-	var te *TimeoutError
-	if !errors.As(err, &te) {
-		t.Fatalf("err = %v (%T), want a TimeoutError", err, err)
-	}
-	// The deadline ends the call; it does not wait for the grandchild.
-	if elapsed > 15*time.Second {
-		t.Errorf("the runner returned after %v for a 5s deadline", elapsed)
-	}
-	// The grandchild left the process group, so the group kill could not
-	// reach it: it is still holding the pipe the command was reading.
-	pid := readPID(t, pidfile)
-	if syscall.Kill(pid, syscall.Signal(0)) != nil {
-		t.Fatalf("grandchild %d did not survive the group kill: it never detached", pid)
-	}
-	// The abandoned goroutine must finish once WaitDelay expires, rather
-	// than waiting for the grandchild to let go of the pipe.
-	select {
-	case <-finished:
-	case <-time.After(30 * time.Second):
-		t.Fatal("the abandoned command never finished")
-	}
+	_ = os.Rename(tmp, path)
 }
