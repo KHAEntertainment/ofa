@@ -283,34 +283,17 @@ func execBounded(ctx context.Context, name string, args []string, spec execSpec)
 	cmd.WaitDelay = pipeDrainDelay
 	cmd.Cancel = func() error { return killProcessGroup(cmd) }
 
-	err = cmd.Run()
+	if err = cmd.Start(); err == nil {
+		killGroupBeforeReap(cmd.Process.Pid)
+		err = cmd.Wait()
+	}
 	if err != nil {
 		var ee *exec.ExitError
 		if errors.Is(err, exec.ErrWaitDelay) && !errors.As(err, &ee) {
-			// The process itself exited cleanly; a straggler kept the pipes
-			// open past WaitDelay. Treat it as success with the output we
-			// collected.
+			// The process itself exited cleanly; a straggler outside the
+			// group (setsid) kept the pipes open past WaitDelay. Treat it as
+			// success with the output we collected.
 			err = nil
-		}
-	}
-	// Reap lingering group members after Wait, on EVERY outcome — not just
-	// ErrWaitDelay: a parent that exits NON-ZERO returns *exec.ExitError,
-	// which masks ErrWaitDelay, and its same-group pipe-holding child then
-	// outlives the runner's return (R3-B2). The cleanup does not depend on
-	// Wait's error type: kill(-pgid, 0) succeeds only while the group still
-	// has a live (or unreaped) member. What is guaranteed: the leader has
-	// just been reaped by Wait, so a probe hit means a member survived the
-	// leader — within this window (WaitDelay is 2s, not milliseconds) PID
-	// reuse is implausible on real schedulers but NOT kernel-guaranteed;
-	// ESRCH (group gone) and EPERM are tolerated. What is NOT guaranteed:
-	// membership evidence — an open pipe proves a descriptor, not that its
-	// holder is in this group — and deliberately detached (setsid)
-	// descendants are outside the group and are not chased. The timeout
-	// path kills the group pre-reap inside Cancel, where the PGID is
-	// unconditionally valid.
-	if cmd.Process != nil {
-		if syscall.Kill(-cmd.Process.Pid, syscall.Signal(0)) == nil {
-			_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
 		}
 	}
 	if ctxErr := ctx.Err(); ctxErr != nil {
@@ -320,6 +303,33 @@ func execBounded(ctx context.Context, name string, args []string, spec execSpec)
 		return stdout.String(), stderr.String(), stdout.truncated, err
 	}
 	return stdout.String(), stderr.String(), stdout.truncated, nil
+}
+
+// killGroupBeforeReap kills what is left of the child's process group once
+// the leader has exited, on EVERY outcome: a parent that exits non-zero
+// still leaves its same-group, pipe-holding children behind (R3-B2).
+//
+// The kill must be sent while the leader is still an unreaped zombie. A
+// PGID is the leader's PID, and the kernel (Linux and XNU alike) keeps a
+// PID allocated while its process, zombie or not, still exists: until Wait
+// reaps the leader, -pgid can only name the group the leader created, which
+// holds our descendants and nothing else. Killing after Wait — the old
+// probe-then-kill — left a window: once the last member exits, the PID is
+// free, an unrelated process can be given it and make itself a group
+// leader, and the SIGKILL lands on that group. So waitLeaderExit blocks
+// until the leader exits WITHOUT reaping it, the group is killed, and only
+// then does Wait reap and drain.
+//
+// When the no-reap wait is unavailable (reap_other.go) or fails, no kill is
+// sent: a straggler that WaitDelay then bounds is better than a signal to a
+// group that may not be ours. Cancellation is unaffected: Cancel kills the
+// group while the leader is alive, and its exit then releases the wait.
+// Deliberately detached (setsid) descendants are outside the group and are
+// not chased.
+func killGroupBeforeReap(pid int) {
+	if waitLeaderExit(pid) == nil {
+		_ = syscall.Kill(-pid, syscall.SIGKILL)
+	}
 }
 
 // killProcessGroup is the exec.Cancel hook: on context cancellation it
