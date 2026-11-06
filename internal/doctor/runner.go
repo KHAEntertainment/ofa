@@ -458,13 +458,18 @@ func credentialForms() []string {
 
 // redactSecrets replaces every credentialForms form of the credential
 // variables doctor passes to the agent with [redacted]. Matching is by
-// exact value and these two encodings only: it is not a credential-format
-// scanner, and values that never crossed the agent boundary are not
-// guessed at. PARTIAL echoes (a prefix, a suffix, a value split across
+// exact value and by the exact spellings url.QueryEscape and url.PathEscape
+// produce, and nothing else: another percent-encoding of the same value
+// (lower-case hex such as %2f, or escaping characters those functions
+// leave alone) is not matched. It is not a credential-format scanner, and
+// values that never crossed the agent boundary are not guessed at. PARTIAL echoes (a prefix, a suffix, a value split across
 // lines) are out of scope by decision: any fixed-length fragment rule
 // either misses a shorter fragment or starts redacting ordinary text that
 // happens to share characters with a token, and a corrupted audit trail is
-// worse than a documented limit.
+// worse than a documented limit. This scope decision is recorded for users
+// in the README's doctor section (README.md and npm/README.md). The issue
+// asked for docs/, but docs/ holds only release notes, and the README is
+// where doctor is documented.
 func redactSecrets(s string) string {
 	for _, f := range credentialForms() {
 		s = strings.ReplaceAll(s, f, "[redacted]")
