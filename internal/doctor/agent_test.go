@@ -118,7 +118,7 @@ func waitProcessGone(t *testing.T, pid int, budget time.Duration) {
 const grandchildScript = `#!/bin/bash
 echo "the answer"
 /bin/sleep 60 &
-echo $! > %[1]s
+echo "$! $$" > %[1]s.tmp && /bin/mv %[1]s.tmp %[1]s
 exit 0
 `
 
@@ -126,7 +126,7 @@ exit 0
 const hangScript = `#!/bin/bash
 echo started
 /bin/sleep 60 &
-echo $! > %[1]s
+echo "$! $$" > %[1]s.tmp && /bin/mv %[1]s.tmp %[1]s
 /bin/sleep 60
 `
 
@@ -200,10 +200,10 @@ func TestClaudeRunnerTimeoutKillsProcessTree(t *testing.T) {
 		_, err := ClaudeRunner()(ctx, "draft")
 		done <- err
 	}()
-	// Readiness first: the grandchild is recorded before any timing or
-	// cancellation is armed, so a loaded machine cannot make the deadline
-	// fire before the fixture exists (R2-A3).
-	waitPIDFile(t, pidfile, 5*time.Second)
+	// Readiness first: the grandchild is in the leader's group before any
+	// timing or cancellation is armed, so a loaded machine cannot make the
+	// deadline fire before the fixture exists (R2-A3, #28).
+	waitInLeaderGroup(t, pidfile, 5*time.Second)
 	start := time.Now()
 	cancel()
 	err := <-done
@@ -236,33 +236,53 @@ func TestClaudeRunnerCapsOutput(t *testing.T) {
 	}
 }
 
-// waitPIDFile polls until the fixture's pidfile exists — the readiness
-// handshake that lets timing-sensitive assertions arm only after the
-// fixture is in place.
-func waitPIDFile(t *testing.T, path string, budget time.Duration) {
+// waitInLeaderGroup is the readiness handshake that lets timing-sensitive
+// assertions arm only after the fixture is in place. It returns once the
+// grandchild named in the pidfile is a member of the leader's process
+// group (its pgid is the leader's pid, which Setpgid made the group id).
+// A pidfile that merely exists proves only that the shell ran the echo,
+// and the group kill is what the assertions depend on. The fixtures write
+// "<grandchild> <leader>" to a temp file and rename it into place, so a
+// half-written pidfile is never read.
+func waitInLeaderGroup(t *testing.T, path string, budget time.Duration) int {
 	t.Helper()
 	deadline := time.Now().Add(budget)
 	for time.Now().Before(deadline) {
-		if _, err := os.Stat(path); err == nil {
-			return
+		if child, leader, ok := parsePIDFile(path); ok {
+			if pgid, err := syscall.Getpgid(child); err == nil && pgid == leader {
+				return child
+			}
 		}
 		time.Sleep(20 * time.Millisecond)
 	}
-	t.Fatalf("pidfile %s never appeared within %v", path, budget)
+	t.Fatalf("grandchild in %s never joined the leader's process group within %v", path, budget)
+	return 0
+}
+
+// parsePIDFile reads a fixture's "<grandchild> <leader>" pidfile.
+func parsePIDFile(path string) (child, leader int, ok bool) {
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return 0, 0, false
+	}
+	f := strings.Fields(string(b))
+	if len(f) != 2 {
+		return 0, 0, false
+	}
+	child, err1 := strconv.Atoi(f[0])
+	leader, err2 := strconv.Atoi(f[1])
+	return child, leader, err1 == nil && err2 == nil
 }
 
 // readPID reads the grandchild's pid from the script's pidfile.
 func readPID(t *testing.T, pidfile string) int {
 	t.Helper()
-	b, err := os.ReadFile(pidfile)
-	if err != nil {
-		t.Fatalf("read pidfile: %v", err)
+	child, _, ok := parsePIDFile(pidfile)
+	if !ok {
+		b, _ := os.ReadFile(pidfile)
+		t.Fatalf("pidfile %s = %q, want \"<grandchild> <leader>\"", pidfile, b)
 	}
-	pid, err := strconv.Atoi(strings.TrimSpace(string(b)))
-	if err != nil {
-		t.Fatalf("parse pid %q: %v", b, err)
-	}
-	return pid
+	return child
 }
 
 // R2-A2: a failing agent may echo the credentials it was passed; the error
@@ -307,7 +327,7 @@ func TestRedactSecrets(t *testing.T) {
 // fails.
 const heartbeatScript = `#!/bin/bash
 while true; do echo beat >> %[1]s; /bin/sleep 0.2; done &
-echo $! > %[2]s
+echo "$! $$" > %[2]s.tmp && /bin/mv %[2]s.tmp %[2]s
 echo "failed"
 exit 3
 `

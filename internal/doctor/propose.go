@@ -49,7 +49,8 @@ type Candidate struct {
 // returns the validated harness bound to the exact extracted TOML bytes
 // that produced it.
 func ValidateProposal(out, bin, targetReal string, run detect.Runner) (Candidate, error) {
-	return validateTOML(ExtractTOML(out), bin, targetReal, run)
+	c, err := validateTOML(ExtractTOML(out), bin, targetReal, run)
+	return c, redactErr(err)
 }
 
 // ValidateSavedProposal validates the WHOLE content of a saved proposal
@@ -59,15 +60,90 @@ func ValidateProposal(out, bin, targetReal string, run detect.Runner) (Candidate
 // benign-looking inner one and install unreviewed outer bytes, so the
 // file must parse, as-is and in full, as a single valid entry.
 func ValidateSavedProposal(src []byte, bin, targetReal string, run detect.Runner) (Candidate, error) {
-	return validateTOML(string(src), bin, targetReal, run)
+	c, err := validateTOML(string(src), bin, targetReal, run)
+	return c, redactErr(err)
+}
+
+// redactErr is the boundary every validation error leaves through. A
+// check deep in the gate (the parser's own validation included) may quote
+// a value the draft decoded, and these errors reach the retry prompt,
+// context.md, rejected.txt and the terminal. The original error is kept
+// when nothing needed redacting, so wrapping still works; otherwise only
+// the redacted text survives, never the original chain.
+func redactErr(err error) error {
+	if err == nil {
+		return nil
+	}
+	msg := redactSecrets(err.Error())
+	if msg == err.Error() {
+		return err
+	}
+	return errors.New(msg)
+}
+
+// errCredentialInProposal names the variables, never a value.
+var errCredentialInProposal = errors.New("proposal contains the value of a credential variable (ANTHROPIC_API_KEY, ANTHROPIC_AUTH_TOKEN or CLAUDE_CODE_OAUTH_TOKEN); a catalog entry must never embed one")
+
+// harnessHasSecret reports whether any decoded string anywhere in h holds
+// a credential form. TOML escapes (\u0066, a literal string, a multi-line
+// string) can rebuild a value the source-text check never saw, so the
+// decoded entry is checked too. Reflection walks every field, so a field
+// added to catalog.Harness later is covered without touching this code.
+func harnessHasSecret(h catalog.Harness) bool {
+	return valueHasSecret(reflect.ValueOf(h))
+}
+
+func valueHasSecret(v reflect.Value) bool {
+	switch v.Kind() {
+	case reflect.String:
+		return containsSecret(v.String())
+	case reflect.Struct:
+		for i := 0; i < v.NumField(); i++ {
+			if valueHasSecret(v.Field(i)) {
+				return true
+			}
+		}
+	case reflect.Slice, reflect.Array:
+		for i := 0; i < v.Len(); i++ {
+			if valueHasSecret(v.Index(i)) {
+				return true
+			}
+		}
+	case reflect.Map:
+		iter := v.MapRange()
+		for iter.Next() {
+			if valueHasSecret(iter.Key()) || valueHasSecret(iter.Value()) {
+				return true
+			}
+		}
+	case reflect.Pointer, reflect.Interface:
+		if !v.IsNil() {
+			return valueHasSecret(v.Elem())
+		}
+	}
+	return false
 }
 
 // validateTOML is the one gate both flows share, over the exact TOML
 // text that will become the candidate's Bytes.
+//
+// A proposal carrying any form of a credential value is refused before
+// anything in it runs: first in the source text, then again in every
+// decoded string once it parses (escapes can rebuild a value). It is rejected, not
+// redacted: the candidate's bytes are what the human reviews and what is
+// installed, so rewriting them would break that binding, and an entry that
+// embeds a token is wrong whatever the token's position. The error names
+// no value, so the retry prompt and the session files cannot echo it.
 func validateTOML(tomlSrc string, bin, targetReal string, run detect.Runner) (Candidate, error) {
+	if containsSecret(tomlSrc) {
+		return Candidate{}, errCredentialInProposal
+	}
 	h, err := catalog.ParseEntry("proposed-catalog.toml", []byte(tomlSrc))
 	if err != nil {
 		return Candidate{}, err
+	}
+	if harnessHasSecret(h) {
+		return Candidate{}, errCredentialInProposal
 	}
 	if err := shapeGate(h, bin, targetReal); err != nil {
 		return Candidate{}, err

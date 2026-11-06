@@ -336,6 +336,15 @@ retry keeps the raw draft in `rejected.txt` instead. A saved proposal that
 fails revalidation at `--install` is marked rejected in `session.json`; it
 gets no `rejected.txt`.
 
+The credentials doctor passes to the agent (`ANTHROPIC_API_KEY`,
+`ANTHROPIC_AUTH_TOKEN`, `CLAUDE_CODE_OAUTH_TOKEN`) are written as `[redacted]`
+in the session files, and a draft that contains one is rejected. A value is
+matched as typed and in the exact percent-encodings Go's `url.QueryEscape` and
+`url.PathEscape` produce. Other spellings of the same encoding, such as
+lower-case `%2f`, are not matched. A partial echo, such as a fragment of a
+token, is not caught either: any fragment rule would either miss short pieces
+or start redacting ordinary text.
+
 A successful run ends with a review block — the harness id and name, every
 install with its method, package, bin, and paths, the version command, and
 the update command on its own line, verbatim. Values are rendered

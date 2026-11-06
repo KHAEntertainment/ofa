@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -12,6 +13,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 	"unicode/utf8"
@@ -280,36 +282,26 @@ func execBounded(ctx context.Context, name string, args []string, spec execSpec)
 	// WaitDelay bounds the pipe waits: once the process is gone, stragglers
 	// holding the pipes cost at most this.
 	cmd.WaitDelay = pipeDrainDelay
-	cmd.Cancel = func() error { return killProcessGroup(cmd) }
+	guard := &groupGuard{}
+	cmd.Cancel = func() error { return killProcessGroup(cmd, guard) }
 
-	err = cmd.Run()
+	if err = cmd.Start(); err == nil {
+		killGroupBeforeReap(cmd.Process.Pid, guard)
+		// From here on no group kill may be sent: Wait is about to reap the
+		// leader and free its PID.
+		guard.release()
+		if beforeWait != nil {
+			beforeWait(cmd, guard)
+		}
+		err = cmd.Wait()
+	}
 	if err != nil {
 		var ee *exec.ExitError
 		if errors.Is(err, exec.ErrWaitDelay) && !errors.As(err, &ee) {
-			// The process itself exited cleanly; a straggler kept the pipes
-			// open past WaitDelay. Treat it as success with the output we
-			// collected.
+			// The process itself exited cleanly; a straggler outside the
+			// group (setsid) kept the pipes open past WaitDelay. Treat it as
+			// success with the output we collected.
 			err = nil
-		}
-	}
-	// Reap lingering group members after Wait, on EVERY outcome — not just
-	// ErrWaitDelay: a parent that exits NON-ZERO returns *exec.ExitError,
-	// which masks ErrWaitDelay, and its same-group pipe-holding child then
-	// outlives the runner's return (R3-B2). The cleanup does not depend on
-	// Wait's error type: kill(-pgid, 0) succeeds only while the group still
-	// has a live (or unreaped) member. What is guaranteed: the leader has
-	// just been reaped by Wait, so a probe hit means a member survived the
-	// leader — within this window (WaitDelay is 2s, not milliseconds) PID
-	// reuse is implausible on real schedulers but NOT kernel-guaranteed;
-	// ESRCH (group gone) and EPERM are tolerated. What is NOT guaranteed:
-	// membership evidence — an open pipe proves a descriptor, not that its
-	// holder is in this group — and deliberately detached (setsid)
-	// descendants are outside the group and are not chased. The timeout
-	// path kills the group pre-reap inside Cancel, where the PGID is
-	// unconditionally valid.
-	if cmd.Process != nil {
-		if syscall.Kill(-cmd.Process.Pid, syscall.Signal(0)) == nil {
-			_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
 		}
 	}
 	if ctxErr := ctx.Err(); ctxErr != nil {
@@ -321,13 +313,92 @@ func execBounded(ctx context.Context, name string, args []string, spec execSpec)
 	return stdout.String(), stderr.String(), stdout.truncated, nil
 }
 
-// killProcessGroup is the exec.Cancel hook: on context cancellation it
-// kills the child's whole process group (the child is the group leader via
-// Setpgid), so descendants die with it.
-func killProcessGroup(cmd *exec.Cmd) error {
+// groupKill sends SIGKILL to process group pgid. It is a variable only so
+// tests can observe which group kills are sent, and when.
+var groupKill = func(pgid int) { _ = syscall.Kill(-pgid, syscall.SIGKILL) }
+
+// beforeWait, when a test sets it, runs between guard.release and Wait:
+// the one point where a late Cancel must already be a no-op.
+var beforeWait func(cmd *exec.Cmd, g *groupGuard)
+
+// groupGuard keeps every group kill apart from the reap. A PGID is the
+// leader's PID, and the kernel (Linux and XNU alike) keeps a PID allocated
+// while its process exists, zombie or not. So while the leader is unreaped,
+// -pgid can only name the group the leader created, which holds our
+// descendants and nothing else. Once Wait reaps the leader the PID is free:
+// when the last member exits, an unrelated process can be given the PID,
+// make itself a group leader, and receive a SIGKILL meant for us.
+//
+// execBounded calls release before Wait. Every kill (the post-exit group
+// kill, and Cancel's group and leader kills) runs under the same mutex and
+// is skipped after release, so no kill can run after the reap. This matters because
+// os/exec may call Cancel AFTER Wait has reaped the leader: its context
+// watcher can see ctx.Done in the same moment Wait completes.
+type groupGuard struct {
+	mu       sync.Mutex
+	released bool
+}
+
+// do runs signal under the guard unless the guard has been released, and
+// reports whether it ran.
+func (g *groupGuard) do(signal func()) bool {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if g.released {
+		return false
+	}
+	signal()
+	return true
+}
+
+// release forbids every later group kill.
+func (g *groupGuard) release() {
+	g.mu.Lock()
+	g.released = true
+	g.mu.Unlock()
+}
+
+// killGroupBeforeReap kills what is left of the child's process group once
+// the leader has exited, on EVERY outcome: a parent that exits non-zero
+// still leaves its same-group, pipe-holding children behind (R3-B2).
+// waitLeaderExit blocks until the leader exits WITHOUT reaping it, so the
+// kill is sent while the zombie leader still pins the PGID (see groupGuard).
+//
+// Behaviour (#28): same-group descendants die when the leader exits. They
+// used to get up to WaitDelay (2s) longer. Output they would have written
+// after the leader's exit is lost; output written before it is kept.
+//
+// What is guaranteed: no group kill is sent once the leader may have been
+// reaped. What is not: deliberately detached (setsid) descendants are
+// outside the group and are not chased; WaitDelay alone bounds how long
+// they can hold the pipes. When the no-reap wait is unavailable
+// (reap_other.go) or fails, no kill is sent here at all: a straggler that
+// WaitDelay bounds is better than a signal to a group that may not be ours.
+func killGroupBeforeReap(pid int, g *groupGuard) {
+	if waitLeaderExit(pid) == nil {
+		g.do(func() { groupKill(pid) })
+	}
+}
+
+// killProcessGroup is the exec.Cancel hook. On context cancellation while
+// the leader is unreaped (alive, or a zombie still pinning its PGID), it
+// kills the whole group and then the leader, so descendants die with it and
+// the leader's exit releases the no-reap wait.
+//
+// Not guaranteed: when Cancel runs after the guard has been released
+// (os/exec's watcher lost the race with a finished child), it sends
+// nothing, because the PGID may already be recycled. On the fallback path
+// (the no-reap wait unavailable or failed), the guard is released before
+// Wait while the leader may still be running. A timeout there is enforced
+// only by os/exec's own Process.Kill of the leader after WaitDelay, and
+// same-group descendants are not chased.
+func killProcessGroup(cmd *exec.Cmd, g *groupGuard) error {
 	if cmd.Process != nil {
-		_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
-		_ = cmd.Process.Kill()
+		pid := cmd.Process.Pid
+		g.do(func() {
+			groupKill(pid)
+			_ = cmd.Process.Kill()
+		})
 	}
 	return nil
 }
@@ -359,25 +430,61 @@ func streamSnippet(stdout, stderr string) string {
 // diagnostics and persisted output.
 var credentialVars = []string{"ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "CLAUDE_CODE_OAUTH_TOKEN"}
 
-// redactSecrets replaces the exact values of the credential variables
-// doctor passes to the agent with [redacted], longest value first so an
-// overlapping pair (one value a prefix of the other) cannot leave the
-// longer secret's suffix behind. Matching is EXACT-VALUE only: it is not a
-// credential-format scanner, and values that never crossed the agent
-// boundary are not guessed at — URL-encoded or partial echoes of a value
-// are out of scope.
-func redactSecrets(s string) string {
-	var secrets []string
+// credentialForms returns every form of the credential values that
+// redaction and the proposal gate match: each set value raw, and its
+// url.QueryEscape and url.PathEscape encodings (the two encodings an agent
+// echoing a token into a URL or a query string produces). Duplicates are
+// dropped, and the result is sorted longest first so an overlapping pair
+// (one form a prefix or substring of another) cannot leave the longer
+// form's remainder behind.
+func credentialForms() []string {
+	seen := map[string]bool{}
+	var forms []string
 	for _, k := range credentialVars {
-		if v := os.Getenv(k); v != "" {
-			secrets = append(secrets, v)
+		v := os.Getenv(k)
+		if v == "" {
+			continue
+		}
+		for _, f := range []string{v, url.QueryEscape(v), url.PathEscape(v)} {
+			if !seen[f] {
+				seen[f] = true
+				forms = append(forms, f)
+			}
 		}
 	}
-	sort.Slice(secrets, func(i, j int) bool { return len(secrets[i]) > len(secrets[j]) })
-	for _, v := range secrets {
-		s = strings.ReplaceAll(s, v, "[redacted]")
+	sort.Slice(forms, func(i, j int) bool { return len(forms[i]) > len(forms[j]) })
+	return forms
+}
+
+// redactSecrets replaces every credentialForms form of the credential
+// variables doctor passes to the agent with [redacted]. Matching is by
+// exact value and by the exact spellings url.QueryEscape and url.PathEscape
+// produce, and nothing else: another percent-encoding of the same value
+// (lower-case hex such as %2f, or escaping characters those functions
+// leave alone) is not matched. It is not a credential-format scanner, and
+// values that never crossed the agent boundary are not guessed at. PARTIAL echoes (a prefix, a suffix, a value split across
+// lines) are out of scope by decision: any fixed-length fragment rule
+// either misses a shorter fragment or starts redacting ordinary text that
+// happens to share characters with a token, and a corrupted audit trail is
+// worse than a documented limit. This scope decision is recorded for users
+// in the README's doctor section (README.md and npm/README.md). The issue
+// asked for docs/, but docs/ holds only release notes, and the README is
+// where doctor is documented.
+func redactSecrets(s string) string {
+	for _, f := range credentialForms() {
+		s = strings.ReplaceAll(s, f, "[redacted]")
 	}
 	return s
+}
+
+// containsSecret reports whether s holds any credentialForms form.
+func containsSecret(s string) bool {
+	for _, f := range credentialForms() {
+		if strings.Contains(s, f) {
+			return true
+		}
+	}
+	return false
 }
 
 // cappedBuffer is a bytes.Buffer that stops storing after limit bytes,
