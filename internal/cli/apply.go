@@ -81,7 +81,7 @@ func (a *App) applyCmd(args []string) ExitCode {
 		}
 		if !ok {
 			fmt.Fprintln(a.Stderr, "aborted")
-			return ExitOK
+			return ExitCancelled
 		}
 	}
 
