@@ -74,15 +74,31 @@ shasum -a 256 "$tmp"
 `-f` matters: without it `curl` writes an HTTP error body to the file and the
 checksum is of that body, which would publish a formula that can never install.
 
-Then commit and push the tap. Verify with `brew update && brew info ofa`.
+Then commit and push the tap. On Homebrew 6.0.0 and newer a non-official tap
+must be trusted before `brew info` loads its formula, so trust it once per
+machine first — that covers the short-name `brew info ofa` too:
+
+```sh
+brew trust khaentertainment/tap
+```
+
+Verify with `brew update && brew info ofa`.
 
 ## 5. Verify the whole chain
 
 ```sh
 gh release view vX.Y.Z                 # assets + checksums present
 npm view @khaentertainment/ofa version # matches the tag
+brew trust khaentertainment/tap        # trust the tap first on a fresh machine
 brew info KHAEntertainment/tap/ofa     # formula version + url match
 ```
+
+`brew trust` landed in Homebrew 5.1.15, where it only enforced trust with
+`HOMEBREW_REQUIRE_TAP_TRUST`; from 6.0.0 on, a non-official tap has to be
+trusted by default. Installing by fully qualified name trusts just that
+formula, so anyone who installed the way the README says needs no extra step —
+only commands that merely load the formula, like `brew info`, need the tap
+trusted first (see section 4).
 
 ## Review capacity fallback
 
