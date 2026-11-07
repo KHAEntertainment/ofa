@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -15,6 +16,7 @@ import (
 	"ofa/internal/catalog"
 	"ofa/internal/config"
 	"ofa/internal/detect"
+	"ofa/internal/picker"
 	"ofa/internal/resolve"
 	"ofa/internal/state"
 	"ofa/internal/update"
@@ -192,41 +194,161 @@ func TestPickerCmd_AutoScansOnMissingState(t *testing.T) {
 //
 // The loading spinner that used to run on stderr before the picker
 // (issue #12) is gone: the scan now animates inside the TUI's scanning
-// screen, so the interactive path writes nothing to the normal streams.
-// These tests pin that contract and the two-terminal gate.
+// screen. The TUI renders to the validated terminal (stderr, per the
+// two-stream gate) — so redirected stdout must receive no bytes at all —
+// and nothing is printed to the normal terminal buffer after teardown.
+
+// syncBuf is a goroutine-safe capture buffer: the TUI renders from its
+// own goroutine while a test polls the frames.
+type syncBuf struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (b *syncBuf) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.Write(p)
+}
+
+func (b *syncBuf) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.String()
+}
+
+// waitForBuf blocks until the captured stream contains substr. The
+// frames are stable history, so a one-way poll is a synchronization
+// point, not a sleep. Bounded at five seconds.
+func waitForBuf(t *testing.T, b *syncBuf, substr string) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		if strings.Contains(b.String(), substr) {
+			return
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	t.Fatalf("stream never contained %q:\n%s", substr, b.String())
+}
 
 // TestPickerFlow_InteractivePathPrintsNothingToNormalStreams: with real
-// terminals on both streams the whole flow runs in the alt screen and
-// leaves the normal streams empty — no spinner, no banner copy, no
-// plain "first run:" notice. Whatever phase the scripted q lands in
-// (scan or select), the exit is 0.
+// terminals on both streams the whole flow runs in the alt screen. The
+// TUI targets the validated stderr; redirected stdout gets zero bytes;
+// every phase frame lands on the TUI stream; and no plain "first run:"
+// notice survives anywhere.
 func TestPickerFlow_InteractivePathPrintsNothingToNormalStreams(t *testing.T) {
-	a, stdout, stderr, sd, sr, _ := newTestApp(t, nil, nil)
+	a, stdout, _, sd, sr, _ := newTestApp(t, nil, nil)
 	a.StderrIsTTY = func(io.Writer) bool { return true }
 	a.StdinIsTTY = func(io.Reader) bool { return true }
 	sd.instances = oneClaude()
 	sr.res = []resolve.Resolution{{HarnessID: "claude", Tier: "self"}}
+	a.StatePath = missingStatePath(t) // first run: the scan phase has real work
+
+	// The validated terminal is the TUI's destination; the test watches
+	// it through a race-safe buffer.
+	tui := &syncBuf{}
+	a.Stderr = tui
+	// Hold the pipeline inside Resolve until the scanning frame has been
+	// painted, so every phase frame is observably rendered.
+	a.ResolveFn = func(insts []detect.Instance, cat []catalog.Harness, run resolve.Runner, get resolve.Getter, cfg resolve.Config) []resolve.Resolution {
+		deadline := time.Now().Add(5 * time.Second)
+		for time.Now().Before(deadline) && !strings.Contains(tui.String(), picker.ScanCaption) {
+			time.Sleep(5 * time.Millisecond)
+		}
+		return sr.res
+	}
 
 	pr, pw := io.Pipe()
 	t.Cleanup(func() { pw.Close() })
 	a.Stdin = pr
-	go func() {
-		// Let the scan land on screen, then stop. The write blocks until
-		// the tea program reads it, so it cannot arrive before then.
-		time.Sleep(50 * time.Millisecond)
-		_, _ = pw.Write([]byte("q"))
-	}()
+	done := make(chan ExitCode, 1)
+	go func() { done <- a.Run() }()
 
-	if code := a.Run(); code != ExitOK {
+	waitForBuf(t, tui, picker.ScanCaption)  // phase 1: the scanning frame
+	waitForBuf(t, tui, "enter apply")       // phase 2: the picker frame
+	_, _ = pw.Write([]byte("\r"))           // empty selection → summary
+	waitForBuf(t, tui, "Nothing selected.") // phase 3: the summary frame
+	_, _ = pw.Write([]byte("q"))            // dismiss
+	if code := <-done; code != ExitOK {
 		t.Fatalf("interactive run exit = %d, want %d", code, ExitOK)
 	}
-	if stderr.Len() != 0 {
-		t.Errorf("stderr = %q, want zero bytes from the interactive path", stderr.String())
+
+	if stdout.Len() != 0 {
+		t.Errorf("redirected stdout = %q, want zero bytes (the TUI targets the validated stderr)", stdout.String())
 	}
-	for _, stream := range []*bytes.Buffer{stdout, stderr} {
-		if strings.Contains(stream.String(), "first run: scanning...") {
-			t.Errorf("stream = %q, want no plain first-run notice on the interactive path", stream.String())
+	got := tui.String()
+	for _, want := range []string{picker.ScanCaption, "enter apply", "Nothing selected."} {
+		if !strings.Contains(got, want) {
+			t.Errorf("TUI stream missing phase frame %q", want)
 		}
+	}
+	if strings.Contains(got, "first run: scanning...") {
+		t.Errorf("TUI stream = %q, want no plain first-run notice on the interactive path", got)
+	}
+}
+
+// TestPickerFlow_ConfigPinsReachThePicker: pins loaded from the real
+// ConfigLoader seam during the scan must reach the picker — a pinned row
+// renders pinned and cannot be selected or applied, while unpinned rows
+// still can. Regression: the flow used to capture a.Pins before
+// loadConfig populated it, so configured pins never reached the model.
+func TestPickerFlow_ConfigPinsReachThePicker(t *testing.T) {
+	a, stdout, _, sd, sr, se := newTestApp(t, nil, nil)
+	a.StderrIsTTY = func(io.Writer) bool { return true }
+	a.StdinIsTTY = func(io.Reader) bool { return true }
+	a.ConfigLoader = func() (config.Config, error) {
+		return config.Config{Pins: []string{"claude"}}, nil
+	}
+	sd.instances = oneClaude()
+	sd.instances = append(sd.instances, detect.Instance{
+		HarnessID: "qwen", Method: "npm", Package: "@qwen-code/qwen-code", Bin: "qwen", Version: "0.22.1", Status: detect.Active,
+	})
+	sr.res = []resolve.Resolution{
+		{HarnessID: "claude", Method: "native", Bin: "claude", Cur: "2.1.300", Tier: "self"}, // pinned in config
+		{HarnessID: "qwen", Method: "npm", Package: "@qwen-code/qwen-code", Bin: "qwen", Cur: "0.22.1", Latest: "0.25.2", Outdated: true, Tier: "npm"},
+	}
+	se.results["qwen (npm)"] = update.Result{Label: "qwen (npm)", ExitCode: 0}
+
+	tui := &syncBuf{}
+	a.Stderr = tui
+	pr, pw := io.Pipe()
+	t.Cleanup(func() { pw.Close() })
+	a.Stdin = pr
+	done := make(chan ExitCode, 1)
+	go func() { done <- a.Run() }()
+
+	waitForBuf(t, tui, "enter apply")
+	if !strings.Contains(tui.String(), "(pinned)") {
+		t.Errorf("config pins never reached the picker:\n%s", tui.String())
+	}
+	// Select all and apply. The pinned row must never reach the apply
+	// stage: no request row for it, no "pinned in config" skip row (what
+	// buildRequests would report if a pinned selection slipped through),
+	// and a one-row summary.
+	_, _ = pw.Write([]byte("a\r"))
+	waitForBuf(t, tui, "qwen (npm)")
+	if strings.Contains(tui.String(), "claude (native)") {
+		t.Error("pinned row was applied")
+	}
+	if strings.Contains(tui.String(), "pinned in config") {
+		t.Error("pinned row was selectable (it reached buildRequests)")
+	}
+	_, _ = pw.Write([]byte("q")) // stop after current, or dismiss
+	waitForBuf(t, tui, "Updates finished")
+	// The summary counts one row — the unpinned update — proving select-all
+	// took only it. (Full lines render fresh on the summary screen, unlike
+	// in-place checkbox toggles, so they are observable in the stream.)
+	waitForBuf(t, tui, "1 succeeded · 0 failed · 0 skipped")
+	_, _ = pw.Write([]byte("q"))
+	if code := <-done; code != ExitOK {
+		t.Fatalf("exit = %d, want %d", code, ExitOK)
+	}
+	if strings.Contains(tui.String(), "claude (native)") || strings.Contains(tui.String(), "pinned in config") {
+		t.Error("pinned row leaked into the apply stage")
+	}
+	if stdout.Len() != 0 {
+		t.Errorf("redirected stdout = %q, want zero bytes", stdout.String())
 	}
 }
 

@@ -270,6 +270,7 @@ func TestFlowModel_EmptyScanIsDismissibleExitZero(t *testing.T) {
 // TestFlowModel_SelectEnterBuildsStableRows: Enter builds one stable row
 // per selected update — pre-skipped ones included — and moves to apply.
 func TestFlowModel_SelectEnterBuildsStableRows(t *testing.T) {
+	stubLookPathAllowed(t) // the apply worker's PATH preflight must be hermetic
 	f, m := flowFixture(t)
 	f.cfg.Build = func(selected []resolve.Resolution) ([]update.Request, []SkippedRow) {
 		if len(selected) != 2 {
@@ -302,6 +303,9 @@ func TestFlowModel_SelectEnterBuildsStableRows(t *testing.T) {
 			t.Errorf("apply frame missing %q\n%s", want, v)
 		}
 	}
+	// Join the apply worker before returning: the ExecLookPath seam must
+	// only be restored after the worker can no longer touch it.
+	f.wg.Wait()
 }
 
 // TestFlowModel_EmptySelectionEnterShowsNothingSelected: the old
@@ -549,6 +553,7 @@ func TestRunFlow_ScanCancelJoinsWorkerBeforeReturning(t *testing.T) {
 // lifecycle over fake streams — select, apply, stop-after-current, and a
 // summary that waits for dismissal. The second update is never started.
 func TestRunFlow_ApplyStopAfterCurrentSkipsRestAndGatesSummary(t *testing.T) {
+	stubLookPathAllowed(t) // RunFlow's apply worker PATH preflight
 	out := &syncBuffer{}
 	pr, pw := io.Pipe()
 	t.Cleanup(func() { pw.Close() })
@@ -613,5 +618,53 @@ func TestRunFlow_ApplyStopAfterCurrentSkipsRestAndGatesSummary(t *testing.T) {
 		if !strings.Contains(got, want) {
 			t.Errorf("output missing %q\n%s", want, got)
 		}
+	}
+}
+
+// stubLookPathAllowed makes the ApplyObserved PATH preflight pass for the
+// fixture commands ("x", "y" — never executed; the Exec stub runs
+// instead), so tests never depend on the machine's PATH. Restored via
+// t.Cleanup, which runs only after the test body has returned — after
+// RunFlow's worker join (or an explicit flowState join) — and no test in
+// this package runs in parallel, so the seam is never shared.
+func stubLookPathAllowed(t *testing.T) {
+	t.Helper()
+	orig := update.ExecLookPath
+	update.ExecLookPath = func(string) (string, error) { return "/usr/bin/true", nil }
+	t.Cleanup(func() { update.ExecLookPath = orig })
+}
+
+// TestFlowModel_ScanPinsAreAuthoritative: pins loaded by the scan travel
+// with the resolutions and win over FlowConfig.Pins — including an empty
+// map, so unpinning can never fall back to stale pins. Only a scan that
+// carried no snapshot leaves the fixed pins in force.
+func TestFlowModel_ScanPinsAreAuthoritative(t *testing.T) {
+	res := []resolve.Resolution{
+		{HarnessID: "claude", Method: "native", Bin: "claude", Cur: "1", Tier: "self"},
+		{HarnessID: "qwen", Method: "npm", Bin: "qwen", Cur: "1", Latest: "2", Outdated: true, Tier: "npm"},
+	}
+
+	// Freshly loaded pins beat the stale fixed set.
+	_, m := scanFixture()
+	m.f.cfg.Pins = map[string]bool{"qwen": true}
+	m = updateMsg(t, m, scanResultMsg{res: ScanResult{Resolutions: res, Pins: map[string]bool{"claude": true}}})
+	if !m.items[0].Pinned || m.items[1].Pinned {
+		t.Errorf("scan pins must win: items = %+v", m.items)
+	}
+
+	// An empty (but present) snapshot means "nothing pinned".
+	_, m2 := scanFixture()
+	m2.f.cfg.Pins = map[string]bool{"claude": true}
+	m2 = updateMsg(t, m2, scanResultMsg{res: ScanResult{Resolutions: res, Pins: map[string]bool{}}})
+	if m2.items[0].Pinned {
+		t.Errorf("empty scan pins are authoritative (unpinning): items = %+v", m2.items)
+	}
+
+	// No snapshot at all: the fixed FlowConfig.Pins stay in force.
+	_, m3 := scanFixture()
+	m3.f.cfg.Pins = map[string]bool{"qwen": true}
+	m3 = updateMsg(t, m3, scanResultMsg{res: ScanResult{Resolutions: res}})
+	if !m3.items[1].Pinned {
+		t.Errorf("fixed pins must remain without a scan snapshot: items = %+v", m3.items)
 	}
 }

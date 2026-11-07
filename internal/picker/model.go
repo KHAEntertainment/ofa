@@ -272,7 +272,14 @@ func (m model) handleScanResult(res ScanResult) (tea.Model, tea.Cmd) {
 		m.exitCode = res.Code
 		return m, m.queueWait()
 	}
-	items := buildItems(res.Resolutions, m.f.cfg.Pins)
+	// Pins loaded by the scan are authoritative (an empty map means
+	// "nothing pinned", never "fall back"); only a scan that carried no
+	// snapshot at all leaves FlowConfig.Pins in force.
+	pins := res.Pins
+	if pins == nil {
+		pins = m.f.cfg.Pins
+	}
+	items := buildItems(res.Resolutions, pins)
 	if len(items) == 0 {
 		m.phase = phaseSummary
 		m.summaryKind = kindEmpty

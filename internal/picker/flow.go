@@ -41,9 +41,14 @@ const ScanDetail = "Detecting installed harnesses and checking available version
 type ScanResult struct {
 	// Resolutions are the scan's findings; nil on failure.
 	Resolutions []resolve.Resolution
+	// Pins is the pin snapshot loaded alongside the resolutions and
+	// consumed together with them (scan-result message, explicit
+	// happens-before). Non-nil is authoritative — including an empty
+	// map, so unpinning takes effect and stale pins can never linger.
+	// Nil leaves FlowConfig.Pins in force, for callers with fixed pins.
+	Pins map[string]bool
 	// Code is the caller's exit code for the failure case (0 = success).
-	// The TUI shows a dismissible error state and the flow exits with
-	// this code, so non-interactive exit-code semantics carry over.
+	// The TUI shows a dismissible error state and the flow exits with it.
 	Code int
 }
 

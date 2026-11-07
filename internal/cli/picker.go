@@ -203,9 +203,11 @@ func (a *App) pickerFlow() ExitCode {
 
 	var cat []catalog.Harness
 	res, err := picker.RunFlow(picker.FlowConfig{
-		Pins:   a.Pins,
-		Input:  a.Stdin,
-		Output: prevOut,
+		Pins:  a.Pins,
+		Input: a.Stdin,
+		// The TUI renders to the validated terminal: the gate checked
+		// stderr, so a redirected stdout must never receive alt-screen bytes.
+		Output: prevErr,
 		Scan: func(diag io.Writer, stop <-chan struct{}) picker.ScanResult {
 			sink.bind(diag)
 			return a.pickerScan(stop, &cat)
@@ -285,5 +287,12 @@ func (a *App) pickerScan(stop <-chan struct{}, catOut *[]catalog.Harness) picker
 	}
 	*catOut = cat
 	res.Resolutions = resolutions
+	// The pin snapshot travels with the resolutions (loadConfig just
+	// populated a.Pins). Normalize nil to an empty map: "loaded, nothing
+	// pinned" is authoritative — stale pins must never survive unpinning.
+	res.Pins = a.Pins
+	if res.Pins == nil {
+		res.Pins = map[string]bool{}
+	}
 	return res
 }
