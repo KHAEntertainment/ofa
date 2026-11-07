@@ -1,9 +1,12 @@
 package cli
 
 import (
+	"bytes"
 	"io"
+	"os"
 	"regexp"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -24,15 +27,16 @@ import (
 //   - they are written exactly once, no matter how many spinner frames
 //     are painted, and the pipeline itself never redraws them;
 //   - they are written before the first-run notice, so the first run is
-//     branded too;
+//     branded too, and a returning user is branded exactly once;
 //   - a non-TTY stderr, a usage error and the `ofa scan` subcommand get no
-//     banner bytes at all;
+//     banner bytes at all — including a stderr that is a character device
+//     but not a terminal;
 //   - NO_COLOR strips the banner's colors, while the spinner's cursor
 //     control escapes stay.
 //
 // Nothing here reaches a real terminal, a real `ofa` install or the
 // developer's own config: the app is built by newTestApp against temp
-// paths, and the spinner frames come from the injected ticker.
+// paths, and the spinner frames are observed rather than waited for.
 
 // sgrPattern matches the SGR escape sequences — the color and style codes.
 // Cursor control escapes such as "\x1b[2K" are deliberately not matched:
@@ -48,6 +52,53 @@ var braillePattern = regexp.MustCompile(`[\x{2800}-\x{28ff}]`)
 // was drawn with colors.
 func stripSGR(s string) string { return sgrPattern.ReplaceAllString(s, "") }
 
+// frameSignal is a mutex-guarded buffer that reports when the spinner has
+// written its second frame.
+//
+// The spinner draws from its own goroutine, so a test must never read the
+// buffer while a frame may be in flight. This writer takes the lock for
+// every write and for every read, and closes secondFrame once the second
+// frame has landed — a synchronization point, not a sleep.
+type frameSignal struct {
+	mu          sync.Mutex
+	buf         bytes.Buffer
+	frames      int
+	secondFrame chan struct{}
+	once        sync.Once
+}
+
+func newFrameSignal() *frameSignal {
+	return &frameSignal{secondFrame: make(chan struct{})}
+}
+
+func (w *frameSignal) Write(p []byte) (int, error) {
+	w.mu.Lock()
+	w.buf.Write(p)
+	if braillePattern.Match(p) {
+		w.frames++
+		if w.frames >= 2 {
+			w.once.Do(func() { close(w.secondFrame) })
+		}
+	}
+	w.mu.Unlock()
+	return len(p), nil
+}
+
+// String returns what has been written so far. Safe to read once the
+// writer is done — the tests read only after Stop joined the goroutine.
+func (w *frameSignal) String() string {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.buf.String()
+}
+
+// Frames returns how many spinner frames have been written.
+func (w *frameSignal) Frames() int {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.frames
+}
+
 // TestScanBanner_TTYDrawsBannerOnceAboveSpinner is the core of issue #43:
 // on a terminal the banner and the short tagline sit above the spinner
 // line, the scanning line carries the new caption, and the banner appears
@@ -55,17 +106,26 @@ func stripSGR(s string) string { return sgrPattern.ReplaceAllString(s, "") }
 func TestScanBanner_TTYDrawsBannerOnceAboveSpinner(t *testing.T) {
 	t.Setenv("NO_COLOR", "1") // plain art: the bytes are exactly banner.Plain()
 
-	a, _, stderr, sd, sr, _ := newTestApp(t, nil, nil)
+	a, _, _, sd, sr, _ := newTestApp(t, nil, nil)
 	a.StderrIsTTY = func(io.Writer) bool { return true }
 	sd.instances = oneClaude()
 
-	// A slow resolve buys several spinner frames: the banner must not be
-	// redrawn by any of them.
+	// The spinner paints from its own goroutine, so the test observes its
+	// frames instead of sleeping and hoping. The resolve waits for the
+	// second frame to have been written, so the pipeline cannot finish
+	// before the spinner has painted twice. The wait is bounded: on a
+	// timeout the resolve returns and the assertions below fail with the
+	// real frame count.
+	sig := newFrameSignal()
+	a.Stderr = sig
+	sr.res = []resolve.Resolution{{HarnessID: "claude", Tier: "self"}}
 	a.ResolveFn = func(insts []detect.Instance, cat []catalog.Harness, run resolve.Runner, get resolve.Getter, cfg resolve.Config) []resolve.Resolution {
-		time.Sleep(400 * time.Millisecond)
+		select {
+		case <-sig.secondFrame:
+		case <-time.After(5 * time.Second):
+		}
 		return sr.res
 	}
-	sr.res = []resolve.Resolution{{HarnessID: "claude", Tier: "self"}}
 
 	// The two calls pickerCmd makes, in the order it makes them.
 	a.drawScanBanner()
@@ -73,7 +133,9 @@ func TestScanBanner_TTYDrawsBannerOnceAboveSpinner(t *testing.T) {
 		t.Fatalf("pickerPipeline exit = %d, want %d", code, ExitOK)
 	}
 
-	got := stderr.String()
+	// Safe to read now: pickerPipeline's deferred Stop joined the
+	// drawing goroutine before it returned.
+	got := sig.String()
 	if n := strings.Count(got, banner.Plain()); n != 1 {
 		t.Errorf("banner art appears %d times in %q, want exactly 1", n, got)
 	}
@@ -93,7 +155,7 @@ func TestScanBanner_TTYDrawsBannerOnceAboveSpinner(t *testing.T) {
 
 	// The spinner really did paint more than one frame, so "drawn once"
 	// was tested against a redraw opportunity.
-	if frames := len(braillePattern.FindAllString(got, -1)); frames < 2 {
+	if frames := sig.Frames(); frames < 2 {
 		t.Errorf("spinner painted %d frames, want at least 2 to prove the banner is not redrawn", frames)
 	}
 }
@@ -179,6 +241,35 @@ func TestScanBanner_FirstRunShowsBannerBeforeScanNotice(t *testing.T) {
 	}
 }
 
+// TestScanBanner_SeededStateShowsBannerOnceAndNoFirstRunNotice: a
+// returning user — one whose state file already exists — is branded
+// exactly once and never sees the first-run notice.
+func TestScanBanner_SeededStateShowsBannerOnceAndNoFirstRunNotice(t *testing.T) {
+	t.Setenv("NO_COLOR", "1")
+
+	a, _, stderr, _, _, _ := newTestApp(t, nil, nil) // no args → the picker
+	a.StderrIsTTY = func(io.Writer) bool { return true }
+	// Seed the state file: the first run already happened.
+	if err := os.WriteFile(a.StatePath, []byte("{}"), 0o644); err != nil {
+		t.Fatalf("seed state: %v", err)
+	}
+
+	if code := a.Run(); code != ExitError {
+		t.Fatalf("bare ofa exit = %d, want %d", code, ExitError)
+	}
+
+	got := stderr.String()
+	if n := strings.Count(got, banner.Plain()); n != 1 {
+		t.Errorf("banner art appears %d times in %q, want exactly 1", n, got)
+	}
+	if !strings.Contains(got, scanTagline) {
+		t.Errorf("stderr = %q, want the short tagline %q", got, scanTagline)
+	}
+	if strings.Contains(got, "first run: scanning...") {
+		t.Errorf("a returning user must not see the first-run notice: %q", got)
+	}
+}
+
 // TestScanBanner_NonTTYWritesNoBannerBytes: piped, redirected and CI runs
 // stay byte-identical. Only the banner is withheld — the diagnostics the
 // path already wrote are still there.
@@ -205,6 +296,87 @@ func TestScanBanner_NonTTYWritesNoBannerBytes(t *testing.T) {
 	if !strings.Contains(got, "no TTY detected") {
 		t.Errorf("stderr = %q, want the no-TTY message to survive", got)
 	}
+}
+
+// TestScanBanner_DefaultGateSuppressesBannerOnPipe: the production path —
+// the default gate, not an injected one — must keep a non-terminal stderr
+// free of banner bytes. The pipe makes the bytes observable.
+func TestScanBanner_DefaultGateSuppressesBannerOnPipe(t *testing.T) {
+	t.Setenv("NO_COLOR", "1")
+
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("os.Pipe: %v", err)
+	}
+	t.Cleanup(func() { r.Close() })
+
+	a, _, _, sd, _, _ := newTestApp(t, nil, nil)
+	a.Stderr = w // a pipe: the default gate must reject it
+	a.StatePath = missingStatePath(t)
+	sd.instances = oneClaude()
+
+	if code := a.Run(); code != ExitError {
+		t.Fatalf("bare ofa exit = %d, want %d", code, ExitError)
+	}
+	// Close the write end so the read sees EOF.
+	w.Close()
+
+	data, err := io.ReadAll(r)
+	if err != nil {
+		t.Fatalf("read pipe: %v", err)
+	}
+	got := string(data)
+	if strings.Contains(stripSGR(got), banner.Plain()) {
+		t.Errorf("a piped stderr got banner bytes: %q", got)
+	}
+	if strings.Contains(got, scanTagline) {
+		t.Errorf("a piped stderr got the tagline: %q", got)
+	}
+	if !strings.Contains(got, "first run: scanning...") {
+		t.Errorf("stderr = %q, want the first-run notice to survive", got)
+	}
+}
+
+// TestStderrIsTTY_CharacterDeviceIsNotATerminal: /dev/null and /dev/zero
+// are character devices, so a stat-only mode check would let them through
+// and the banner and the spinner would be written to a device that
+// discards every byte. Only a real terminal passes the gate.
+func TestStderrIsTTY_CharacterDeviceIsNotATerminal(t *testing.T) {
+	devNull, err := os.Open(os.DevNull)
+	if err != nil {
+		t.Fatalf("open %s: %v", os.DevNull, err)
+	}
+	t.Cleanup(func() { devNull.Close() })
+	if stderrIsTTY(devNull) {
+		t.Errorf("%s must not pass the stderr terminal gate", os.DevNull)
+	}
+
+	// /dev/zero is where the device-node case shows up: a character
+	// device that is not a terminal. It is not present everywhere.
+	devZero, err := os.Open("/dev/zero")
+	if err != nil {
+		t.Logf("/dev/zero is not available here: %v", err)
+	} else {
+		t.Cleanup(func() { devZero.Close() })
+		if stderrIsTTY(devZero) {
+			t.Error("/dev/zero must not pass the stderr terminal gate")
+		}
+	}
+
+	// The positive case needs a real terminal, which a machine without a
+	// controlling terminal (a CI runner) does not have. It is a skip
+	// rather than a pass: the default output says SKIP, so a run that
+	// never checked the positive case cannot read as one that did.
+	t.Run("a controlling terminal is a terminal", func(t *testing.T) {
+		tty, err := os.OpenFile("/dev/tty", os.O_RDWR, 0)
+		if err != nil {
+			t.Skipf("no controlling terminal here (%v)", err)
+		}
+		defer tty.Close()
+		if !stderrIsTTY(tty) {
+			t.Error("stderrIsTTY(a controlling terminal) = false, want true")
+		}
+	})
 }
 
 // TestScanBanner_UsageErrorWritesNoBannerBytes: the banner is drawn after
