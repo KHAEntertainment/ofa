@@ -1,0 +1,44 @@
+--- stdout ---
+{
+  "scanned_at": "2025-01-01T00:00:00Z",
+  "harness_count": 3,
+  "install_count": 3,
+  "initial_scan": false,
+  "harnesses": {
+    "claude": {
+      "installs": [
+        {
+          "method": "native",
+          "bin": "claude",
+          "version": "2.1.300",
+          "status": "active"
+        }
+      ]
+    },
+    "codex": {
+      "installs": [
+        {
+          "method": "brew-cask",
+          "package": "codex",
+          "bin": "codex",
+          "version": "0.162.1",
+          "status": "active"
+        }
+      ]
+    },
+    "qwen": {
+      "installs": [
+        {
+          "method": "npm",
+          "package": "@qwen-code/qwen-code",
+          "bin": "qwen",
+          "version": "0.22.1",
+          "status": "active"
+        }
+      ]
+    }
+  }
+}
+--- stderr ---
+--- exit ---
+0
