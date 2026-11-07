@@ -43,6 +43,14 @@ type Request struct {
 	Label   string // human-readable: "claude (native)"
 	DryRun  bool   // print and return; do not execute
 	Verbose bool   // stream installer output to stdout; suppress progress lines
+	// Silent suppresses every terminal write the executor would make on
+	// its own (quiet-mode progress lines, verbose banners, the dry-run
+	// print). The interactive TUI renders its own per-row progress, so
+	// these bytes would only corrupt the alt screen. Installer output is
+	// still captured for Result.OutputTail. The picker sets this on the
+	// requests it runs; non-interactive callers leave it false and keep
+	// the existing output exactly.
+	Silent bool
 }
 
 // Result is the outcome of one Request. Exactly one of Skipped / Failed /
@@ -62,6 +70,37 @@ type Result struct {
 // Executor runs one command and returns its Result. DefaultExecutor shells
 // out and streams output; tests inject stubs to avoid touching the system.
 type Executor func(req Request) Result
+
+// EventType identifies which lifecycle transition an Event reports.
+type EventType int
+
+const (
+	// EventStarted fires just before a request's executor runs. Rows
+	// that are skipped without executing only get EventFinished.
+	EventStarted EventType = iota
+	// EventFinished fires exactly once per request — including requests
+	// skipped without executing (empty command, binary not on PATH,
+	// canceled before start).
+	EventFinished
+)
+
+// Event reports one request's lifecycle to an observer.
+//
+// Index is the request's position in the slice passed to ApplyObserved:
+// a stable identity that stays unique when several installs share a
+// label, so a UI can bind events to rows without guessing.
+//
+// Progress is deliberately absent: no built-in executor reports
+// trustworthy installer progress, so a row driven by these events is
+// always indeterminate rather than a fabricated percentage. An executor
+// that ever reports real progress can extend this struct then; nothing
+// here pretends to know more than the installer says.
+type Event struct {
+	Type   EventType
+	Index  int
+	Label  string
+	Result *Result // set on EventFinished; points at the bucketed Result
+}
 
 // Summary aggregates Apply's per-request results.
 type Summary struct {
@@ -94,9 +133,46 @@ var ExecLookPath = exec.LookPath
 // else (including DryRun) goes to Succeeded. DryRun is a flag on the
 // request, not a bucket; DefaultExecutor prints the command at execution
 // time so the dry-run transcript reads in order.
+//
+// Apply is ApplyObserved with no observer and no stop signal: behavior
+// and callers are unchanged.
 func Apply(requests []Request, exec Executor) Summary {
+	return ApplyObserved(requests, exec, nil, nil)
+}
+
+// ApplyObserved runs requests exactly as Apply does and additionally
+// reports each request's lifecycle through observe (nil to observe
+// nothing).
+//
+// stop, when non-nil, is a race-safe cancellation signal consumed between
+// requests: once it is closed, no further request is started and each
+// remaining one becomes a Skipped result with reason "canceled". A
+// request already in flight always runs to completion — Apply never kills
+// a running installer. Closing stop concurrently is safe; the channel is
+// only ever closed by its owner.
+func ApplyObserved(requests []Request, exec Executor, observe func(Event), stop <-chan struct{}) Summary {
 	var s Summary
-	for _, req := range requests {
+	for i, req := range requests {
+		emit := func(ev Event) {
+			if observe != nil {
+				observe(ev)
+			}
+		}
+		if stop != nil {
+			select {
+			case <-stop:
+				r := Result{
+					Label:         req.Label,
+					Cmd:           req.Cmd,
+					Skipped:       true,
+					SkippedReason: "canceled",
+				}
+				s.Skipped = append(s.Skipped, r)
+				emit(Event{Type: EventFinished, Index: i, Label: req.Label, Result: &s.Skipped[len(s.Skipped)-1]})
+				continue
+			default:
+			}
+		}
 		// Empty Cmd is a malformed request — skip without calling exec.
 		// Defends against a stray catalog entry or a bad CLI translation.
 		if len(req.Cmd.Cmd) == 0 {
@@ -106,6 +182,7 @@ func Apply(requests []Request, exec Executor) Summary {
 				Skipped:       true,
 				SkippedReason: "empty command",
 			})
+			emit(Event{Type: EventFinished, Index: i, Label: req.Label, Result: &s.Skipped[len(s.Skipped)-1]})
 			continue
 		}
 		if !req.DryRun {
@@ -118,10 +195,12 @@ func Apply(requests []Request, exec Executor) Summary {
 						Skipped:       true,
 						SkippedReason: fmt.Sprintf("%s not on PATH", bin),
 					})
+					emit(Event{Type: EventFinished, Index: i, Label: req.Label, Result: &s.Skipped[len(s.Skipped)-1]})
 					continue
 				}
 			}
 		}
+		emit(Event{Type: EventStarted, Index: i, Label: req.Label})
 		r := exec(req)
 		switch {
 		case r.Skipped:
@@ -131,6 +210,16 @@ func Apply(requests []Request, exec Executor) Summary {
 		default:
 			s.Succeeded = append(s.Succeeded, r)
 		}
+		var bucket *Result
+		switch {
+		case r.Skipped:
+			bucket = &s.Skipped[len(s.Skipped)-1]
+		case r.Failed || r.Err != nil:
+			bucket = &s.Failed[len(s.Failed)-1]
+		default:
+			bucket = &s.Succeeded[len(s.Succeeded)-1]
+		}
+		emit(Event{Type: EventFinished, Index: i, Label: req.Label, Result: bucket})
 	}
 	return s
 }
@@ -159,7 +248,9 @@ func DefaultExecutor(req Request) Result {
 	r := Result{Label: req.Label, Cmd: req.Cmd}
 
 	if req.DryRun {
-		fmt.Printf("  DRY-RUN  %s\n    %s\n", req.Label, req.Cmd.String())
+		if !req.Silent {
+			fmt.Printf("  DRY-RUN  %s\n    %s\n", req.Label, req.Cmd.String())
+		}
 		return r
 	}
 
@@ -189,6 +280,12 @@ func DefaultExecutor(req Request) Result {
 // be overwritten by the finish hook with the same `\033[2K\r` clear
 // regardless of label width.
 func announcePair(req Request) (func(), func(Result), io.Writer) {
+	if req.Silent {
+		// The TUI renders this request's progress itself; any terminal
+		// write here would corrupt the alt screen. Output is still
+		// captured by DefaultExecutor's safeBuffer for failure tails.
+		return func() {}, func(Result) {}, io.Discard
+	}
 	if req.Verbose {
 		start := func() {
 			fmt.Printf("\n── %s ──\n$ %s\n", req.Label, req.Cmd.String())
