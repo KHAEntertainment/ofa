@@ -36,12 +36,24 @@ func isTerminal(f *os.File) bool {
 }
 
 // stderrIsTTY is the default StderrIsTTY gate for the picker's loading
-// indicator. It reuses the same cheap ModeCharDevice check as isTerminal, so
-// piped and redirect-to-file stderr get zero spinner bytes. (A character
-// device like /dev/null also passes, which is harmless: the writes vanish.)
+// indicator and the scanning screen's banner.
+//
+// It asks the device itself, through stdinIsTTY, instead of the cheap
+// stat-only character-device test isTerminal does. /dev/null and
+// /dev/zero are character devices too, so the mode check alone would let
+// them through — and a banner or a spinner written to one is seen by
+// nobody: it only pollutes a device that discards bytes. stdinIsTTY asks
+// for a termios ioctl, so a pipe, a regular file and every non-terminal
+// character device answer no, and only a real terminal answers yes.
+//
+// stdinIsTTY is doctor's stdin gate; the question it asks — is this
+// device a real terminal? — is the same one for stderr, so it is reused
+// verbatim rather than duplicated. The check never reads, so it cannot
+// block, and it can only ever turn an interactive stderr into a
+// non-interactive one — never the other way round.
 func stderrIsTTY(w io.Writer) bool {
 	f, ok := w.(*os.File)
-	return ok && isTerminal(f)
+	return ok && stdinIsTTY(f)
 }
 
 // scanTagline is the short brand line shown under the OFA banner on the
