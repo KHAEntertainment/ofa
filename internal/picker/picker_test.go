@@ -274,6 +274,7 @@ func TestView_ContainsItemsAndFooter(t *testing.T) {
 }
 
 func TestView_HeaderIsBanner(t *testing.T) {
+	t.Setenv("NO_COLOR", "") // hermetic: ambient NO_COLOR must not decide this
 	m := fixture()
 	v := m.View().Content
 	// The banner is baked with SGR 24-bit color escapes (the orange→blue

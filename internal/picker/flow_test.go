@@ -13,6 +13,7 @@ import (
 
 	tea "charm.land/bubbletea/v2"
 
+	"ofa/internal/banner"
 	"ofa/internal/resolve"
 	"ofa/internal/update"
 )
@@ -105,6 +106,7 @@ func flowFixture(t *testing.T) (*flowState, model) {
 // on the scanning screen — on every run, first run included (the same
 // frame serves the first run; there is no separate plain notice).
 func TestFlowModel_ScanFrameShowsBannerCaptionTagline(t *testing.T) {
+	t.Setenv("NO_COLOR", "") // hermetic: ambient NO_COLOR must not decide this
 	_, m := scanFixture()
 	v := m.View().Content
 	for _, want := range []string{
@@ -141,6 +143,33 @@ func TestFlowModel_ScanFrameAnimatesSpinner(t *testing.T) {
 	m = updateMsg(t, m, animTickMsg{})
 	if !contains(m.frame(), spinnerFrame(m.anim)) {
 		t.Errorf("scan frame = %q, want the next spinner frame %q", m.frame(), spinnerFrame(m.anim))
+	}
+}
+
+// TestFlowModel_BannerNOColorMatchesBannerRender: the in-TUI banner
+// honors NO_COLOR exactly as banner.Render does on the plain paths (issue
+// #43 AC7): same art, plain, with colors intact when NO_COLOR is unset or
+// empty.
+func TestFlowModel_BannerNOColorMatchesBannerRender(t *testing.T) {
+	t.Setenv("NO_COLOR", "1")
+	_, m := scanFixture()
+	v := m.View().Content
+	if strings.Contains(v, "\x1b[38;2;") {
+		t.Errorf("NO_COLOR left banner colors in the scan frame\n%s", v)
+	}
+	for _, line := range strings.Split(banner.Plain(), "\n") {
+		if line != "" && !contains(v, line) {
+			t.Errorf("NO_COLOR scan frame missing plain banner line %q", line)
+		}
+	}
+	if !contains(v, ScanCaption) {
+		t.Errorf("NO_COLOR scan frame missing the caption")
+	}
+
+	t.Setenv("NO_COLOR", "") // present but empty: no-color.org keeps colors
+	_, m2 := scanFixture()
+	if !contains(m2.View().Content, "\x1b[38;2;") {
+		t.Error("empty NO_COLOR must keep the banner colors")
 	}
 }
 

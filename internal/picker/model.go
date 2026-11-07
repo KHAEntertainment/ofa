@@ -2,6 +2,7 @@ package picker
 
 import (
 	"fmt"
+	"os"
 	"strings"
 	"time"
 	"unicode/utf8"
@@ -509,9 +510,9 @@ func bannerBlock(width int, blurb string) string {
 	// Banner is the OFA logomark (35x8) with SGR 24-bit color escapes
 	// already inlined. bubbletea forwards these to the terminal verbatim,
 	// so the fade between #e67a4c and #4282d7 lands on screen as baked.
-	// Note: the picker always emits colors. NO_COLOR is honored by the
-	// banner.Render path used for --help, but the picker requires a TTY
-	// and the terminal handles color display from there.
+	// NO_COLOR (non-empty, per no-color.org) strips the colors exactly as
+	// banner.Render does on the plain paths — the same art, plain — so
+	// the convention holds on every screen.
 	//
 	// Center it above the content: each row gets (width-bannerWidth)/2
 	// plain leading spaces and the remainder as trailing spaces, so every
@@ -521,13 +522,17 @@ func bannerBlock(width int, blurb string) string {
 	// stay intact. A trailing blank line separates the banner from the
 	// first row.
 	const bannerWidth = banner.Cols
+	art := banner.Art
+	if v, ok := os.LookupEnv("NO_COLOR"); ok && v != "" {
+		art = banner.Plain()
+	}
 	extra := width - bannerWidth
 	var leftPad, rightPad string
 	if extra > 0 {
 		leftPad = strings.Repeat(" ", (extra+1)/2) // bias extra to the left
 		rightPad = strings.Repeat(" ", extra-len(leftPad))
 	}
-	for _, line := range strings.Split(banner.Art, "\n") {
+	for _, line := range strings.Split(art, "\n") {
 		fmt.Fprintf(&b, "%s%s%s\n", leftPad, line, rightPad)
 	}
 	b.WriteString("\n")
