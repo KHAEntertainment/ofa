@@ -1,29 +1,32 @@
 package cli
 
 import (
+	"bytes"
 	"errors"
 	"flag"
 	"fmt"
 	"io"
 	"os"
+	"sort"
 	"strings"
+	"sync"
 	"unicode/utf8"
 
 	"ofa/internal/banner"
 	"ofa/internal/catalog"
 	"ofa/internal/picker"
 	"ofa/internal/resolve"
-	"ofa/internal/spinner"
 	"ofa/internal/update"
 )
 
-// isTerminal reports whether f is a character device (terminal, console,
-// pipe). Used to bail out of the interactive picker when OFA is invoked
-// from a non-interactive context (CI, piped input, etc.).
+// isTerminal reports whether f is a character device — a necessary but
+// not sufficient condition for being a terminal. Used only where a rough
+// pre-check is wanted (doctor's open prompt); gates that must not fire on
+// /dev/null or /dev/zero use stderrIsTTY / stdinIsTTY, which ask the
+// device itself via termios.
 //
 // Cheap stat-based check; avoids the extra dep that golang.org/x/term
-// would bring. The downstream bubbletea.Program will do its own
-// isatty-style detection on top of this.
+// would bring.
 func isTerminal(f *os.File) bool {
 	if f == nil {
 		return false
@@ -35,16 +38,17 @@ func isTerminal(f *os.File) bool {
 	return (info.Mode() & os.ModeCharDevice) != 0
 }
 
-// stderrIsTTY is the default StderrIsTTY gate for the picker's loading
-// indicator and the scanning screen's banner.
+// stderrIsTTY is the default StderrIsTTY gate for the scanning screen's
+// banner on the non-interactive fallback path, and half of the gate that
+// opens the interactive TUI (issue #62).
 //
-// It asks the device itself, through stdinIsTTY, instead of the cheap
-// stat-only character-device test isTerminal does. /dev/null and
-// /dev/zero are character devices too, so the mode check alone would let
-// them through — and a banner or a spinner written to one is seen by
-// nobody: it only pollutes a device that discards bytes. stdinIsTTY asks
-// for a termios ioctl, so a pipe, a regular file and every non-terminal
-// character device answer no, and only a real terminal answers yes.
+// It asks the device itself, through stdinIsTTY, instead of a cheap
+// stat-only character-device test. /dev/null and /dev/zero are character
+// devices too, so a mode check alone would let them through — and a
+// banner or a spinner written to one is seen by nobody: it only pollutes
+// a device that discards bytes. stdinIsTTY asks for a termios ioctl, so a
+// pipe, a regular file and every non-terminal character device answer no,
+// and only a real terminal answers yes.
 //
 // stdinIsTTY is doctor's stdin gate; the question it asks — is this
 // device a real terminal? — is the same one for stderr, so it is reused
@@ -62,24 +66,18 @@ func stderrIsTTY(w io.Writer) bool {
 // package owns no part of the picker's layout.
 const scanTagline = "One-For-All. Harness Updater."
 
-// scanCaption is the caption on the scanning screen's spinner line.
-const scanCaption = "Scanning System for Harnesses..."
-
-// drawScanBanner writes the OFA banner and the short tagline to stderr, so
-// the brand is on screen while the harness scan runs (issue #43).
+// drawScanBanner writes the OFA banner and the short tagline to stderr,
+// so the brand is on screen while the harness scan runs (issue #43).
 //
-// Nothing is written when stderr is not a terminal: piped, redirected and CI
-// runs stay byte-identical.
+// Nothing is written when stderr is not a terminal: piped, redirected and
+// CI runs stay byte-identical.
 //
-// The banner is written once, above the spinner line. The spinner owns one
-// line and only ever rewrites that line, so no frame can redraw the banner
-// or double it.
-//
-// The banner lands in the terminal's normal buffer. The picker paints its
-// own banner into the alternate-screen buffer, so the two are never on
-// screen at the same time — but the normal-buffer copy comes back when the
-// alt screen is torn down, and the alt-screen switch itself shows one blank
-// frame. Issue #62 closes both by running the scan inside the TUI.
+// The banner is written once, above the plain scan output. Issue #62
+// moved the interactive flow into one alt-screen TUI, where the banner
+// and the scanning screen live inside the alt screen; this normal-buffer
+// banner belongs to the non-interactive fallback only, so the two copies
+// (normal buffer + alt screen) and the blank frame between phases can
+// never coexist.
 func (a *App) drawScanBanner() {
 	if !a.StderrIsTTY(a.Stderr) {
 		return
@@ -106,50 +104,25 @@ func centerUnderBanner(s string) string {
 	return left + s + strings.Repeat(" ", extra-len(left))
 }
 
-// pickerPipeline runs detect+resolve with the loading indicator up (issue
-// #12), below the banner the scanning screen draws (issue #43). The
-// indicator writes to stderr, never stdout, and only when stderr is
-// a terminal, so piped/CI runs stay byte-identical. It is stopped — clearing
-// its line — before the caller opens the picker's alt screen, and on every
-// early return via defer.
-//
-// runPipeline reports detection failures, stale caches, and save problems on
-// a.Stderr mid-flight; those writes are routed through the spinner so they
-// erase the indicator line instead of landing on top of it.
-func (a *App) pickerPipeline(cat []catalog.Harness) ([]resolve.Resolution, ExitCode) {
-	var sp *spinner.Spinner
-	if a.StderrIsTTY(a.Stderr) {
-		sp = spinner.Start(a.Stderr, scanCaption, spinner.DefaultTicker)
-	}
-	defer sp.Stop() // nil-safe
-
-	prev := a.Stderr
-	a.Stderr = sp.Writer(prev)
-	defer func() { a.Stderr = prev }()
-
-	_, resolutions, _, code := a.runPipeline(cat)
-	return resolutions, code
-}
-
 // pickerCmd is the interactive default: `ofa` (no subcommand). On a
 // machine with no state.json it auto-scans first (per cli-surface spec)
 // so the very first run still works without a separate `ofa scan` step.
 //
-// The flow:
+// The flow (issue #62 — one TUI for everything):
 //
-//  1. If state file is missing → run scan to populate it. The scan's
-//     human output goes to stderr so it isn't erased when the alt-screen
-//     picker takes over.
-//  2. Detect + resolve against the catalog, with a loading indicator on
-//     stderr when it is a terminal (cleared before the alt screen).
-//  3. Hand resolutions to the picker TUI.
-//  4. If the user pressed Enter on a selection → run update.Apply with
-//     the chosen items and return its exit code.
-//  5. If the user pressed q (or Ctrl-C) → exit cleanly with 0.
+//  1. When stdin AND stderr are real terminals, run the whole flow in
+//     one alt-screen TUI (picker.pickerFlow): scan (banner visible,
+//     first run included), picker, per-update progress rows, and a
+//     summary that stays until dismissed. Nothing is printed to the
+//     normal terminal afterwards — the process exit code is the only
+//     output.
+//  2. Otherwise fall back to plain output, byte-identical to the
+//     pre-#62 behavior: banner (when stderr is a terminal), the
+//     first-run scan and its notice, then a clear "use a subcommand
+//     instead" message.
 //
 // The picker is the only piece of OFA that requires a TTY. When stdin
-// isn't a TTY, the bubbletea program will fail to start; we surface a
-// clear "use a subcommand instead" message.
+// isn't a TTY, the fallback surfaces the same message it always has.
 func (a *App) pickerCmd(args []string) ExitCode {
 	// The bare picker accepts only --refresh (issue #8); anything else is
 	// a usage error, matching the subcommand FlagSets.
@@ -161,71 +134,156 @@ func (a *App) pickerCmd(args []string) ExitCode {
 	}
 	a.Refresh = *refresh
 
-	// Brand the scanning screen (issue #43): the OFA banner and its short
-	// tagline sit above the first-run notice and above the spinner line,
-	// so the mark is on screen while the harness scan runs. Drawn after
-	// the flags parse, so a usage error never gains banner output.
-	a.drawScanBanner()
+	// The TUI needs a real terminal on both streams (issue #62): a
+	// non-TTY stderr with a TTY stdin must not open the alt screen, or
+	// its escape bytes would land in whatever that stream points at.
+	// Both gates are real terminal checks (termios), not stat tests.
+	if a.StdinIsTTY(a.Stdin) && a.StderrIsTTY(a.Stderr) {
+		return a.pickerFlow()
+	}
 
-	// First-run auto-scan. Run scan only if there's no state file; the
-	// scan writes the file as a side effect, so subsequent runs skip.
-	// This runs even when stdin is not a TTY — a user piping `ofa` into
-	// a non-interactive context still benefits from a populated state.
+	// Non-interactive fallback — plain output, byte-identical to the
+	// pre-#62 behavior. The banner brand the first-run scan (#43); the
+	// scan itself writes its usual plain report. Then the no-TTY notice.
+	a.drawScanBanner()
 	if _, err := os.Stat(a.StatePath); errors.Is(err, os.ErrNotExist) {
 		fmt.Fprintln(a.Stderr, "first run: scanning...")
 		if code := a.scanCmd([]string{}); code != ExitOK {
 			return code
 		}
 	}
+	fmt.Fprintln(a.Stderr, "ofa: no TTY detected; use `ofa scan`, `ofa check`, or `ofa apply` instead")
+	return ExitError
+}
 
-	// Use a.Stdin (not os.Stdin) so tests can inject a non-TTY reader
-	// and exercise the bail-out path. isTerminal on a nil reader
-	// returns false, which is the correct behavior for tests.
-	stdin, ok := a.Stdin.(*os.File)
-	if !ok || !isTerminal(stdin) {
-		fmt.Fprintln(a.Stderr, "ofa: no TTY detected; use `ofa scan`, `ofa check`, or `ofa apply` instead")
+// emitSink captures everything the CLI pipeline writes during the
+// interactive flow and forwards it to the TUI's diag writer once bound,
+// so diagnostics are rendered inside the active TUI — never printed to
+// the normal buffer, never dropped (issue #62). Writes made before the
+// bind are buffered and flushed on bind. App.Stdout and App.Stderr are
+// reassigned only around RunFlow — never while the TUI is rendering —
+// and restored after RunFlow has joined its workers.
+type emitSink struct {
+	mu  sync.Mutex
+	w   io.Writer // bound by the Scan callback before any pipeline stage runs
+	buf bytes.Buffer
+}
+
+func (s *emitSink) bind(w io.Writer) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.buf.Len() > 0 {
+		_, _ = w.Write(s.buf.Bytes())
+		s.buf.Reset()
+	}
+	s.w = w
+}
+
+func (s *emitSink) Write(p []byte) (int, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.w == nil {
+		return s.buf.Write(p)
+	}
+	return s.w.Write(p)
+}
+
+// pickerFlow runs the whole interactive flow inside one alt-screen TUI
+// (issue #62): scan and detection (banner visible, #43), the picker, the
+// per-update progress rows, and a summary that stays until dismissed.
+// The CLI keeps its pipeline and update logic; the flow calls back into
+// it through Scan and Build and renders only what they report. After the
+// flow returns, nothing is printed to the normal terminal — the returned
+// exit code is the run's only output.
+func (a *App) pickerFlow() ExitCode {
+	sink := &emitSink{}
+	prevOut, prevErr := a.Stdout, a.Stderr
+	a.Stdout, a.Stderr = sink, sink
+	defer func() { a.Stdout, a.Stderr = prevOut, prevErr }()
+
+	var cat []catalog.Harness
+	res, err := picker.RunFlow(picker.FlowConfig{
+		Pins:   a.Pins,
+		Input:  a.Stdin,
+		Output: prevOut,
+		Scan: func(diag io.Writer, stop <-chan struct{}) picker.ScanResult {
+			sink.bind(diag)
+			return a.pickerScan(stop, &cat)
+		},
+		Build: func(selected []resolve.Resolution) ([]update.Request, []picker.SkippedRow) {
+			requests, skip := buildRequests(cat, selected, false /* picker is always quiet */, a.Pins)
+			// Stable rows: buildRequests reports skips keyed by label and
+			// map iteration order is random, so sort for a deterministic
+			// progress screen.
+			labels := make([]string, 0, len(skip))
+			for label := range skip {
+				labels = append(labels, label)
+			}
+			sort.Strings(labels)
+			skipped := make([]picker.SkippedRow, 0, len(skip))
+			for _, label := range labels {
+				skipped = append(skipped, picker.SkippedRow{Label: label, Reason: skip[label]})
+			}
+			return requests, skipped
+		},
+		Exec: a.UpdateExec,
+	})
+	if err != nil {
+		fmt.Fprintf(prevErr, "ofa: picker: %v\n", err)
 		return ExitError
 	}
+	return ExitCode(res.Code)
+}
 
+// pickerScan is the flow's Scan callback: the existing detect+resolve
+// pipeline (plus the first-run scan) with its diagnostics routed into
+// the TUI. Stages are launched only while no stop has been requested —
+// once one is, no further stage starts and in-flight bounded work runs
+// to completion. The synchronous detectors expose no cancellation API,
+// so the flow waits for them and never claims they were canceled.
+func (a *App) pickerScan(stop <-chan struct{}, catOut *[]catalog.Harness) picker.ScanResult {
+	var res picker.ScanResult
+	stopped := func() bool {
+		select {
+		case <-stop:
+			return true
+		default:
+			return false
+		}
+	}
+
+	// First-run auto-scan (cli-surface spec): populate the state file so
+	// later runs skip it. Its report lands in the TUI like any other
+	// diagnostic. Same order as the plain path: scan first, then
+	// catalog/config.
+	if _, err := os.Stat(a.StatePath); errors.Is(err, os.ErrNotExist) {
+		if code := a.scanCmd([]string{}); code != ExitOK {
+			res.Code = int(code)
+			return res
+		}
+	}
+	if stopped() {
+		return res
+	}
 	cat, code := a.loadCatalog()
 	if code != ExitOK {
-		return code
+		res.Code = int(code)
+		return res
 	}
 	if code := a.loadConfig(); code != ExitOK {
-		return code
+		res.Code = int(code)
+		return res
 	}
 	a.warnUnknownPins(cat)
-	resolutions, code := a.pickerPipeline(cat)
+	if stopped() {
+		return res
+	}
+	_, resolutions, _, code := a.runPipeline(cat)
 	if code != ExitOK {
-		return code
+		res.Code = int(code)
+		return res
 	}
-
-	outcome, err := picker.Run(resolutions, a.Pins)
-	if err != nil {
-		fmt.Fprintf(a.Stderr, "ofa: picker: %v\n", err)
-		return ExitError
-	}
-
-	if outcome.Quit || !outcome.Apply {
-		return ExitOK
-	}
-	if len(outcome.Selected) == 0 {
-		fmt.Fprintln(a.Stdout, "nothing selected")
-		return ExitOK
-	}
-
-	requests, skip := buildRequests(cat, outcome.Selected, false /* picker is always quiet */, a.Pins)
-	for label, reason := range skip {
-		fmt.Fprintf(a.Stderr, "ofa: skip %s: %s\n", label, reason)
-	}
-	if len(requests) == 0 {
-		fmt.Fprintln(a.Stdout, "nothing to apply")
-		return ExitOK
-	}
-
-	fmt.Fprintln(a.Stdout)
-	fmt.Fprintf(a.Stdout, "Applying %d update(s)\n", len(requests))
-	summary := update.Apply(requests, a.UpdateExec)
-	printApplySummary(a.Stdout, summary)
-	return ExitCode(summary.ExitCode())
+	*catOut = cat
+	res.Resolutions = resolutions
+	return res
 }

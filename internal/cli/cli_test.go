@@ -11,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	"ofa/internal/banner"
 	"ofa/internal/catalog"
 	"ofa/internal/config"
 	"ofa/internal/detect"
@@ -187,55 +188,72 @@ func TestPickerCmd_AutoScansOnMissingState(t *testing.T) {
 	}
 }
 
-// --- picker loading indicator (issue #12) ---
+// --- interactive flow (issue #62) ---
+//
+// The loading spinner that used to run on stderr before the picker
+// (issue #12) is gone: the scan now animates inside the TUI's scanning
+// screen, so the interactive path writes nothing to the normal streams.
+// These tests pin that contract and the two-terminal gate.
 
-// stagePicker stubs a minimal one-install pipeline and returns the app plus
-// its stderr buffer.
-func stagePicker(t *testing.T) (*App, *bytes.Buffer, *stubDetect, *stubResolve) {
-	t.Helper()
-	a, _, stderr, sd, sr, _ := newTestApp(t, nil, nil)
-	sd.instances = []detect.Instance{
-		{HarnessID: "claude", Method: "native", Bin: "claude", Version: "2.1.300", Status: detect.Active},
-	}
+// TestPickerFlow_InteractivePathPrintsNothingToNormalStreams: with real
+// terminals on both streams the whole flow runs in the alt screen and
+// leaves the normal streams empty — no spinner, no banner copy, no
+// plain "first run:" notice. Whatever phase the scripted q lands in
+// (scan or select), the exit is 0.
+func TestPickerFlow_InteractivePathPrintsNothingToNormalStreams(t *testing.T) {
+	a, stdout, stderr, sd, sr, _ := newTestApp(t, nil, nil)
+	a.StderrIsTTY = func(io.Writer) bool { return true }
+	a.StdinIsTTY = func(io.Reader) bool { return true }
+	sd.instances = oneClaude()
 	sr.res = []resolve.Resolution{{HarnessID: "claude", Tier: "self"}}
-	return a, stderr, sd, sr
-}
 
-func TestPickerPipeline_NonTTYEmitsNoSpinnerBytes(t *testing.T) {
-	a, stderr, _, _ := stagePicker(t)
-	a.StderrIsTTY = func(io.Writer) bool { return false }
+	pr, pw := io.Pipe()
+	t.Cleanup(func() { pw.Close() })
+	a.Stdin = pr
+	go func() {
+		// Let the scan land on screen, then stop. The write blocks until
+		// the tea program reads it, so it cannot arrive before then.
+		time.Sleep(50 * time.Millisecond)
+		_, _ = pw.Write([]byte("q"))
+	}()
 
-	res, code := a.pickerPipeline(testCatalog(t))
-	if code != ExitOK {
-		t.Fatalf("pickerPipeline exit = %d, want %d", code, ExitOK)
-	}
-	if len(res) != 1 {
-		t.Fatalf("resolutions = %d, want 1", len(res))
+	if code := a.Run(); code != ExitOK {
+		t.Fatalf("interactive run exit = %d, want %d", code, ExitOK)
 	}
 	if stderr.Len() != 0 {
-		t.Errorf("stderr = %q, want zero bytes with a non-TTY gate", stderr.String())
+		t.Errorf("stderr = %q, want zero bytes from the interactive path", stderr.String())
+	}
+	for _, stream := range []*bytes.Buffer{stdout, stderr} {
+		if strings.Contains(stream.String(), "first run: scanning...") {
+			t.Errorf("stream = %q, want no plain first-run notice on the interactive path", stream.String())
+		}
 	}
 }
 
-func TestPickerPipeline_TTYDrawsAndClearsSpinner(t *testing.T) {
-	a, stderr, _, _ := stagePicker(t)
-	a.StderrIsTTY = func(io.Writer) bool { return true }
+// TestPickerFlow_NonTTYStderrDoesNotOpenAltScreen pins issue #62's gate:
+// the alt screen needs a real terminal on both streams. A TTY stdin with
+// a non-TTY stderr takes the plain fallback — pre-#62 this combination
+// opened the alt screen and spilled its escape bytes into the redirected
+// stderr, a prior bug corrected here and pinned by this test.
+func TestPickerFlow_NonTTYStderrDoesNotOpenAltScreen(t *testing.T) {
+	a, _, stderr, sd, _, _ := newTestApp(t, nil, nil)
+	a.StdinIsTTY = func(io.Reader) bool { return true }   // TTY stdin
+	a.StderrIsTTY = func(io.Writer) bool { return false } // but a non-TTY stderr
+	a.StatePath = missingStatePath(t)
+	sd.instances = oneClaude()
 
-	if _, code := a.pickerPipeline(testCatalog(t)); code != ExitOK {
-		t.Fatalf("pickerPipeline exit = %d, want %d", code, ExitOK)
+	if code := a.Run(); code != ExitError {
+		t.Fatalf("exit = %d, want %d (the plain fallback's code)", code, ExitError)
 	}
-
 	got := stderr.String()
-	if !strings.Contains(got, "⠋") {
-		t.Errorf("stderr = %q, want a braille spinner frame", got)
+	if !strings.Contains(got, "first run: scanning...") {
+		t.Errorf("stderr = %q, want the first-run notice on the fallback", got)
 	}
-	if !strings.Contains(got, "Scanning System for Harnesses...") {
-		t.Errorf("stderr = %q, want the spinner caption", got)
+	if !strings.Contains(got, "no TTY detected") {
+		t.Errorf("stderr = %q, want the no-TTY message", got)
 	}
-	// The line must be erased before the picker takes the alt screen; Stop
-	// is the last writer, so the capture ends on the clear sequence.
-	if !strings.HasSuffix(got, "\r\033[2K") {
-		t.Errorf("stderr ends with %q, want the spinner line cleared", got)
+	if strings.Contains(stripSGR(got), banner.Plain()) {
+		t.Errorf("stderr = %q, want no banner bytes (non-TTY stderr)", got)
 	}
 }
 
@@ -395,7 +413,7 @@ func TestBuildRequests_NoCmdSkipped(t *testing.T) {
 		t.Errorf("want 0 requests (no update cmd), got %d", len(reqs))
 	}
 	if _, ok := skip["manual (native)"]; !ok {
-		t.Errorf("manual should be skipped with reason, got %+v", skip)
+		t.Errorf("manual should be in skipReasons, got %+v", skip)
 	}
 }
 

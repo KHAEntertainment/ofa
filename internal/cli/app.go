@@ -108,18 +108,19 @@ type App struct {
 	// Now is injected so tests can pin timestamps.
 	Now func() time.Time
 
-	// StderrIsTTY reports whether the picker may animate its loading
-	// indicator (issue #12). The default reuses the stat-based isTerminal
-	// check; tests override it to exercise both gates without needing a
-	// real terminal.
+	// StderrIsTTY reports whether stderr is a real terminal: it gates the
+	// scanning screen's banner on the plain fallback (issue #43/#12) and,
+	// with StdinIsTTY, the interactive TUI (issue #62). The default is
+	// stderrIsTTY — a termios check through stdinIsTTY, not a stat-only
+	// mode test, so /dev/null and /dev/zero are correctly excluded; tests
+	// override it to exercise both gates without needing a real terminal.
 	StderrIsTTY func(io.Writer) bool
 
-	// StdinIsTTY reports whether doctor's install prompt may read an
-	// interactive answer from Stdin. The default is stricter than
-	// StderrIsTTY's stat-based check: it asks the device itself (a
-	// termios ioctl) whether stdin is a real terminal, and excludes
-	// /dev/null; tests override it so the prompt and the
-	// non-interactive branch are both reachable without a real terminal.
+	// StdinIsTTY reports whether stdin is a real terminal (a termios
+	// ioctl that excludes /dev/null). It gates doctor's install prompt
+	// and, with StderrIsTTY, the interactive picker TUI (issue #62).
+	// Tests override it so the interactive and non-interactive branches
+	// are both reachable without a real terminal.
 	StdinIsTTY func(io.Reader) bool
 
 	// ConfigLoader reads the user config (~/.config/ofa/config.toml).
