@@ -229,7 +229,7 @@ func TestPickerPipeline_TTYDrawsAndClearsSpinner(t *testing.T) {
 	if !strings.Contains(got, "⠋") {
 		t.Errorf("stderr = %q, want a braille spinner frame", got)
 	}
-	if !strings.Contains(got, "scanning harnesses") {
+	if !strings.Contains(got, "Scanning System for Harnesses...") {
 		t.Errorf("stderr = %q, want the spinner caption", got)
 	}
 	// The line must be erased before the picker takes the alt screen; Stop
