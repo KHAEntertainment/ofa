@@ -153,11 +153,22 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, m.animCmd()
 	case tea.WindowSizeMsg:
 		// Real terminal size (and resizes). Not a queue message: the
-		// queue waiter stays untouched.
+		// queue waiter stays untouched. Offsets normalize at the new
+		// geometry — no stale scroll position survives a resize.
 		m.width, m.height = msg.Width, msg.Height
+		m.scroll, m.logScroll = 0, 0
 		return m, nil
 	}
 	return m, nil
+}
+
+// dismiss is every model-initiated exit: it marks a normal dismissal on
+// the failure recorder (ordering terminal failures against it) and then
+// quits. Wrapper mode has no recorder and is unaffected.
+func (m model) dismiss() (tea.Model, tea.Cmd) {
+	m.f.requestDismissal()
+	m.quitting = true
+	return m, tea.Quit
 }
 
 // handleKey processes a single keystroke. The dispatch table is small
@@ -233,8 +244,7 @@ func (m model) handleKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 		case phaseSummary:
 			switch k {
 			case "ctrl+c", "q", "enter":
-				m.quitting = true
-				return m, tea.Quit
+				return m.dismiss()
 			case "l":
 				m.logView = true
 				return m, nil
@@ -322,9 +332,8 @@ func (m model) handleKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 func (m model) handleQuitKey() (tea.Model, tea.Cmd) {
 	switch {
 	case m.f == nil || m.phase == phaseSelect:
-		m.quitting = true
 		m.outcome = Outcome{Quit: true}
-		return m, tea.Quit
+		return m.dismiss()
 	case m.phase == phaseScan:
 		m.scanStopReq = true
 		m.f.stopScan() // idempotent: RunFlow's teardown may stop too
@@ -334,8 +343,7 @@ func (m model) handleQuitKey() (tea.Model, tea.Cmd) {
 		m.f.stopApply() // idempotent: the failure recorder may stop too
 		return m, nil
 	default: // phaseSummary
-		m.quitting = true
-		return m, tea.Quit
+		return m.dismiss()
 	}
 }
 
@@ -346,9 +354,8 @@ func (m model) handleQuitKey() (tea.Model, tea.Cmd) {
 // screen opens with the same items Run would have built.
 func (m model) handleScanResult(res ScanResult) (tea.Model, tea.Cmd) {
 	if m.scanStopReq {
-		m.quitting = true
 		m.exitCode = 0
-		return m, tea.Quit
+		return m.dismiss()
 	}
 	if res.Code != 0 {
 		m.phase = phaseSummary
@@ -721,6 +728,32 @@ func windowLines(body []string, scroll, visible int, tail bool) ([]string, int) 
 	return body[scroll : scroll+visible], scroll
 }
 
+// headerFor picks the header by actual fit, never by a guessed height
+// threshold (issue #43, review N3): the full banner art whenever the
+// real frame budget — header rows plus this frame's pinned status and
+// count lines, the footer, and at least one body row — can hold it, so a
+// standard 80x24 screen keeps its art; the compact tagline only when the
+// art genuinely cannot fit.
+func (m model) headerFor(width, pinned int) []string {
+	full := strings.Split(strings.TrimSuffix(bannerBlock(width, ScanTagline), "\n"), "\n")
+	compact := []string{truncateLine(centerTagline(ScanTagline, width), width), ""}
+	fits := func(header []string) bool {
+		if m.height <= 0 {
+			return true // unknown size: render everything
+		}
+		// header + pinned status lines + footer + at least one body row
+		return len(header)+pinned+1+1 <= m.height
+	}
+	switch {
+	case (width <= 0 || width >= banner.Cols) && fits(full):
+		return full
+	case fits(compact):
+		return compact
+	default:
+		return nil
+	}
+}
+
 // layout assembles a non-select screen: the banner header (compacted at
 // tiny heights), pinned status lines, a scrollable viewport over body
 // lines, and a footer that always stays visible. Width or height <= 0
@@ -735,13 +768,7 @@ func (m model) layout(body, pinned []string, footer string, scroll int, tail boo
 		w = contentWidth(probe)
 	}
 
-	var out []string
-	if m.height <= 0 || m.height >= 30 {
-		banner := bannerBlock(w, ScanTagline)
-		out = append(out, strings.Split(strings.TrimSuffix(banner, "\n"), "\n")...)
-	} else {
-		out = append(out, truncateLine(centerTagline(ScanTagline, w), w), "")
-	}
+	out := m.headerFor(w, len(pinned))
 	for _, line := range pinned {
 		out = append(out, truncateLine(line, w))
 	}
@@ -920,6 +947,18 @@ func (m model) selectFrame() string {
 			label = "\x1b[2m" + label + " (pinned)\x1b[0m"
 		}
 		fmt.Fprintf(&b, "%s[%s] %s\n", cursor, check, label)
+	}
+	if m.f != nil {
+		// Flow mode only (review B8): fast-scan warnings must be
+		// discoverable from the select screen. Run's wrapper layout is
+		// untouched below.
+		if n := len(m.diags); n > 0 {
+			fmt.Fprintf(&b, "\n  ! %d diagnostic line(s) — press l to view\n", n)
+		} else {
+			b.WriteString("\n")
+		}
+		b.WriteString("↑/↓ navigate · space toggle · a all · enter apply · q quit · l logs\n")
+		return b.String()
 	}
 	b.WriteString("\n↑/↓ navigate · space toggle · a all · enter apply · q quit\n")
 	return b.String()

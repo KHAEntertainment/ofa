@@ -3,7 +3,9 @@ package picker
 import (
 	"bytes"
 	"errors"
+	"fmt"
 	"io"
+	"os"
 	"regexp"
 	"strings"
 	"sync"
@@ -780,13 +782,13 @@ func TestObservedStreams_RecordAndStopSynchronously(t *testing.T) {
 		if stops != 1 {
 			t.Errorf("stop requests = %d, want 1 synchronous", stops)
 		}
-		if rec.firstErr() != err {
-			t.Errorf("recorded error = %v, want the original %v", rec.firstErr(), err)
+		if rec.failure() != err {
+			t.Errorf("recorded error = %v, want the original %v", rec.failure(), err)
 		}
 		// Repeated failure: first error wins, stop stays single.
 		_, _ = or.Read(make([]byte, 4))
-		if stops != 1 || rec.firstErr() != err {
-			t.Errorf("repeat changed state: stops=%d err=%v", stops, rec.firstErr())
+		if stops != 1 || rec.failure() != err {
+			t.Errorf("repeat changed state: stops=%d err=%v", stops, rec.failure())
 		}
 	}
 
@@ -803,7 +805,7 @@ func TestObservedStreams_RecordAndStopSynchronously(t *testing.T) {
 		if _, _ = ow.Write([]byte("frame")); stops != 1 {
 			t.Errorf("stop requests = %d, want 1 synchronous", stops)
 		}
-		if rec.firstErr() == nil {
+		if rec.failure() == nil {
 			t.Error("the original write failure must be recorded")
 		}
 	}
@@ -964,6 +966,12 @@ func TestRunFlow_WriteFailureReturnsOriginalErrorAndStops(t *testing.T) {
 	if !strings.Contains(runErr.Error(), "output write failed") {
 		t.Errorf("error = %v, want the original write failure", runErr)
 	}
+	if plan.ranSecond.Load() {
+		t.Error("queued installer ran after the write failure was observed")
+	}
+	if !plan.firstDone.Load() {
+		t.Error("the in-flight installer must be allowed to finish and be joined")
+	}
 }
 
 // TestRunFlow_InputEOFDuringApplyStopsQueuedWork (QA probe A2, elevated):
@@ -1097,6 +1105,7 @@ func TestFlowModel_AllSkippedSelectionShowsFullSummary(t *testing.T) {
 // render in plan order with stable distinct identities even when labels
 // repeat — never collapsed, never reordered.
 func TestFlowModel_PlanOrderAndDuplicateLabelsPreserved(t *testing.T) {
+	stubLookPathAllowed(t) // the apply worker's PATH preflight must be hermetic
 	f, m := flowFixture(t)
 	f.cfg.Build = func([]resolve.Resolution) FlowPlan {
 		return FlowPlan{
@@ -1121,6 +1130,9 @@ func TestFlowModel_PlanOrderAndDuplicateLabelsPreserved(t *testing.T) {
 			t.Errorf("row %d = %+v, want rowID %d state %v", i, m.rows[i], want.rowID, want.state)
 		}
 	}
+	// Join the apply worker before returning: the ExecLookPath seam must
+	// only be restored after the worker can no longer touch it.
+	f.wg.Wait()
 }
 
 // TestFlowModel_WidthTruncationKeepsStateAndBar (review B7): at 80 and
@@ -1214,5 +1226,288 @@ func TestFlowModel_DetailViewShowsFullContent(t *testing.T) {
 		if !contains(joined, frag) {
 			t.Errorf("detail view lost %q\n%s", frag, v)
 		}
+	}
+}
+
+// --- lifecycle ordering and terminal failures (issue #62 review N2) ---
+
+// TestFailureRecorder_OrderingPolicy: failures are ordered against the
+// normal dismissal by the recorder's own lifecycle state. Pre-dismissal
+// failures are always honored — genuine EOF/EIO/short writes are never
+// converted to success because dismissal raced them. Post-dismissal
+// failures are suppressed only when identified as our own shutdown's
+// cancellation noise (an already-closed handle).
+func TestFailureRecorder_OrderingPolicy(t *testing.T) {
+	// Record before dismissal: honored even after dismissal is marked.
+	rec := &failureRecorder{ch: make(chan struct{}), stop: func() {}}
+	rec.record(io.EOF)
+	rec.markDismissing()
+	if got := rec.failure(); got != io.EOF {
+		t.Errorf("pre-dismissal failure = %v, want io.EOF", got)
+	}
+
+	// Record after dismissal, own-shutdown noise: suppressed.
+	rec2 := &failureRecorder{ch: make(chan struct{}), stop: func() {}}
+	rec2.markDismissing()
+	rec2.record(os.ErrClosed)
+	if got := rec2.failure(); got != nil {
+		t.Errorf("post-dismissal shutdown noise = %v, want nil", got)
+	}
+
+	// Record after dismissal, genuine terminal failure: honored.
+	rec3 := &failureRecorder{ch: make(chan struct{}), stop: func() {}}
+	rec3.markDismissing()
+	rec3.record(io.EOF)
+	if got := rec3.failure(); got != io.EOF {
+		t.Errorf("post-dismissal genuine EOF = %v, want io.EOF", got)
+	}
+	// A wrapped genuine failure is never noise either.
+	rec4 := &failureRecorder{ch: make(chan struct{}), stop: func() {}}
+	rec4.markDismissing()
+	rec4.record(fmt.Errorf("write: %w", errors.New("EIO")))
+	if got := rec4.failure(); got == nil {
+		t.Error("post-dismissal write failure must not be suppressed")
+	}
+}
+
+// TestFailureRecorder_ConcurrentDismissalAndFailure: whichever side of
+// the mutex wins, the outcome is consistent with the observed order —
+// a genuine failure is reported unless it was noise after dismissal, and
+// nothing is ever fabricated.
+func TestFailureRecorder_ConcurrentDismissalAndFailure(t *testing.T) {
+	for i := 0; i < 200; i++ {
+		rec := &failureRecorder{ch: make(chan struct{}), stop: func() {}}
+		start := make(chan struct{})
+		var wg sync.WaitGroup
+		wg.Add(2)
+		go func() { defer wg.Done(); <-start; rec.markDismissing() }()
+		go func() { defer wg.Done(); <-start; rec.record(io.EOF) }()
+		close(start)
+		wg.Wait()
+		// io.EOF is never shutdown noise, so it must surface regardless
+		// of which side won the race.
+		if got := rec.failure(); got != io.EOF {
+			t.Fatalf("iteration %d: failure = %v, want io.EOF (q/error race must not swallow)", i, got)
+		}
+	}
+}
+
+// dataEOFReader delivers data and EOF in one Read — the (n>0, EOF) case.
+type dataEOFReader struct{}
+
+func (dataEOFReader) Read(p []byte) (int, error) {
+	n := copy(p, "a\r")
+	return n, io.EOF
+}
+
+// TestObservedReader_RecordBeforeReturnOnDataEOF: when a Read returns
+// data AND EOF, the record and the synchronous stop happen before the
+// bytes and the error reach tea — consumer processing can never outrun
+// the observation. The Reader contract (bytes + original error) is
+// preserved.
+func TestObservedReader_RecordBeforeReturnOnDataEOF(t *testing.T) {
+	stopped := false
+	rec := &failureRecorder{ch: make(chan struct{}), stop: func() { stopped = true }}
+	or := &observedReader{r: dataEOFReader{}, rec: rec}
+	buf := make([]byte, 8)
+	n, err := or.Read(buf)
+	if n != 2 || err != io.EOF || string(buf[:2]) != "a\r" {
+		t.Errorf("Read contract broken: n=%d err=%v data=%q", n, err, buf[:n])
+	}
+	if !stopped {
+		t.Error("record/stop must be synchronous before Read returns bytes to tea")
+	}
+	if rec.failure() != io.EOF {
+		t.Error("the EOF must be recorded as the original failure")
+	}
+}
+
+// TestRunFlow_QThenEOFSurfacesTheFailure: dismissal racing a genuine
+// terminal failure never converts it to success — the conservative
+// policy. (Fixture input is closed deliberately here; ordinary tests
+// hold their input through dismissal/join.)
+func TestRunFlow_QThenEOFSurfacesTheFailure(t *testing.T) {
+	stubLookPathAllowed(t)
+	out := &syncBuffer{}
+	pr, pw := io.Pipe()
+	done := make(chan FlowResult, 1)
+	var runErr error
+	go func() {
+		res, err := RunFlow(FlowConfig{
+			Scan:   failureScan,
+			Build:  func([]resolve.Resolution) FlowPlan { return FlowPlan{} },
+			Exec:   func(req update.Request) update.Result { return update.Result{Label: req.Label} },
+			Input:  pr,
+			Output: out,
+		})
+		runErr = err
+		done <- res
+	}()
+	waitForOutput(t, out, "enter apply")
+	_, _ = pw.Write([]byte("q")) // the user quits…
+	_ = pw.Close()               // …and the terminal dies in the same breath
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("RunFlow hung on the q+EOF race")
+	}
+	if !errors.Is(runErr, io.EOF) {
+		t.Errorf("error = %v, want the genuine EOF surfaced despite the dismissal race", runErr)
+	}
+}
+
+// TestRunFlow_SummaryWriteFailureReturnsErrorAndJoins (QA ENV4): a
+// pre-dismissal write failure while the summary waits for a dismissal
+// that never comes must terminate the run with the original error — the
+// watcher must deliver the shutdown — with every worker joined. The
+// writer is armed only once the summary is painted and no dismissal key
+// is ever sent.
+func TestRunFlow_SummaryWriteFailureReturnsErrorAndJoins(t *testing.T) {
+	stubLookPathAllowed(t)
+	out := &flakyWriter{failed: make(chan struct{})}
+	pr, pw := io.Pipe()
+	t.Cleanup(func() { pw.Close() })
+	done := make(chan FlowResult, 1)
+	var runErr error
+	go func() {
+		res, err := RunFlow(FlowConfig{
+			Scan: failureScan,
+			Build: func([]resolve.Resolution) FlowPlan {
+				return FlowPlan{
+					Rows:     []FlowRow{{RowID: 0, Label: "first", RequestIndex: 0}},
+					Requests: []update.Request{{Label: "first", Cmd: update.CmdSpec{Cmd: []string{"x", "1"}}}},
+				}
+			},
+			Exec:   func(req update.Request) update.Result { return update.Result{Label: req.Label, Cmd: req.Cmd} },
+			Input:  pr,
+			Output: out,
+		})
+		runErr = err
+		done <- res
+	}()
+	waitForOutput(t, out, "enter apply")
+	_, _ = pw.Write([]byte("a\r"))
+	waitForOutput(t, out, "Updates finished") // summary painted
+	out.arm()                                 // …and only now the output breaks
+	// One non-dismissal redraw so the broken output is exercised even
+	// though the summary frame is otherwise static.
+	_, _ = pw.Write([]byte("d"))
+	select {
+	case <-out.failed:
+	case <-time.After(5 * time.Second):
+		t.Fatal("no write reached the armed writer at the summary")
+	}
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("RunFlow hung after a summary write failure — the watcher never terminated the program")
+	}
+	if runErr == nil || !strings.Contains(runErr.Error(), "output write failed") {
+		t.Errorf("error = %v, want the original write failure", runErr)
+	}
+}
+
+// --- header budget and select diagnostics (issue #62 review N3/B8) ---
+
+// TestFlowModel_FullArtAt80x24PerPhase (review N3): the standard 80x24
+// terminal keeps the banner art on every screen — compaction is driven
+// by actual fit, not by a guessed height threshold.
+func TestFlowModel_FullArtAt80x24PerPhase(t *testing.T) {
+	_, scan := scanFixture()
+	scan = updateMsg(t, scan, tea.WindowSizeMsg{Width: 80, Height: 24})
+	if v := scan.frame(); !contains(v, "▓") {
+		t.Errorf("scan frame lost the banner art at 80x24\n%s", v)
+	}
+
+	_, apply := flowFixture(t)
+	apply.phase = phaseApply
+	apply.rows = []applyRow{{label: "first", state: rowRunning}}
+	apply = updateMsg(t, apply, tea.WindowSizeMsg{Width: 80, Height: 24})
+	if v := apply.frame(); !contains(v, "▓") {
+		t.Errorf("apply frame lost the banner art at 80x24\n%s", v)
+	}
+
+	_, summary := summaryFixture(t)
+	summary = updateMsg(t, summary, tea.WindowSizeMsg{Width: 80, Height: 24})
+	if v := summary.frame(); !contains(v, "▓") {
+		t.Errorf("summary frame lost the banner art at 80x24\n%s", v)
+	}
+}
+
+// TestFlowModel_HeaderCompactsOnlyWhenRequired (review N3): per-phase
+// boundary — the art stays for every height where header + pinned +
+// footer + one body row fit, and compacts on the first height that
+// cannot.
+func TestFlowModel_HeaderCompactsOnlyWhenRequired(t *testing.T) {
+	// Scan: pinned = caption/detail/blank (3) → full art needs
+	// 11 + 3 + 1 + 1 = 16 rows.
+	_, scan := scanFixture()
+	scan = updateMsg(t, scan, tea.WindowSizeMsg{Width: 80, Height: 16})
+	if v := scan.frame(); !contains(v, "▓") {
+		t.Errorf("scan should keep the art at height 16 (fits exactly)\n%s", v)
+	}
+	scan = updateMsg(t, scan, tea.WindowSizeMsg{Width: 80, Height: 15})
+	if v := scan.frame(); contains(v, "▓") || !contains(v, ScanTagline) {
+		t.Errorf("scan should compact at height 15 but keep the tagline\n%s", v)
+	}
+
+	// Apply: pinned = heading/blank (2) → full art needs 15 rows.
+	_, apply := flowFixture(t)
+	apply.phase = phaseApply
+	apply.rows = []applyRow{{label: "first", state: rowQueued}}
+	apply = updateMsg(t, apply, tea.WindowSizeMsg{Width: 80, Height: 15})
+	if v := apply.frame(); !contains(v, "▓") {
+		t.Errorf("apply should keep the art at height 15 (fits exactly)\n%s", v)
+	}
+	apply = updateMsg(t, apply, tea.WindowSizeMsg{Width: 80, Height: 14})
+	if v := apply.frame(); contains(v, "▓") {
+		t.Errorf("apply should compact at height 14\n%s", v)
+	}
+
+	// Summary: pinned = heading/counts/blank (3) → full art needs 16 rows.
+	_, summary := summaryFixture(t)
+	summary = updateMsg(t, summary, tea.WindowSizeMsg{Width: 80, Height: 16})
+	if v := summary.frame(); !contains(v, "▓") {
+		t.Errorf("summary should keep the art at height 16 (fits exactly)\n%s", v)
+	}
+	summary = updateMsg(t, summary, tea.WindowSizeMsg{Width: 80, Height: 15})
+	if v := summary.frame(); contains(v, "▓") {
+		t.Errorf("summary should compact at height 15\n%s", v)
+	}
+}
+
+// TestFlowModel_SelectShowsDiagnosticsHint (review B8): in flow mode the
+// select screen advertises the log view and counts live diagnostics, so
+// fast-scan warnings are discoverable before any apply.
+func TestFlowModel_SelectShowsDiagnosticsHint(t *testing.T) {
+	_, m := flowFixture(t) // flow mode, select phase
+	m = updateMsg(t, m, diagMsg{line: "warning: npm registry stale"})
+	v := m.frame()
+	if !contains(v, "1 diagnostic line(s) — press l to view") {
+		t.Errorf("flow select screen missing the diagnostics notice\n%s", v)
+	}
+	if !contains(v, "l logs") {
+		t.Errorf("flow select screen missing the l-logs key hint\n%s", v)
+	}
+	m = updateKey(t, m, "l")
+	if v := m.frame(); !contains(v, "warning: npm registry stale") {
+		t.Errorf("log view should open from select\n%s", v)
+	}
+
+	// Without diagnostics the notice is absent but the key stays discoverable.
+	_, m2 := flowFixture(t)
+	v2 := m2.frame()
+	if contains(v2, "diagnostic line(s)") {
+		t.Errorf("no-notice expected without diagnostics\n%s", v2)
+	}
+	if !contains(v2, "l logs") {
+		t.Errorf("the l-logs hint must be discoverable even before warnings\n%s", v2)
+	}
+
+	// Run's wrapper mode keeps the original footer byte-identical.
+	wm := fixture()
+	wv := wm.frame()
+	if contains(wv, "l logs") || contains(wv, "diagnostic line(s)") {
+		t.Errorf("wrapper select layout must be unchanged\n%s", wv)
 	}
 }

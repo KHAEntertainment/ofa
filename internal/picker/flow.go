@@ -252,6 +252,7 @@ type flowState struct {
 	scanOnce  sync.Once
 	applyOnce sync.Once
 	wg        sync.WaitGroup
+	rec       *failureRecorder
 }
 
 // stopScan requests that no further scan stage launches.
@@ -291,28 +292,190 @@ func (f *flowState) startApply(requests []update.Request) {
 // it. Stopping is never deferred to a watcher: by the time the failure
 // is observable, no queued work may start any more. The watcher's only
 // job is program shutdown.
+//
+// A small mutex-guarded lifecycle state expresses the order between a
+// failure and a normal dismissal: a failure observed before the user
+// dismissed is always honored — genuine EOF, EIO and short writes are
+// never converted to success merely because dismissal raced them — while
+// a failure observed after dismissal is suppressed only when it is
+// identified as our own shutdown's cancellation noise (an already-closed
+// handle); anything else is still honored.
 type failureRecorder struct {
 	stop func()
 	ch   chan struct{} // closed on first failure
 	once sync.Once
-	mu   sync.Mutex
-	err  error
+
+	mu                sync.Mutex
+	err               error
+	dismissing        bool // the model initiated a normal dismissal
+	errAfterDismissal bool
 }
 
 func (r *failureRecorder) record(err error) {
 	r.once.Do(func() {
 		r.mu.Lock()
 		r.err = err
+		r.errAfterDismissal = r.dismissing
 		r.mu.Unlock()
 		r.stop()
 		close(r.ch)
 	})
 }
 
-func (r *failureRecorder) firstErr() error {
+// markDismissing records that the model initiated a normal exit. Only
+// shutdown noise observed after this point may be suppressed.
+func (r *failureRecorder) markDismissing() {
+	r.mu.Lock()
+	r.dismissing = true
+	r.mu.Unlock()
+}
+
+// failure returns the error the run must report, or nil. Pre-dismissal
+// failures always surface; post-dismissal failures surface unless they
+// are identified own-shutdown cancellation noise.
+func (r *failureRecorder) failure() error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	if r.err == nil {
+		return nil
+	}
+	if r.errAfterDismissal && isShutdownNoise(r.err) {
+		return nil
+	}
 	return r.err
+}
+
+// isShutdownNoise identifies the one class of errors our own normal
+// shutdown may cause: reads or writes against a handle that shutdown
+// itself closed. Genuine terminal failures (EOF, EIO, short write) are
+// never noise.
+func isShutdownNoise(err error) bool {
+	return errors.Is(err, os.ErrClosed)
+}
+
+// -- capability-preserving stream observation (issue #62 review N1) --
+//
+// Tea detects a real terminal by asserting term.File
+// (io.ReadWriteCloser + Fd) on its input and output, and muesli/
+// cancelreader asserts its own File (ReadWriteCloser + Fd + Name) to
+// pick a genuinely cancellable reader. Wrapping a stream must therefore
+// preserve every capability the original had — never fabricate Fd or
+// Name. Three cases, chosen at construction: the full superset (the
+// *os.File production path), ReadWriteCloser+Fd without Name (tea keeps
+// raw mode; cancelreader deliberately falls back rather than see a
+// faked Name), and plain generic streams.
+
+// fileCap is the full capability set a terminal handle can carry: what
+// tea's term.File assertion needs plus the Name cancelreader's File
+// assertion needs. *os.File implements all of it.
+type fileCap interface {
+	io.ReadWriteCloser
+	Fd() uintptr
+	Name() string
+}
+
+// fileCapNoName is term.File exactly: enough for tea's raw-mode and
+// size detection, deliberately not enough for cancelreader's File.
+type fileCapNoName interface {
+	io.ReadWriteCloser
+	Fd() uintptr
+}
+
+// wrapInput returns an observing input that preserves every interface
+// the original input implements.
+func wrapInput(r io.Reader, rec *failureRecorder) io.Reader {
+	if f, ok := r.(fileCap); ok {
+		return &observedInputFile{fileCap: f, rec: rec}
+	}
+	if f, ok := r.(fileCapNoName); ok {
+		return &observedInputNoName{fileCapNoName: f, rec: rec}
+	}
+	return &observedReader{r: r, rec: rec}
+}
+
+// wrapOutput returns an observing output that preserves every interface
+// the original output implements. tea asserts term.File (which includes
+// Read) on its output too, so the file wrappers carry the full
+// ReadWriteCloser surface and override only Write.
+func wrapOutput(w io.Writer, rec *failureRecorder) io.Writer {
+	if f, ok := w.(fileCap); ok {
+		return &observedOutputFile{fileCap: f, rec: rec}
+	}
+	if f, ok := w.(fileCapNoName); ok {
+		return &observedOutputNoName{fileCapNoName: f, rec: rec}
+	}
+	return &observedWriter{w: w, rec: rec}
+}
+
+// observedInputFile observes reads while every other method (Write,
+// Close, Fd, Name) is the original handle's, byte for byte. Close
+// delegates — the wrapper owns nothing and closes nothing the caller
+// would not have.
+type observedInputFile struct {
+	fileCap
+	rec *failureRecorder
+}
+
+func (o *observedInputFile) Read(p []byte) (int, error) {
+	n, err := o.fileCap.Read(p)
+	if err != nil {
+		// Synchronous: the stop is requested before any byte of this
+		// read reaches tea, so consumer processing can never outrun the
+		// observation (read n>0 with EOF included).
+		o.rec.record(err)
+	}
+	return n, err
+}
+
+// observedInputNoName is the term.File-only case: tea keeps raw mode and
+// real sizing; cancelreader falls back because Name is absent — it is
+// never faked.
+type observedInputNoName struct {
+	fileCapNoName
+	rec *failureRecorder
+}
+
+func (o *observedInputNoName) Read(p []byte) (int, error) {
+	n, err := o.fileCapNoName.Read(p)
+	if err != nil {
+		o.rec.record(err)
+	}
+	return n, err
+}
+
+// observedOutputFile observes writes while every other method stays the
+// original handle's.
+type observedOutputFile struct {
+	fileCap
+	rec *failureRecorder
+}
+
+func (o *observedOutputFile) Write(p []byte) (int, error) {
+	n, err := o.fileCap.Write(p)
+	switch {
+	case err != nil:
+		o.rec.record(err)
+	case n < len(p):
+		o.rec.record(io.ErrShortWrite)
+	}
+	return n, err
+}
+
+// observedOutputNoName is the term.File-only output case.
+type observedOutputNoName struct {
+	fileCapNoName
+	rec *failureRecorder
+}
+
+func (o *observedOutputNoName) Write(p []byte) (int, error) {
+	n, err := o.fileCapNoName.Write(p)
+	switch {
+	case err != nil:
+		o.rec.record(err)
+	case n < len(p):
+		o.rec.record(io.ErrShortWrite)
+	}
+	return n, err
 }
 
 // observedWriter forwards to the wrapped writer and records the first
@@ -339,7 +502,8 @@ func (o *observedWriter) Write(p []byte) (int, error) {
 // user cannot dismiss anything, so it is treated exactly like an
 // abnormal terminal failure — stop, finish in-flight work, return the
 // original cause — instead of waiting forever. The original error is
-// always returned to the caller.
+// always returned to the caller, and the record/stop happens
+// synchronously before the bytes and the error reach tea.
 type observedReader struct {
 	r   io.Reader
 	rec *failureRecorder
@@ -371,6 +535,7 @@ func RunFlow(cfg FlowConfig) (FlowResult, error) {
 		applyStop: make(chan struct{}),
 	}
 	rec := &failureRecorder{ch: make(chan struct{}), stop: f.stopAll}
+	f.rec = rec
 	m := newFlowModel(f)
 
 	// WithoutSignalHandler: bubbletea's own handler turns SIGINT into
@@ -386,10 +551,10 @@ func RunFlow(cfg FlowConfig) (FlowResult, error) {
 	// tests use.
 	opts := []tea.ProgramOption{tea.WithoutSignalHandler(), tea.WithWindowSize(120, 40)}
 	if cfg.Input != nil {
-		opts = append(opts, tea.WithInput(&observedReader{r: cfg.Input, rec: rec}))
+		opts = append(opts, tea.WithInput(wrapInput(cfg.Input, rec)))
 	}
 	if cfg.Output != nil {
-		opts = append(opts, tea.WithOutput(&observedWriter{w: cfg.Output, rec: rec}))
+		opts = append(opts, tea.WithOutput(wrapOutput(cfg.Output, rec)))
 	}
 	p := tea.NewProgram(m, opts...)
 
@@ -451,13 +616,15 @@ func RunFlow(cfg FlowConfig) (FlowResult, error) {
 		return FlowResult{}, errors.Join(pErr, fmt.Errorf("picker: unexpected final model type %T", final))
 	}
 
-	// Honor the original failure. If the model chose to quit, any
-	// recorded error is shutdown noise and the exit is the model's;
-	// otherwise a recorded read/write/EOF error is the root cause and is
-	// returned verbatim, with any tea error kept as context — never
-	// swallowed either way.
+	// Honor the original failure by lifecycle order, never by final
+	// state: a failure observed before the user dismissed is always
+	// returned — genuine EOF, EIO and short writes are never converted
+	// to success merely because dismissal raced them. A failure observed
+	// after a normal dismissal is suppressed only when it is identified
+	// own-shutdown cancellation noise. A tea error that rode along is
+	// kept as context, never swallowed either way.
 	runErr := pErr
-	if root := rec.firstErr(); root != nil && !fm.quitting {
+	if root := rec.failure(); root != nil {
 		switch {
 		case pErr == nil:
 			runErr = root
@@ -468,6 +635,15 @@ func RunFlow(cfg FlowConfig) (FlowResult, error) {
 		}
 	}
 	return FlowResult{Code: fm.exitCode}, runErr
+}
+
+// requestDismissal marks that the model initiated a normal exit, so the
+// failure recorder can order terminal failures against it. Nil-safe
+// (Run's wrapper mode has no recorder).
+func (f *flowState) requestDismissal() {
+	if f != nil && f.rec != nil {
+		f.rec.markDismissing()
+	}
 }
 
 // rowState is one row's lifecycle on the progress screen.
