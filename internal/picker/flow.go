@@ -5,13 +5,17 @@
 // FlowConfig callbacks; this package only renders the state those
 // callbacks report. Workers talk to the model through a msgQueue, the
 // model requests cancellation through stop channels, and RunFlow joins
-// every worker before the TUI is torn down — nothing can write to the
-// terminal after the alt screen closes.
+// every worker before returning — nothing can outlive the flow. The
+// terminal itself is observed: the first write error, short write, read
+// error or EOF records its original cause and requests the idempotent
+// stop synchronously, so no queued work can start invisibly and the run
+// never waits forever on a terminal that is gone.
 
 package picker
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -21,6 +25,7 @@ import (
 	"syscall"
 
 	tea "charm.land/bubbletea/v2"
+	"github.com/charmbracelet/x/ansi"
 
 	"ofa/internal/resolve"
 	"ofa/internal/update"
@@ -48,17 +53,32 @@ type ScanResult struct {
 	// Nil leaves FlowConfig.Pins in force, for callers with fixed pins.
 	Pins map[string]bool
 	// Code is the caller's exit code for the failure case (0 = success).
-	// The TUI shows a dismissible error state and the flow exits with it.
+	// The TUI shows a dismissible error state and the flow exits with
+	// this code, so non-interactive exit-code semantics carry over.
 	Code int
 }
 
-// SkippedRow is a selected update that cannot be applied (pinned,
-// shadowed, missing catalog entry, …). It keeps its place on the
-// progress screen as a stable row in the skipped state, so no selection
-// ever silently disappears.
-type SkippedRow struct {
-	Label  string
-	Reason string
+// FlowPlan is the apply plan for a selection: the ordered rows to render
+// plus the requests to execute. Rows carry one entry per selected
+// update, in selection order — display order can never diverge from
+// what the user picked, and duplicate labels stay distinct rows.
+type FlowPlan struct {
+	// Rows are in selection order. RowID is each row's stable identity:
+	// its index in the Build's selected slice, never label-derived.
+	// RequestIndex indexes Requests, or is -1 for a row that will not
+	// run (its Reason says why).
+	Rows []FlowRow
+	// Requests to execute, in row order; update.Event.Index indexes
+	// here. A row's RequestIndex points into this slice.
+	Requests []update.Request
+}
+
+// FlowRow is one selected update's row in the plan.
+type FlowRow struct {
+	RowID        int    // stable identity: index in the selection
+	Label        string // display label
+	RequestIndex int    // index into FlowPlan.Requests, or -1 when pre-skipped
+	Reason       string // skip reason when RequestIndex < 0
 }
 
 // FlowConfig wires the CLI's existing pipeline and update logic into the
@@ -66,7 +86,8 @@ type SkippedRow struct {
 // back into it and renders only what the callbacks report.
 type FlowConfig struct {
 	// Pins names harness ids the user froze: those rows are still shown
-	// but are dimmed and cannot be selected.
+	// but are dimmed and cannot be selected. A scan that reports its own
+	// Pins snapshot (the CLI always does) supersedes this fixed set.
 	Pins map[string]bool
 
 	// Scan runs detect+resolve (and the first-run scan) on the flow's
@@ -75,19 +96,19 @@ type FlowConfig struct {
 	// work already in flight may run to completion. Diagnostics go to
 	// diag as complete lines and surface inside the TUI — never printed
 	// to the normal buffer, never dropped. RunFlow joins this goroutine
-	// before the TUI is torn down.
+	// before returning.
 	Scan func(diag io.Writer, stop <-chan struct{}) ScanResult
 
-	// Build turns the user's selection into runnable requests and
-	// pre-skipped rows. Every selected update appears exactly once
-	// across the two lists, so every selection owns a stable row.
-	Build func(selected []resolve.Resolution) (requests []update.Request, skipped []SkippedRow)
+	// Build turns the user's selection into the ordered row plan and
+	// runnable requests. Every selected update appears exactly once.
+	Build func(selected []resolve.Resolution) FlowPlan
 
 	// Exec runs one update request. Usually update.DefaultExecutor.
 	Exec update.Executor
 
 	// Input and Output override the tea program's streams (tests).
-	// Nil means tea's own defaults — the real terminal.
+	// Nil means tea's own defaults — the real terminal. Both are
+	// observed: the first read/write failure or EOF stops the run.
 	Input  io.Reader
 	Output io.Writer
 }
@@ -219,14 +240,29 @@ func (w *diagWriter) flush() {
 
 // flowState is the per-run state shared between RunFlow, the workers and
 // the (value-copied) model. The model touches it only from bubbletea's
-// single Update goroutine; workers only observe the stop channels.
+// single Update goroutine; workers and the failure observers only stop
+// it. Every stop is idempotent (sync.Once), so the model's per-phase
+// stops, the failure recorder and RunFlow's teardown can all request
+// cancellation without ever double-closing a channel.
 type flowState struct {
 	cfg       *FlowConfig
 	q         *msgQueue
 	scanStop  chan struct{}
 	applyStop chan struct{}
+	scanOnce  sync.Once
+	applyOnce sync.Once
 	wg        sync.WaitGroup
 }
+
+// stopScan requests that no further scan stage launches.
+func (f *flowState) stopScan() { f.scanOnce.Do(func() { close(f.scanStop) }) }
+
+// stopApply requests stop-after-current: ApplyObserved consumes it
+// between requests; the in-flight installer always finishes.
+func (f *flowState) stopApply() { f.applyOnce.Do(func() { close(f.applyStop) }) }
+
+// stopAll requests both stops. Idempotent and safe from any goroutine.
+func (f *flowState) stopAll() { f.stopScan(); f.stopApply() }
 
 // startApply launches the update worker. Requests are silenced — the TUI
 // renders per-row progress itself, and the executor's own terminal
@@ -249,10 +285,80 @@ func (f *flowState) startApply(requests []update.Request) {
 	}()
 }
 
+// failureRecorder captures the FIRST terminal failure — a write error, a
+// short write, a read error or EOF — with its original cause, and
+// requests the idempotent stop synchronously from the very call that saw
+// it. Stopping is never deferred to a watcher: by the time the failure
+// is observable, no queued work may start any more. The watcher's only
+// job is program shutdown.
+type failureRecorder struct {
+	stop func()
+	ch   chan struct{} // closed on first failure
+	once sync.Once
+	mu   sync.Mutex
+	err  error
+}
+
+func (r *failureRecorder) record(err error) {
+	r.once.Do(func() {
+		r.mu.Lock()
+		r.err = err
+		r.mu.Unlock()
+		r.stop()
+		close(r.ch)
+	})
+}
+
+func (r *failureRecorder) firstErr() error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.err
+}
+
+// observedWriter forwards to the wrapped writer and records the first
+// error or short write. The original error is always returned to the
+// caller — never swallowed, never replaced.
+type observedWriter struct {
+	w   io.Writer
+	rec *failureRecorder
+}
+
+func (o *observedWriter) Write(p []byte) (int, error) {
+	n, err := o.w.Write(p)
+	switch {
+	case err != nil:
+		o.rec.record(err)
+	case n < len(p):
+		o.rec.record(io.ErrShortWrite)
+	}
+	return n, err
+}
+
+// observedReader forwards to the wrapped reader and records the first
+// read error. EOF is terminal loss here, not a normal end: after EOF the
+// user cannot dismiss anything, so it is treated exactly like an
+// abnormal terminal failure — stop, finish in-flight work, return the
+// original cause — instead of waiting forever. The original error is
+// always returned to the caller.
+type observedReader struct {
+	r   io.Reader
+	rec *failureRecorder
+}
+
+func (o *observedReader) Read(p []byte) (int, error) {
+	n, err := o.r.Read(p)
+	if err != nil {
+		o.rec.record(err)
+	}
+	return n, err
+}
+
 // RunFlow runs the whole interactive flow in one bubbletea program:
 // the harness scan (banner visible, issue #43), the picker, per-update
 // progress rows, and a summary that stays until dismissed. It returns
-// once the user has dismissed the flow and every worker has been joined.
+// once the user has dismissed the flow and every worker has been joined,
+// or once a terminal failure (input error/EOF, output error/short write,
+// tea error) has stopped the work and joined it.
 //
 // Nothing is written to the normal terminal buffer by this function: all
 // screens render inside the alt screen, which tears down empty.
@@ -264,6 +370,7 @@ func RunFlow(cfg FlowConfig) (FlowResult, error) {
 		scanStop:  make(chan struct{}),
 		applyStop: make(chan struct{}),
 	}
+	rec := &failureRecorder{ch: make(chan struct{}), stop: f.stopAll}
 	m := newFlowModel(f)
 
 	// WithoutSignalHandler: bubbletea's own handler turns SIGINT into
@@ -279,12 +386,26 @@ func RunFlow(cfg FlowConfig) (FlowResult, error) {
 	// tests use.
 	opts := []tea.ProgramOption{tea.WithoutSignalHandler(), tea.WithWindowSize(120, 40)}
 	if cfg.Input != nil {
-		opts = append(opts, tea.WithInput(cfg.Input))
+		opts = append(opts, tea.WithInput(&observedReader{r: cfg.Input, rec: rec}))
 	}
 	if cfg.Output != nil {
-		opts = append(opts, tea.WithOutput(cfg.Output))
+		opts = append(opts, tea.WithOutput(&observedWriter{w: cfg.Output, rec: rec}))
 	}
 	p := tea.NewProgram(m, opts...)
+
+	// The failure watcher's only job is program shutdown — never
+	// stopping work (the recorder already did, synchronously). It is
+	// stopped and joined on every exit, including tea startup failure.
+	watcherStop := make(chan struct{})
+	watcherDone := make(chan struct{})
+	go func() {
+		defer close(watcherDone)
+		select {
+		case <-rec.ch:
+			p.Quit()
+		case <-watcherStop:
+		}
+	}()
 
 	sigs := make(chan os.Signal, 1)
 	signal.Notify(sigs, os.Interrupt, syscall.SIGTERM)
@@ -311,17 +432,42 @@ func RunFlow(cfg FlowConfig) (FlowResult, error) {
 		q.push(scanResultMsg{res: res})
 	}()
 
-	final, err := p.Run()
-	// Join before teardown completes: once this returns no worker can
-	// write anywhere, so the CLI may safely restore its streams and the
-	// terminal is left with the normal buffer untouched.
+	final, pErr := p.Run()
+
+	// Whatever ended the program — user dismissal, a terminal failure,
+	// or a tea error — stop before joining: no queued work may start
+	// now, in-flight bounded work finishes, and every worker is joined
+	// before this function returns. (Tea restores the terminal inside
+	// Run; no claim is made about that ordering — the guarantee here is
+	// join-before-return and no work after termination.)
+	f.stopAll()
 	f.wg.Wait()
 	q.close()
+	close(watcherStop)
+	<-watcherDone
+
 	fm, ok := final.(model)
 	if !ok {
-		return FlowResult{}, fmt.Errorf("picker: unexpected final model type %T", final)
+		return FlowResult{}, errors.Join(pErr, fmt.Errorf("picker: unexpected final model type %T", final))
 	}
-	return FlowResult{Code: fm.exitCode}, err
+
+	// Honor the original failure. If the model chose to quit, any
+	// recorded error is shutdown noise and the exit is the model's;
+	// otherwise a recorded read/write/EOF error is the root cause and is
+	// returned verbatim, with any tea error kept as context — never
+	// swallowed either way.
+	runErr := pErr
+	if root := rec.firstErr(); root != nil && !fm.quitting {
+		switch {
+		case pErr == nil:
+			runErr = root
+		case errors.Is(pErr, root):
+			runErr = root
+		default:
+			runErr = fmt.Errorf("%w (program: %v)", root, pErr)
+		}
+	}
+	return FlowResult{Code: fm.exitCode}, runErr
 }
 
 // rowState is one row's lifecycle on the progress screen.
@@ -353,10 +499,12 @@ func (s rowState) String() string {
 
 // applyRow is one selected update's stable row. A row exists from the
 // moment the user applies until the summary is dismissed; only its state
-// and bar change. reqIdx is the row's request index — the stable identity
-// update.Event carries — or -1 for a pre-skipped row. Rows may share a
-// label (two installs of one harness); identity never depends on it.
+// and bar change. rowID is the row's stable identity (its selection
+// index); reqIdx is the request index events carry, or -1 for a
+// pre-skipped row. Rows may share a label (two installs of one harness);
+// identity never depends on it.
 type applyRow struct {
+	rowID  int
 	label  string
 	state  rowState
 	reason string // skip reason or failure note
@@ -397,11 +545,75 @@ func bar(st rowState, anim int) string {
 	return "[" + string(cells) + "]"
 }
 
+// rowSuffix is the always-visible tail of a row line: the state word and
+// the bar. Width-aware truncation may shorten the label and reason but
+// never these — the row's state must stay readable at any width.
+func rowSuffix(r applyRow, anim int) string {
+	return fmt.Sprintf("%-8s %s", r.state.String(), bar(r.state, anim))
+}
+
 // rowLine renders one progress row: label, optional reason, state word
-// and the bar. Fixed column widths keep rows aligned and stable across
-// frames; nothing here is colored, matching the picker's plain rows.
-func rowLine(r applyRow, anim int) string {
-	return fmt.Sprintf("  %-24s %-40s %-8s %s", r.label, r.reason, r.state.String(), bar(r.state, anim))
+// and the bar. With width <= 0 (unknown size) it renders the full
+// legacy line. With a known width it keeps the state and bar visible and
+// truncates the label/reason to fit, measuring with ANSI cell width so
+// wide graphemes and style escapes count correctly.
+func rowLine(r applyRow, anim int, width int) string {
+	suffix := rowSuffix(r, anim)
+	if width <= 0 {
+		return fmt.Sprintf("  %-24s %-40s %s", r.label, r.reason, suffix)
+	}
+	budget := width - 2 - ansi.StringWidth(suffix) - 1
+	if budget < 1 {
+		return ansi.Truncate(suffix, width, "…")
+	}
+	text := r.label
+	if r.reason != "" {
+		text += "  " + r.reason
+	}
+	text = ansi.Truncate(text, budget, "…")
+	pad := budget - ansi.StringWidth(text)
+	if pad < 0 {
+		pad = 0
+	}
+	return "  " + text + strings.Repeat(" ", pad) + " " + suffix
+}
+
+// detailLines expands one row to its full, untruncated detail: label,
+// state, reason and failure tail, wrapped to the terminal width so no
+// content is lost — only moved to more lines (the viewport pages it).
+func detailLines(r applyRow, anim int, width int) []string {
+	lines := []string{
+		r.label,
+		"  " + rowSuffix(r, anim),
+	}
+	if r.reason != "" {
+		lines = append(lines, "  reason: "+r.reason)
+	}
+	if r.tail != "" {
+		lines = append(lines, "  output tail:")
+		for _, line := range strings.Split(r.tail, "\n") {
+			lines = append(lines, "    "+line)
+		}
+	}
+	if width <= 0 {
+		return lines
+	}
+	var out []string
+	for _, line := range lines {
+		out = append(out, wrapToWidth(line, width)...)
+	}
+	return out
+}
+
+// wrapToWidth hard-wraps one logical line to width cells, ANSI-aware,
+// so a detail or diagnostic line is fully readable via paging instead of
+// being truncated away.
+func wrapToWidth(line string, width int) []string {
+	if width <= 0 || ansi.StringWidth(line) <= width {
+		return []string{line}
+	}
+	wrapped := ansi.Hardwrap(line, width, true)
+	return strings.Split(wrapped, "\n")
 }
 
 // spinnerFrames is the braille cycle the scanning screen animates with —

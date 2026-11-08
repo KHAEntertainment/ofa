@@ -352,6 +352,144 @@ func TestPickerFlow_ConfigPinsReachThePicker(t *testing.T) {
 	}
 }
 
+// TestPickerFlow_StopDuringDetectNeverLaunchesResolve (review B3): a
+// stop observed while detection runs must prevent the resolve stage
+// from ever launching — the scan stops between stages, not only between
+// pipeline calls.
+func TestPickerFlow_StopDuringDetectNeverLaunchesResolve(t *testing.T) {
+	a, _, _, sd, sr, _ := newTestApp(t, nil, nil)
+	a.StderrIsTTY = func(io.Writer) bool { return true }
+	a.StdinIsTTY = func(io.Reader) bool { return true }
+	sd.instances = oneClaude()
+	sr.res = []resolve.Resolution{{HarnessID: "claude", Tier: "self"}}
+	// A seeded state file skips the first-run scan, so the only detect
+	// call is the pipeline's own.
+	if err := os.WriteFile(a.StatePath, []byte("{}"), 0o644); err != nil {
+		t.Fatalf("seed state: %v", err)
+	}
+
+	tui := &syncBuf{}
+	a.Stderr = tui
+	detectStarted := make(chan struct{})
+	releaseDetect := make(chan struct{})
+	resolveCalls := 0
+	a.DetectFn = func(cat []catalog.Harness, run detect.Runner) ([]detect.Instance, []detect.Failure, error) {
+		close(detectStarted)
+		<-releaseDetect // the in-flight stage runs to completion
+		return sd.instances, nil, nil
+	}
+	a.ResolveFn = func(insts []detect.Instance, cat []catalog.Harness, run resolve.Runner, get resolve.Getter, cfg resolve.Config) []resolve.Resolution {
+		resolveCalls++ // read after the run's join: no data race
+		return sr.res
+	}
+
+	pr, pw := io.Pipe()
+	t.Cleanup(func() { pw.Close() })
+	a.Stdin = pr
+	done := make(chan ExitCode, 1)
+	go func() { done <- a.Run() }()
+
+	<-detectStarted
+	waitForBuf(t, tui, "Scanning System for Harnesses...") // the scan screen is up
+	_, _ = pw.Write([]byte("q"))                           // stop during detect
+	// The stopping state is the sync point: the stop has been requested
+	// (and keeps rendering) while detection is still in flight, so the
+	// release below can never race ahead of the request.
+	waitForBuf(t, tui, "Stopping — waiting for the scan to finish…")
+	close(releaseDetect) // the in-flight stage finishes
+	if code := <-done; code != ExitOK {
+		t.Fatalf("exit = %d, want %d (canceled scan quits clean)", code, ExitOK)
+	}
+	if resolveCalls != 0 {
+		t.Errorf("resolve launched %d time(s) after the stop was observed, want 0", resolveCalls)
+	}
+}
+
+// TestRunPipelineUntil_JoinsBrewPrefetchOnDetectFailure (review B4): the
+// spawned `brew outdated` is joined on the detect-failure exit path —
+// background work must not outlive the pipeline. The join is the cached
+// BrewFuture.Join, never a second consumptive wait.
+func TestRunPipelineUntil_JoinsBrewPrefetchOnDetectFailure(t *testing.T) {
+	a, _, _, _, _, _ := newTestApp(t, nil, nil)
+	runnerStarted := make(chan struct{})
+	runnerRelease := make(chan struct{})
+	runnerDone := make(chan struct{})
+	a.ResolveRunner = func(name string, args ...string) (string, error) {
+		if name == "brew" {
+			close(runnerStarted)
+			<-runnerRelease
+			close(runnerDone)
+			return "", nil
+		}
+		return "", nil
+	}
+	a.DetectFn = func(cat []catalog.Harness, run detect.Runner) ([]detect.Instance, []detect.Failure, error) {
+		return nil, nil, errors.New("detect failed")
+	}
+
+	ret := make(chan struct{})
+	go func() {
+		_, _, _, _ = a.runPipelineUntil(testCatalog(t), nil)
+		close(ret)
+	}()
+
+	<-runnerStarted // the prefetch query is genuinely in flight
+	select {
+	case <-ret:
+		t.Fatal("runPipelineUntil returned while the brew query was still in flight")
+	case <-time.After(50 * time.Millisecond): // the pass path: still waiting
+	}
+	close(runnerRelease)
+	select {
+	case <-ret:
+	case <-time.After(5 * time.Second):
+		t.Fatal("runPipelineUntil never returned after the query finished")
+	}
+	<-runnerDone
+}
+
+// TestPickerFlow_DuplicateLabelSkipsStayDistinct (review B6): two
+// selections that share a label and both skip keep two stable rows with
+// their reasons — never collapsed into one.
+func TestPickerFlow_DuplicateLabelSkipsStayDistinct(t *testing.T) {
+	a, _, _, sd, sr, _ := newTestApp(t, nil, nil)
+	a.StderrIsTTY = func(io.Writer) bool { return true }
+	a.StdinIsTTY = func(io.Reader) bool { return true }
+	sd.instances = []detect.Instance{
+		{HarnessID: "qwen", Method: "npm", Package: "pkg-a", Bin: "qwen", Version: "1", Status: detect.Active},
+		{HarnessID: "qwen", Method: "npm", Package: "pkg-b", Bin: "qwen", Version: "1", Status: detect.Active},
+	}
+	// Both packages match no catalog install block → both selections
+	// skip with the same label "qwen (npm)".
+	sr.res = []resolve.Resolution{
+		{HarnessID: "qwen", Method: "npm", Package: "pkg-a", Bin: "qwen", Cur: "1", Latest: "2", Outdated: true, Tier: "npm"},
+		{HarnessID: "qwen", Method: "npm", Package: "pkg-b", Bin: "qwen", Cur: "1", Latest: "2", Outdated: true, Tier: "npm"},
+	}
+
+	tui := &syncBuf{}
+	a.Stderr = tui
+	pr, pw := io.Pipe()
+	t.Cleanup(func() { pw.Close() })
+	a.Stdin = pr
+	done := make(chan ExitCode, 1)
+	go func() { done <- a.Run() }()
+
+	waitForBuf(t, tui, "enter apply")
+	_, _ = pw.Write([]byte("a\r")) // select both, apply
+	waitForBuf(t, tui, "Updates finished")
+	got := tui.String()
+	if !strings.Contains(got, "0 succeeded · 0 failed · 2 skipped") {
+		t.Errorf("summary counts wrong for two same-label skips:\n%s", got)
+	}
+	if n := strings.Count(got, "no matching install block"); n < 2 {
+		t.Errorf("skip reasons rendered %d time(s), want 2 distinct rows:\n%s", n, got)
+	}
+	_, _ = pw.Write([]byte("q"))
+	if code := <-done; code != ExitOK {
+		t.Fatalf("exit = %d, want %d", code, ExitOK)
+	}
+}
+
 // TestPickerFlow_NonTTYStderrDoesNotOpenAltScreen pins issue #62's gate:
 // the alt screen needs a real terminal on both streams. A TTY stdin with
 // a non-TTY stderr takes the plain fallback — pre-#62 this combination

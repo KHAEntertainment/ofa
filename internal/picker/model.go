@@ -8,6 +8,7 @@ import (
 	"unicode/utf8"
 
 	tea "charm.land/bubbletea/v2"
+	"github.com/charmbracelet/x/ansi"
 
 	"ofa/internal/banner"
 	"ofa/internal/resolve"
@@ -48,6 +49,15 @@ type model struct {
 	exitMsg      string
 	exitCode     int
 	anim         int // animation frame for spinner and bars
+
+	// Rendering state (issue #62 review B7/B8): terminal size from
+	// WindowSizeMsg (0 = unknown → full, unwindowed frames), body scroll,
+	// the all-diagnostics log view, and expanded row detail.
+	width, height int
+	scroll        int  // body scroll offset of the current screen
+	logView       bool // full diagnostics overlay (key l)
+	logScroll     int  // scroll offset inside the log view
+	detail        bool // expanded, untruncated row detail (key d)
 }
 
 // newModel builds an empty-selection model for the given items, with the
@@ -141,6 +151,11 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case animTickMsg:
 		m.anim++
 		return m, m.animCmd()
+	case tea.WindowSizeMsg:
+		// Real terminal size (and resizes). Not a queue message: the
+		// queue waiter stays untouched.
+		m.width, m.height = msg.Width, msg.Height
+		return m, nil
 	}
 	return m, nil
 }
@@ -148,31 +163,105 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 // handleKey processes a single keystroke. The dispatch table is small
 // enough that one switch is clearer than a key map; if it grows past ~12
 // keys, split it.
+//
+// Keys introduced for the log view and row detail never change the
+// existing select/apply/quit semantics: q and ctrl+c always keep their
+// phase meaning (quit / stop-after-current / dismiss), even while an
+// overlay is open.
 func (m model) handleKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
+	k := msg.String()
+
+	// The log view owns scrolling while open; l or esc closes it.
+	if m.logView {
+		switch k {
+		case "l", "esc":
+			m.logView = false
+			return m, nil
+		case "up":
+			m.logScroll++
+			return m, nil
+		case "down":
+			if m.logScroll > 0 {
+				m.logScroll--
+			}
+			return m, nil
+		case "pgup":
+			m.logScroll += 10
+			return m, nil
+		case "pgdown":
+			m.logScroll -= 10
+			if m.logScroll < 0 {
+				m.logScroll = 0
+			}
+			return m, nil
+		case "ctrl+c", "q":
+			return m.handleQuitKey()
+		}
+		return m, nil
+	}
+
 	if m.f != nil {
 		switch m.phase {
-		case phaseScan, phaseApply:
-			// The quit key requests a stop — the flow never abandons
-			// work — and every other key is ignored. The help line on
-			// each screen says exactly that.
-			if msg.String() == "ctrl+c" || msg.String() == "q" {
+		case phaseScan:
+			switch k {
+			case "ctrl+c", "q":
 				return m.handleQuitKey()
+			case "l":
+				m.logView = true
+				return m, nil
+			case "up", "down", "pgup", "pgdown":
+				m = m.scrollBody(k)
+				return m, nil
+			}
+			return m, nil
+		case phaseApply:
+			switch k {
+			case "ctrl+c", "q":
+				return m.handleQuitKey()
+			case "l":
+				m.logView = true
+				return m, nil
+			case "d":
+				m.detail = !m.detail
+				m.scroll = 0
+				return m, nil
+			case "up", "down", "pgup", "pgdown":
+				m = m.scrollBody(k)
+				return m, nil
 			}
 			return m, nil
 		case phaseSummary:
-			switch msg.String() {
+			switch k {
 			case "ctrl+c", "q", "enter":
 				m.quitting = true
 				return m, tea.Quit
+			case "l":
+				m.logView = true
+				return m, nil
+			case "d":
+				if m.summaryKind == kindResults {
+					m.detail = !m.detail
+					m.scroll = 0
+				}
+				return m, nil
+			case "up", "down", "pgup", "pgdown":
+				m = m.scrollBody(k)
+				return m, nil
 			}
 			return m, nil
 		}
 	}
 	// phaseSelect, and Run's wrapper mode: the original dispatch table,
-	// unchanged.
-	switch msg.String() {
+	// unchanged (plus l for the flow's diagnostics — a no-op in wrapper
+	// mode, which has none).
+	switch k {
 	case "ctrl+c", "q":
 		return m.handleQuitKey()
+	case "l":
+		if m.f != nil {
+			m.logView = true
+		}
+		return m, nil
 	case "up", "k":
 		return m.nextSelectable(-1), nil
 	case "down", "j":
@@ -237,16 +326,12 @@ func (m model) handleQuitKey() (tea.Model, tea.Cmd) {
 		m.outcome = Outcome{Quit: true}
 		return m, tea.Quit
 	case m.phase == phaseScan:
-		if !m.scanStopReq {
-			m.scanStopReq = true
-			close(m.f.scanStop)
-		}
+		m.scanStopReq = true
+		m.f.stopScan() // idempotent: RunFlow's teardown may stop too
 		return m, nil
 	case m.phase == phaseApply:
-		if !m.applyStopReq {
-			m.applyStopReq = true
-			close(m.f.applyStop)
-		}
+		m.applyStopReq = true
+		m.f.stopApply() // idempotent: the failure recorder may stop too
 		return m, nil
 	default: // phaseSummary
 		m.quitting = true
@@ -293,10 +378,12 @@ func (m model) handleScanResult(res ScanResult) (tea.Model, tea.Cmd) {
 	return m, m.queueWait()
 }
 
-// startApply builds the stable row list — one row per selected update,
-// pre-skipped ones included — and launches the update worker. An empty
-// selection, or a selection nothing can be built from, lands on the same
-// dismissible screen with the old exit code (0).
+// startApply builds the ordered row plan — one stable row per selected
+// update, pre-skipped ones included — and launches the update worker.
+// An empty selection lands on the dismissible "Nothing selected." screen
+// with the old exit code (0). A selection that is entirely pre-skipped
+// renders the full skipped summary (rows, reasons, counts), never an
+// empty placeholder.
 func (m model) startApply() (tea.Model, tea.Cmd) {
 	var selected []resolve.Resolution
 	for i, it := range m.items {
@@ -311,24 +398,63 @@ func (m model) startApply() (tea.Model, tea.Cmd) {
 		m.exitCode = 0
 		return m, nil
 	}
-	requests, skipped := m.f.cfg.Build(selected)
-	m.rows = make([]applyRow, 0, len(requests)+len(skipped))
-	for _, sk := range skipped {
-		m.rows = append(m.rows, applyRow{label: sk.Label, state: rowSkipped, reason: sk.Reason, reqIdx: -1})
+	plan := m.f.cfg.Build(selected)
+	m.rows = make([]applyRow, 0, len(plan.Rows))
+	for _, row := range plan.Rows {
+		st := rowQueued
+		if row.RequestIndex < 0 {
+			st = rowSkipped
+		}
+		m.rows = append(m.rows, applyRow{
+			rowID:  row.RowID,
+			label:  row.Label,
+			state:  st,
+			reason: row.Reason,
+			reqIdx: row.RequestIndex,
+		})
 	}
-	for i, req := range requests {
-		m.rows = append(m.rows, applyRow{label: req.Label, state: rowQueued, reqIdx: i})
-	}
-	if len(requests) == 0 {
+	if len(plan.Requests) == 0 {
 		m.phase = phaseSummary
-		m.summaryKind = kindEmpty
-		m.exitMsg = "Nothing to apply."
+		m.summaryKind = kindResults
 		m.exitCode = 0
 		return m, nil
 	}
 	m.phase = phaseApply
-	m.f.startApply(requests)
+	m.f.startApply(plan.Requests)
 	return m, nil
+}
+
+// scrollBody moves the body viewport by one line or one page. Log-style
+// bodies (scan, diagnostics) are tail-relative — 0 follows the newest
+// line and up walks back through history — while list-style bodies
+// (rows) scroll down from the top.
+func (m model) scrollBody(key string) model {
+	tail := m.logView || m.phase == phaseScan
+	step := 1
+	if key == "pgup" || key == "pgdown" {
+		step = 10
+	}
+	switch key {
+	case "up", "pgup":
+		if tail {
+			m.scroll += step
+		} else if m.scroll > 0 {
+			m.scroll -= step
+			if m.scroll < 0 {
+				m.scroll = 0
+			}
+		}
+	case "down", "pgdown":
+		if tail {
+			m.scroll -= step
+			if m.scroll < 0 {
+				m.scroll = 0
+			}
+		} else {
+			m.scroll += step
+		}
+	}
+	return m
 }
 
 // handleEvent binds an update lifecycle event to its row. The event's
@@ -493,6 +619,9 @@ func (m model) frame() string {
 	if m.quitting {
 		return ""
 	}
+	if m.logView {
+		return m.logFrame()
+	}
 	if m.f == nil || m.phase == phaseSelect {
 		return m.selectFrame()
 	}
@@ -562,131 +691,191 @@ func contentWidth(lines []string) int {
 	return w
 }
 
-// diagLines renders the most recent diagnostics with an explicit counter
-// for anything elided — a diagnostic is never dropped silently. max is
-// how many of the most recent lines to show.
-func diagLines(diags []string, max int) []string {
-	if len(diags) == 0 {
-		return nil
+// truncateLine shortens one line to width cells, ANSI- and
+// wide-grapheme-aware. Width <= 0 leaves the line untouched.
+func truncateLine(line string, width int) string {
+	if width <= 0 {
+		return line
 	}
+	return ansi.Truncate(line, width, "…")
+}
+
+// windowLines returns the visible slice of body for the given scroll
+// offset, and the offset clamped to the last page. visible <= 0 means
+// unknown height: the whole body. In tail mode the offset counts hidden
+// lines above the newest page (0 = follow the tail).
+func windowLines(body []string, scroll, visible int, tail bool) ([]string, int) {
+	if visible <= 0 || len(body) <= visible {
+		return body, 0
+	}
+	maxScroll := len(body) - visible
+	if tail {
+		scroll = maxScroll - scroll
+	}
+	if scroll > maxScroll {
+		scroll = maxScroll
+	}
+	if scroll < 0 {
+		scroll = 0
+	}
+	return body[scroll : scroll+visible], scroll
+}
+
+// layout assembles a non-select screen: the banner header (compacted at
+// tiny heights), pinned status lines, a scrollable viewport over body
+// lines, and a footer that always stays visible. Width or height <= 0
+// means unknown: everything renders full and unwindowed.
+//
+// The banner may compact before anything else: states, counts and
+// navigation must stay reachable at any terminal size.
+func (m model) layout(body, pinned []string, footer string, scroll int, tail bool) string {
+	w := m.width
+	if w <= 0 {
+		probe := append(append(append([]string{}, body...), pinned...), footer)
+		w = contentWidth(probe)
+	}
+
 	var out []string
-	skip := len(diags) - max
-	if skip > 0 {
-		out = append(out, fmt.Sprintf("  … %d earlier diagnostic line(s)", skip))
+	if m.height <= 0 || m.height >= 30 {
+		banner := bannerBlock(w, ScanTagline)
+		out = append(out, strings.Split(strings.TrimSuffix(banner, "\n"), "\n")...)
+	} else {
+		out = append(out, truncateLine(centerTagline(ScanTagline, w), w), "")
 	}
-	lo := skip
-	if lo < 0 {
-		lo = 0
+	for _, line := range pinned {
+		out = append(out, truncateLine(line, w))
 	}
-	for _, line := range diags[lo:] {
-		out = append(out, "  "+line)
+
+	visible := -1
+	if m.height > 0 {
+		visible = m.height - len(out) - 1 // the footer line stays visible
+		if visible < 1 {
+			visible = 1
+		}
 	}
-	return out
+	body, _ = windowLines(body, scroll, visible, tail)
+	for _, line := range body {
+		out = append(out, truncateLine(line, w))
+	}
+	out = append(out, truncateLine(footer, w))
+	return strings.Join(out, "\n") + "\n"
+}
+
+// centerTagline is the compact header's single tagline line.
+func centerTagline(s string, width int) string {
+	return padCenter(s, width)
+}
+
+// countsLine is the summary's counts — shown pinned so they stay
+// visible at any size.
+func (m model) countsLine() string {
+	var done, failed, skipped int
+	for _, r := range m.rows {
+		switch r.state {
+		case rowDone:
+			done++
+		case rowFailed:
+			failed++
+		default:
+			skipped++
+		}
+	}
+	return fmt.Sprintf("%d succeeded · %d failed · %d skipped", done, failed, skipped)
+}
+
+// rowBody renders the rows — expanded to full, wrapped detail when
+// requested — with failure tails under the row in summary mode.
+func (m model) rowBody(anim int, withTails bool) []string {
+	var body []string
+	for _, r := range m.rows {
+		if m.detail {
+			body = append(body, detailLines(r, anim, m.width)...)
+			body = append(body, "")
+			continue
+		}
+		body = append(body, rowLine(r, anim, m.width))
+		if withTails && r.tail != "" {
+			for _, line := range strings.Split(r.tail, "\n") {
+				if strings.TrimSpace(line) != "" {
+					body = append(body, wrapToWidth("      "+line, m.width)...)
+				}
+			}
+		}
+	}
+	return body
 }
 
 // scanFrame renders the scanning screen (issue #43): the banner, the
 // exact caption and the short tagline — on every run, first run
-// included — live diagnostics, and the stop hint. Stopping replaces the
-// hint with an accurate status line; the screen never claims a
-// synchronous detector was canceled while it still runs.
+// included — and every diagnostic in a scrollable viewport. Stopping is
+// shown as pinned status; the screen never claims a synchronous detector
+// was canceled while it still runs.
 func (m model) scanFrame() string {
-	content := []string{
+	pinned := []string{
 		fmt.Sprintf("%s %s", spinnerFrame(m.anim), ScanCaption),
 		ScanDetail,
 		"",
 	}
-	content = append(content, diagLines(m.diags, 8)...)
-	stop := "q/ctrl+c stop scanning"
 	if m.scanStopReq {
-		stop = "Stopping — waiting for the scan to finish…"
+		pinned = append(pinned, "Stopping — waiting for the scan to finish…", "")
 	}
-	content = append(content, "", stop)
-
-	var b strings.Builder
-	b.WriteString(bannerBlock(contentWidth(content), ScanTagline))
-	for _, line := range content {
-		b.WriteString(line)
-		b.WriteString("\n")
+	var body []string
+	for _, line := range m.diags {
+		body = append(body, wrapToWidth("  "+line, m.width)...)
 	}
-	return b.String()
+	return m.layout(body, pinned, "q/ctrl+c stop scanning · ↑/↓/pgup/pgdn scroll · l logs", m.scroll, true)
 }
 
 // applyFrame renders the progress screen: one stable row per selected
 // update with its small bar and state. Unknown installer progress is
 // indeterminate — the running bar slides and never shows a number — and
-// a row keeps its final state once its update ends.
+// a row keeps its final state once its update ends. State words and bars
+// stay visible at any width (B7); full row detail is the d view.
 func (m model) applyFrame() string {
-	content := []string{"Applying selected updates", ""}
-	for _, r := range m.rows {
-		content = append(content, rowLine(r, m.anim))
-	}
-	content = append(content, "")
+	pinned := []string{"Applying selected updates", ""}
 	if m.applyStopReq {
-		content = append(content,
+		pinned = append(pinned,
 			"Stopping after current update…",
 			"Current update will finish. Remaining updates are skipped as canceled.",
 			"",
 		)
 	}
-	content = append(content, "q/ctrl+c stop after current update")
-
-	var b strings.Builder
-	b.WriteString(bannerBlock(contentWidth(content), ScanTagline))
-	for _, line := range content {
-		b.WriteString(line)
-		b.WriteString("\n")
-	}
-	return b.String()
+	return m.layout(m.rowBody(m.anim, false), pinned,
+		"q/ctrl+c stop after current update · ↑/↓/pgup/pgdn scroll · d details · l logs", m.scroll, false)
 }
 
 // summaryFrame renders the final screen: per-row results with failure
-// tails and skip reasons, the counts, and any diagnostics. It stays
-// visible until the user dismisses it — nothing here auto-exits.
+// tails and skip reasons, the counts pinned at the bottom of the header
+// so they survive any height. It stays visible until the user dismisses
+// it — nothing here auto-exits.
 func (m model) summaryFrame() string {
-	var content []string
 	switch m.summaryKind {
 	case kindError, kindEmpty:
-		content = append(content, m.exitMsg, "")
+		var body []string
+		for _, line := range m.diags {
+			body = append(body, wrapToWidth("  "+line, m.width)...)
+		}
+		return m.layout(body, []string{m.exitMsg, ""},
+			"q/enter/ctrl+c dismiss · l logs", m.scroll, true)
 	default:
-		content = append(content, "Updates finished", "")
-		for _, r := range m.rows {
-			content = append(content, rowLine(r, 0))
-			for _, line := range strings.Split(r.tail, "\n") {
-				if strings.TrimSpace(line) != "" {
-					content = append(content, "      "+line)
-				}
-			}
-		}
-		// Counts cover every selected update's row — pre-skipped and
-		// canceled included — so the numbers add up to what the user
-		// picked, not only what actually executed.
-		var done, failed, skipped int
-		for _, r := range m.rows {
-			switch r.state {
-			case rowDone:
-				done++
-			case rowFailed:
-				failed++
-			default:
-				skipped++
-			}
-		}
-		content = append(content, "",
-			fmt.Sprintf("%d succeeded · %d failed · %d skipped", done, failed, skipped))
+		pinned := []string{"Updates finished", m.countsLine(), ""}
+		return m.layout(m.rowBody(0, true), pinned,
+			"q/enter/ctrl+c dismiss · ↑/↓/pgup/pgdn scroll · d details · l logs", m.scroll, false)
 	}
-	if lines := diagLines(m.diags, 20); lines != nil {
-		content = append(content, "")
-		content = append(content, lines...)
-	}
-	content = append(content, "", "Enter / q / Ctrl+C dismiss · summary stays visible until then.")
+}
 
-	var b strings.Builder
-	b.WriteString(bannerBlock(contentWidth(content), ScanTagline))
-	for _, line := range content {
-		b.WriteString(line)
-		b.WriteString("\n")
+// logFrame renders the full diagnostics log (B8): every line, wrapped
+// and paged — never elided — reachable from every phase with l.
+func (m model) logFrame() string {
+	var body []string
+	for _, line := range m.diags {
+		body = append(body, wrapToWidth(line, m.width)...)
 	}
-	return b.String()
+	if len(body) == 0 {
+		body = []string{"(no diagnostics)"}
+	}
+	pinned := []string{fmt.Sprintf("Diagnostics — %d line(s), all shown", len(m.diags)), ""}
+	return m.layout(body, pinned, "↑/↓/pgup/pgdn scroll · l/esc close", m.logScroll, true)
 }
 
 // selectFrame is the rendered picker body (banner, blurb, rows, footer),

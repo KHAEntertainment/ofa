@@ -12,6 +12,7 @@ import (
 	"time"
 
 	tea "charm.land/bubbletea/v2"
+	"github.com/charmbracelet/x/ansi"
 
 	"ofa/internal/banner"
 	"ofa/internal/resolve"
@@ -46,7 +47,7 @@ func (b *syncBuffer) String() string {
 // waitForOutput blocks until the rendered output contains substr. The
 // frames are stable (the string stays rendered), so a one-way poll is a
 // synchronization point, not a sleep. Bounded at five seconds.
-func waitForOutput(t *testing.T, b *syncBuffer, substr string) {
+func waitForOutput(t *testing.T, b interface{ String() string }, substr string) {
 	t.Helper()
 	deadline := time.Now().Add(5 * time.Second)
 	for time.Now().Before(deadline) {
@@ -74,7 +75,7 @@ func updateMsg(t *testing.T, m model, msg tea.Msg) model {
 func scanFixture() (*flowState, model) {
 	f := &flowState{
 		cfg: &FlowConfig{
-			Build: func([]resolve.Resolution) ([]update.Request, []SkippedRow) { return nil, nil },
+			Build: func([]resolve.Resolution) FlowPlan { return FlowPlan{} },
 			Exec:  func(req update.Request) update.Result { return update.Result{Label: req.Label} },
 		},
 		q:         newMsgQueue(),
@@ -175,20 +176,40 @@ func TestFlowModel_BannerNOColorMatchesBannerRender(t *testing.T) {
 
 // TestFlowModel_ScanDiagnosticsShownAndCounted: diagnostics surface in
 // the TUI and anything elided is counted — never silently dropped.
-func TestFlowModel_ScanDiagnosticsShownAndCounted(t *testing.T) {
+// TestFlowModel_DiagnosticsAllReachable: no diagnostic is ever dropped
+// (issue #62 review B8): the scan body pages every line, scrolling
+// reaches the oldest, and the log view (l) shows the complete set from
+// any phase — there is no elision counter because nothing is elided.
+func TestFlowModel_DiagnosticsAllReachable(t *testing.T) {
 	_, m := scanFixture()
+	m = updateMsg(t, m, tea.WindowSizeMsg{Width: 80, Height: 12}) // a small screen: only a window fits
 	for i := 0; i < 12; i++ {
 		m = updateMsg(t, m, diagMsg{line: "diag-line-" + string(rune('a'+i))})
 	}
-	v := m.frame()
-	if !contains(v, "diag-line-l") {
+	// The live view shows the newest lines at the bottom of the viewport.
+	if v := m.frame(); !contains(v, "diag-line-l") {
 		t.Errorf("scan frame should show the most recent diagnostics\n%s", v)
 	}
-	if !contains(v, "4 earlier diagnostic line(s)") {
-		t.Errorf("scan frame should count elided diagnostics\n%s", v)
+	// Scrolling back reaches the oldest line — paging, never truncation.
+	m = updateMsg(t, m, keyMsg("pgup"))
+	if v := m.frame(); !contains(v, "diag-line-a") {
+		t.Errorf("scrolling up should reach the oldest diagnostic\n%s", v)
 	}
-	if contains(v, "diag-line-a") {
-		t.Errorf("scan frame should elide the oldest lines\n%s", v)
+	// The log view renders every line (unwindowed when height is unknown).
+	_, lm := scanFixture()
+	for i := 0; i < 12; i++ {
+		lm = updateMsg(t, lm, diagMsg{line: "diag-line-" + string(rune('a'+i))})
+	}
+	lm = updateMsg(t, lm, keyMsg("l"))
+	v := lm.frame()
+	for i := 0; i < 12; i++ {
+		want := "diag-line-" + string(rune('a'+i))
+		if !contains(v, want) {
+			t.Errorf("log view dropped %q", want)
+		}
+	}
+	if !contains(v, "Diagnostics — 12 line(s), all shown") {
+		t.Errorf("log view should announce the complete set\n%s", v)
 	}
 }
 
@@ -272,16 +293,21 @@ func TestFlowModel_EmptyScanIsDismissibleExitZero(t *testing.T) {
 func TestFlowModel_SelectEnterBuildsStableRows(t *testing.T) {
 	stubLookPathAllowed(t) // the apply worker's PATH preflight must be hermetic
 	f, m := flowFixture(t)
-	f.cfg.Build = func(selected []resolve.Resolution) ([]update.Request, []SkippedRow) {
+	f.cfg.Build = func(selected []resolve.Resolution) FlowPlan {
 		if len(selected) != 2 {
 			t.Errorf("Build got %d selections, want 2", len(selected))
 		}
-		return []update.Request{
+		return FlowPlan{
+			Rows: []FlowRow{
+				{RowID: 2, Label: "pinned one", RequestIndex: -1, Reason: "pinned in config"},
+				{RowID: 0, Label: "claude (native)", RequestIndex: 0},
+				{RowID: 1, Label: "qwen (npm)", RequestIndex: 1},
+			},
+			Requests: []update.Request{
 				{Label: "claude (native)", Cmd: update.CmdSpec{Cmd: []string{"x"}}},
 				{Label: "qwen (npm)", Cmd: update.CmdSpec{Cmd: []string{"y"}}},
-			}, []SkippedRow{
-				{Label: "pinned one", Reason: "pinned in config"},
-			}
+			},
+		}
 	}
 	m = updateKey(t, m, "a") // select all
 	m = updateKey(t, m, "enter")
@@ -313,9 +339,9 @@ func TestFlowModel_SelectEnterBuildsStableRows(t *testing.T) {
 // Build is never called.
 func TestFlowModel_EmptySelectionEnterShowsNothingSelected(t *testing.T) {
 	f, m := flowFixture(t)
-	f.cfg.Build = func([]resolve.Resolution) ([]update.Request, []SkippedRow) {
+	f.cfg.Build = func([]resolve.Resolution) FlowPlan {
 		t.Error("Build must not be called with an empty selection")
-		return nil, nil
+		return FlowPlan{}
 	}
 	m = updateKey(t, m, "enter")
 	if m.phase != phaseSummary || m.exitCode != 0 {
@@ -375,7 +401,7 @@ func TestBar_RunningIsIndeterminateWithoutNumbers(t *testing.T) {
 		}
 	}
 	for _, st := range []rowState{rowQueued, rowRunning, rowDone, rowFailed, rowSkipped} {
-		if l := rowLine(applyRow{label: "x", state: st}, 3); numOrPercent.MatchString(l) && st != rowRunning {
+		if l := rowLine(applyRow{label: "x", state: st}, 3, 0); numOrPercent.MatchString(l) && st != rowRunning {
 			// state words carry no digits; only reason text may, which is
 			// empty here — so no row line may show a number.
 			t.Errorf("row line %q contains a number or percent", l)
@@ -459,7 +485,7 @@ func TestFlowModel_SummaryPersistsUntilDismissed(t *testing.T) {
 		"tail line",
 		"pinned in config",
 		"1 succeeded · 1 failed · 1 skipped",
-		"Enter / q / Ctrl+C dismiss · summary stays visible until then.",
+		"q/enter/ctrl+c dismiss",
 	} {
 		if !contains(v, want) {
 			t.Errorf("summary missing %q\n%s", want, v)
@@ -516,17 +542,23 @@ func TestRunFlow_ScanCancelJoinsWorkerBeforeReturning(t *testing.T) {
 	var scanReturned atomic.Bool
 	out := &syncBuffer{}
 	pr, pw := io.Pipe()
-	t.Cleanup(func() { pw.Close() })
+	release := make(chan struct{})
+	var releaseOnce sync.Once
+	releaseAll := func() { releaseOnce.Do(func() { close(release) }) }
+	// A failing test must never wedge the worker: cleanup always releases.
+	t.Cleanup(func() { pw.Close(); releaseAll() })
 	done := make(chan FlowResult, 1)
 	go func() {
 		res, err := RunFlow(FlowConfig{
 			Scan: func(diag io.Writer, stop <-chan struct{}) ScanResult {
-				<-stop                            // a synchronous detector: finishes only when told to
-				time.Sleep(20 * time.Millisecond) // bounded work in flight
+				<-stop // a synchronous detector: finishes only when told to
+				// Bounded in-flight work — released by observing the stopping
+				// state on screen, never by a timer (review A1).
+				<-release
 				scanReturned.Store(true)
 				return ScanResult{}
 			},
-			Build:  func([]resolve.Resolution) ([]update.Request, []SkippedRow) { return nil, nil },
+			Build:  func([]resolve.Resolution) FlowPlan { return FlowPlan{} },
 			Exec:   func(req update.Request) update.Result { return update.Result{Label: req.Label} },
 			Input:  pr,
 			Output: out,
@@ -539,7 +571,10 @@ func TestRunFlow_ScanCancelJoinsWorkerBeforeReturning(t *testing.T) {
 
 	waitForOutput(t, out, ScanCaption) // the scanning screen is up
 	_, _ = pw.Write([]byte("q"))       // request the stop
+	// The stopping state must be observable before the worker can finish:
+	// that is the sync point — release only once it is on screen.
 	waitForOutput(t, out, "Stopping — waiting for the scan to finish…")
+	releaseAll()
 	res := <-done
 	if !scanReturned.Load() {
 		t.Error("RunFlow returned before the scan worker finished — the join is broken")
@@ -568,13 +603,18 @@ func TestRunFlow_ApplyStopAfterCurrentSkipsRestAndGatesSummary(t *testing.T) {
 					{HarnessID: "qwen", Method: "npm", Bin: "qwen", Cur: "1", Latest: "2", Outdated: true, Tier: "npm"},
 				}}
 			},
-			Build: func(selected []resolve.Resolution) ([]update.Request, []SkippedRow) {
-				return []update.Request{
+			Build: func(selected []resolve.Resolution) FlowPlan {
+				return FlowPlan{
+					Rows: []FlowRow{
+						{RowID: 2, Label: "pinned one", RequestIndex: -1, Reason: "pinned in config"},
+						{RowID: 0, Label: "first", RequestIndex: 0},
+						{RowID: 1, Label: "second", RequestIndex: 1},
+					},
+					Requests: []update.Request{
 						{Label: "first", Cmd: update.CmdSpec{Cmd: []string{"x", "1"}}},
 						{Label: "second", Cmd: update.CmdSpec{Cmd: []string{"x", "2"}}},
-					}, []SkippedRow{
-						{Label: "pinned one", Reason: "pinned in config"},
-					}
+					},
+				}
 			},
 			Exec: func(req update.Request) update.Result {
 				if req.Label == "second" {
@@ -666,5 +706,513 @@ func TestFlowModel_ScanPinsAreAuthoritative(t *testing.T) {
 	m3 = updateMsg(t, m3, scanResultMsg{res: ScanResult{Resolutions: res}})
 	if !m3.items[1].Pinned {
 		t.Errorf("fixed pins must remain without a scan snapshot: items = %+v", m3.items)
+	}
+}
+
+// --- terminal failure boundaries (issue #62 review B1/B2 + EOF) ---
+
+// errAfterKeysReader hands out one scripted chunk, then blocks until the
+// first installer is in flight, then fails like a lost terminal.
+type errAfterKeysReader struct {
+	sendKeys     chan struct{} // closed when the select screen is up
+	firstStarted chan struct{}
+	err          error
+	reads        int
+}
+
+func (r *errAfterKeysReader) Read(p []byte) (int, error) {
+	r.reads++
+	switch r.reads {
+	case 1:
+		<-r.sendKeys               // keys must not race the scan phase
+		return copy(p, "a\r"), nil // select all, apply
+	case 2:
+		<-r.firstStarted
+		return 0, r.err
+	default:
+		return 0, r.err
+	}
+}
+
+// flakyWriter writes happily until armed, then fails every write and
+// signals the first failure.
+type flakyWriter struct {
+	mu     sync.Mutex
+	armed  bool
+	failed chan struct{}
+	once   sync.Once
+	buf    syncBuffer // frames are observable until the writer is armed
+}
+
+// String reports everything written before the writer was armed.
+func (w *flakyWriter) String() string { return w.buf.String() }
+
+func (w *flakyWriter) arm() {
+	w.mu.Lock()
+	w.armed = true
+	w.mu.Unlock()
+}
+
+func (w *flakyWriter) Write(p []byte) (int, error) {
+	w.mu.Lock()
+	armed := w.armed
+	w.mu.Unlock()
+	if armed {
+		w.once.Do(func() { close(w.failed) })
+		return 0, errors.New("output write failed")
+	}
+	return w.buf.Write(p)
+}
+
+// TestObservedStreams_RecordAndStopSynchronously: the first write error,
+// short write, read error or EOF is recorded with its original cause and
+// the idempotent stop is requested INSIDE the call that saw it — never
+// deferred to a watcher. Repeats are no-ops (review B1/B2 bounds).
+func TestObservedStreams_RecordAndStopSynchronously(t *testing.T) {
+	// Read error / EOF.
+	for _, err := range []error{io.EOF, errors.New("input died")} {
+		stops := 0
+		rec := &failureRecorder{ch: make(chan struct{}), stop: func() { stops++ }}
+		or := &observedReader{r: errReader{err}, rec: rec}
+		if _, got := or.Read(make([]byte, 4)); got != err {
+			t.Errorf("Read error = %v, want the original %v", got, err)
+		}
+		if stops != 1 {
+			t.Errorf("stop requests = %d, want 1 synchronous", stops)
+		}
+		if rec.firstErr() != err {
+			t.Errorf("recorded error = %v, want the original %v", rec.firstErr(), err)
+		}
+		// Repeated failure: first error wins, stop stays single.
+		_, _ = or.Read(make([]byte, 4))
+		if stops != 1 || rec.firstErr() != err {
+			t.Errorf("repeat changed state: stops=%d err=%v", stops, rec.firstErr())
+		}
+	}
+
+	// Write error and short write.
+	for _, tc := range []struct {
+		w io.Writer
+	}{
+		{errWriter{errors.New("output died")}},
+		{shortWriter{}},
+	} {
+		stops := 0
+		rec := &failureRecorder{ch: make(chan struct{}), stop: func() { stops++ }}
+		ow := &observedWriter{w: tc.w, rec: rec}
+		if _, _ = ow.Write([]byte("frame")); stops != 1 {
+			t.Errorf("stop requests = %d, want 1 synchronous", stops)
+		}
+		if rec.firstErr() == nil {
+			t.Error("the original write failure must be recorded")
+		}
+	}
+}
+
+// errReader and friends are one-shot failure sources.
+type errReader struct{ err error }
+
+func (r errReader) Read([]byte) (int, error) { return 0, r.err }
+
+type errWriter struct{ err error }
+
+func (w errWriter) Write(p []byte) (int, error) { return 0, w.err }
+
+type shortWriter struct{}
+
+func (w shortWriter) Write(p []byte) (int, error) { return len(p) - 1, nil }
+
+// failurePlan is the shared fixture for the failure-boundary runs: two
+// requests, the first in flight and released by the test, the second
+// tracked for "never started after the failure".
+type failurePlan struct {
+	firstStarted chan struct{}
+	release      chan struct{}
+	releaseOnce  sync.Once
+	ranSecond    atomic.Bool
+	firstDone    atomic.Bool
+}
+
+func (p *failurePlan) releaseFirst() { p.releaseOnce.Do(func() { close(p.release) }) }
+
+func (p *failurePlan) exec(req update.Request) update.Result {
+	if req.Label == "second" {
+		p.ranSecond.Store(true)
+		return update.Result{Label: req.Label, Cmd: req.Cmd}
+	}
+	close(p.firstStarted)
+	<-p.release
+	p.firstDone.Store(true)
+	return update.Result{Label: req.Label, Cmd: req.Cmd}
+}
+
+func failureBuild(_ []resolve.Resolution) FlowPlan {
+	return FlowPlan{
+		Rows: []FlowRow{
+			{RowID: 0, Label: "first", RequestIndex: 0},
+			{RowID: 1, Label: "second", RequestIndex: 1},
+		},
+		Requests: []update.Request{
+			{Label: "first", Cmd: update.CmdSpec{Cmd: []string{"x", "1"}}},
+			{Label: "second", Cmd: update.CmdSpec{Cmd: []string{"x", "2"}}},
+		},
+	}
+}
+
+func failureScan(diag io.Writer, stop <-chan struct{}) ScanResult {
+	return ScanResult{Resolutions: []resolve.Resolution{
+		{HarnessID: "claude", Method: "native", Bin: "claude", Cur: "1", Tier: "self"},
+		{HarnessID: "qwen", Method: "npm", Bin: "qwen", Cur: "1", Latest: "2", Outdated: true, Tier: "npm"},
+	}}
+}
+
+// TestRunFlow_InputErrorStopsQueuedWorkAndJoins (review B1/B2): a
+// terminal input failure mid-apply stops the queued installer, lets the
+// in-flight one finish and be joined, and returns the original error.
+func TestRunFlow_InputErrorStopsQueuedWorkAndJoins(t *testing.T) {
+	stubLookPathAllowed(t)
+	out := &syncBuffer{}
+	plan := &failurePlan{
+		firstStarted: make(chan struct{}),
+		release:      make(chan struct{}),
+	}
+	t.Cleanup(plan.releaseFirst)
+	errInput := errors.New("terminal input failed")
+	sendKeys := make(chan struct{})
+	rdr := &errAfterKeysReader{sendKeys: sendKeys, firstStarted: plan.firstStarted, err: errInput}
+
+	done := make(chan FlowResult, 1)
+	var runErr error
+	go func() {
+		res, err := RunFlow(FlowConfig{
+			Scan:   failureScan,
+			Build:  failureBuild,
+			Exec:   plan.exec,
+			Input:  rdr,
+			Output: out,
+		})
+		runErr = err
+		done <- res
+	}()
+
+	waitForOutput(t, out, "enter apply") // the select screen is up
+	close(sendKeys)                      // now deliver "a\r"
+	<-plan.firstStarted                  // apply is running: first installer in flight
+	// The input error fires while "first" is in flight and the program
+	// shuts down (its teardown bytes are the observable that record +
+	// quit already happened). Only then release the in-flight installer:
+	// anything queued must already have been stopped.
+	waitForOutput(t, out, "[?1049l")
+	plan.releaseFirst()
+	<-done
+	if !errors.Is(runErr, errInput) {
+		t.Errorf("error = %v, want the original input error %v", runErr, errInput)
+	}
+	if plan.ranSecond.Load() {
+		t.Error("queued installer ran after the input failure was observed")
+	}
+	if !plan.firstDone.Load() {
+		t.Error("the in-flight installer must be allowed to finish and be joined")
+	}
+}
+
+// TestRunFlow_WriteFailureReturnsOriginalErrorAndStops (review B2): a
+// broken output stops the run and surfaces the original write error —
+// never a silent success — and repeated failures stay idempotent.
+func TestRunFlow_WriteFailureReturnsOriginalErrorAndStops(t *testing.T) {
+	stubLookPathAllowed(t)
+	plan := &failurePlan{
+		firstStarted: make(chan struct{}),
+		release:      make(chan struct{}),
+	}
+	t.Cleanup(plan.releaseFirst)
+	out := &flakyWriter{failed: make(chan struct{})}
+	pr, pw := io.Pipe()
+	t.Cleanup(func() { pw.Close() })
+
+	done := make(chan FlowResult, 1)
+	var runErr error
+	go func() {
+		res, err := RunFlow(FlowConfig{
+			Scan:   failureScan,
+			Build:  failureBuild,
+			Exec:   plan.exec,
+			Input:  pr,
+			Output: out,
+		})
+		runErr = err
+		done <- res
+	}()
+
+	// Reaching the apply phase needs keys from the pipe — delivered only
+	// once the select screen is observable. Then break the output while
+	// the first installer is in flight.
+	waitForOutput(t, out, "enter apply")
+	_, _ = pw.Write([]byte("a\r"))
+	<-plan.firstStarted
+	out.arm()
+	<-out.failed // record + synchronous stop happened by now
+	plan.releaseFirst()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("RunFlow hung after an output failure — invisible waiting")
+	}
+	if runErr == nil {
+		t.Fatal("write failure must surface as an error, never silent success")
+	}
+	if !strings.Contains(runErr.Error(), "output write failed") {
+		t.Errorf("error = %v, want the original write failure", runErr)
+	}
+}
+
+// TestRunFlow_InputEOFDuringApplyStopsQueuedWork (QA probe A2, elevated):
+// input EOF is terminal loss — the queued installer is stopped, the
+// in-flight one finishes and is joined, and the original EOF is returned.
+func TestRunFlow_InputEOFDuringApplyStopsQueuedWork(t *testing.T) {
+	stubLookPathAllowed(t)
+	out := &syncBuffer{}
+	plan := &failurePlan{
+		firstStarted: make(chan struct{}),
+		release:      make(chan struct{}),
+	}
+	t.Cleanup(plan.releaseFirst)
+	pr, pw := io.Pipe()
+
+	done := make(chan FlowResult, 1)
+	var runErr error
+	go func() {
+		res, err := RunFlow(FlowConfig{
+			Scan:   failureScan,
+			Build:  failureBuild,
+			Exec:   plan.exec,
+			Input:  pr,
+			Output: out,
+		})
+		runErr = err
+		done <- res
+	}()
+
+	waitForOutput(t, out, "enter apply")
+	_, _ = pw.Write([]byte("a\r")) // select all, apply
+	<-plan.firstStarted
+	_ = pw.Close() // terminal loss: EOF while the first installer runs
+	// The program shuts down on the observed EOF (the teardown bytes are
+	// the observable that record + quit already happened); only then is
+	// the in-flight installer released.
+	waitForOutput(t, out, "[?1049l")
+	plan.releaseFirst()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("RunFlow hung after input EOF")
+	}
+	if !errors.Is(runErr, io.EOF) {
+		t.Errorf("error = %v, want the original EOF", runErr)
+	}
+	if plan.ranSecond.Load() {
+		t.Error("queued installer ran after input EOF was observed")
+	}
+	if !plan.firstDone.Load() {
+		t.Error("the in-flight installer must be allowed to finish and be joined")
+	}
+}
+
+// TestRunFlow_InputEOFAtSummaryReturnsRatherThanHanging: the exact QA
+// probe A2 repro — EOF while the summary waits for dismissal must not
+// wait forever; the run returns with the original terminal failure.
+func TestRunFlow_InputEOFAtSummaryReturnsRatherThanHanging(t *testing.T) {
+	stubLookPathAllowed(t)
+	out := &syncBuffer{}
+	pr, pw := io.Pipe()
+	done := make(chan FlowResult, 1)
+	var runErr error
+	go func() {
+		res, err := RunFlow(FlowConfig{
+			Scan: failureScan,
+			Build: func([]resolve.Resolution) FlowPlan {
+				return FlowPlan{
+					Rows:     []FlowRow{{RowID: 0, Label: "first", RequestIndex: 0}},
+					Requests: []update.Request{{Label: "first", Cmd: update.CmdSpec{Cmd: []string{"x", "1"}}}},
+				}
+			},
+			Exec: func(req update.Request) update.Result {
+				return update.Result{Label: req.Label, Cmd: req.Cmd}
+			},
+			Input:  pr,
+			Output: out,
+		})
+		runErr = err
+		done <- res
+	}()
+
+	waitForOutput(t, out, "enter apply")
+	_, _ = pw.Write([]byte("a\r")) // select all, apply
+	waitForOutput(t, out, "Updates finished")
+	_ = pw.Close() // input EOF with the summary on screen
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("RunFlow never returns after input EOF — the summary waits on a dead terminal")
+	}
+	if !errors.Is(runErr, io.EOF) {
+		t.Errorf("error = %v, want the original EOF", runErr)
+	}
+}
+
+// --- row plan and rendering (issue #62 review B5/B6/B7) ---
+
+// TestFlowModel_AllSkippedSelectionShowsFullSummary (review B5): a
+// selection that is entirely pre-skipped renders the full skipped
+// summary — rows, reasons, counts — never an empty placeholder.
+func TestFlowModel_AllSkippedSelectionShowsFullSummary(t *testing.T) {
+	f, m := flowFixture(t)
+	f.cfg.Build = func([]resolve.Resolution) FlowPlan {
+		return FlowPlan{Rows: []FlowRow{
+			{RowID: 0, Label: "claude (native)", RequestIndex: -1, Reason: "pinned in config"},
+			{RowID: 1, Label: "qwen (npm)", RequestIndex: -1, Reason: "no update command (catalog)"},
+		}}
+	}
+	m = updateKey(t, m, "a")
+	m = updateKey(t, m, "enter")
+	if m.phase != phaseSummary || m.exitCode != 0 {
+		t.Fatalf("phase=%v exit=%d, want summary/0", m.phase, m.exitCode)
+	}
+	v := m.frame()
+	for _, want := range []string{
+		"claude (native)", "pinned in config",
+		"qwen (npm)", "no update command (catalog)",
+		"0 succeeded · 0 failed · 2 skipped",
+	} {
+		if !contains(v, want) {
+			t.Errorf("all-skipped summary missing %q\n%s", want, v)
+		}
+	}
+	if contains(v, "Nothing to apply.") {
+		t.Errorf("all-skipped summary must show rows, not an empty placeholder\n%s", v)
+	}
+}
+
+// TestFlowModel_PlanOrderAndDuplicateLabelsPreserved (review B6): rows
+// render in plan order with stable distinct identities even when labels
+// repeat — never collapsed, never reordered.
+func TestFlowModel_PlanOrderAndDuplicateLabelsPreserved(t *testing.T) {
+	f, m := flowFixture(t)
+	f.cfg.Build = func([]resolve.Resolution) FlowPlan {
+		return FlowPlan{
+			Rows: []FlowRow{
+				{RowID: 0, Label: "qwen (npm)", RequestIndex: -1, Reason: "no matching install block"},
+				{RowID: 1, Label: "qwen (npm)", RequestIndex: 0},
+				{RowID: 2, Label: "qwen (npm)", RequestIndex: -1, Reason: "no matching install block"},
+			},
+			Requests: []update.Request{{Label: "qwen (npm)", Cmd: update.CmdSpec{Cmd: []string{"x"}}}},
+		}
+	}
+	m = updateKey(t, m, "a")
+	m = updateKey(t, m, "enter")
+	if len(m.rows) != 3 {
+		t.Fatalf("rows = %d, want 3 distinct rows for duplicate labels", len(m.rows))
+	}
+	for i, want := range []struct {
+		rowID int
+		state rowState
+	}{{0, rowSkipped}, {1, rowQueued}, {2, rowSkipped}} {
+		if m.rows[i].rowID != want.rowID || m.rows[i].state != want.state {
+			t.Errorf("row %d = %+v, want rowID %d state %v", i, m.rows[i], want.rowID, want.state)
+		}
+	}
+}
+
+// TestFlowModel_WidthTruncationKeepsStateAndBar (review B7): at 80 and
+// at narrow widths every row line fits the terminal in ANSI cell width —
+// wide graphemes counted as two cells — and the state word and bar are
+// never truncated away.
+func TestFlowModel_WidthTruncationKeepsStateAndBar(t *testing.T) {
+	for _, width := range []int{80, 40, 24} {
+		_, m := flowFixture(t)
+		m = updateMsg(t, m, tea.WindowSizeMsg{Width: width, Height: 24})
+		m.phase = phaseApply
+		m.rows = []applyRow{
+			{label: "ハーネス更新ツール-very-long-harness-name (native)", state: rowRunning, reason: "a very long reason that must not push the state and bar out of the frame"},
+			{label: "x", state: rowFailed, reason: "r"},
+		}
+		v := m.frame()
+		for _, line := range strings.Split(v, "\n") {
+			if w := ansi.StringWidth(line); w > width {
+				t.Errorf("width %d: line of %d cells: %q", width, w, line)
+			}
+		}
+		for _, want := range []string{"running", "failed", "["} {
+			if !contains(v, want) {
+				t.Errorf("width %d: row state/bar %q missing\n%s", width, want, v)
+			}
+		}
+	}
+}
+
+// TestFlowModel_ResizeShrinkAndExpand (review B7): both directions of
+// WindowSizeMsg re-layout correctly.
+func TestFlowModel_ResizeShrinkAndExpand(t *testing.T) {
+	_, m := flowFixture(t)
+	m.phase = phaseApply
+	m.rows = []applyRow{{label: "harness-name-that-is-quite-long-indeed (npm)", state: rowDone}}
+
+	m = updateMsg(t, m, tea.WindowSizeMsg{Width: 40, Height: 12}) // shrink
+	for _, line := range strings.Split(m.frame(), "\n") {
+		if w := ansi.StringWidth(line); w > 40 {
+			t.Errorf("shrunk line of %d cells: %q", w, line)
+		}
+	}
+	if !contains(m.frame(), "done") {
+		t.Errorf("shrunk frame lost the state word\n%s", m.frame())
+	}
+
+	m = updateMsg(t, m, tea.WindowSizeMsg{Width: 120, Height: 40}) // expand
+	if !contains(m.frame(), "harness-name-that-is-quite-long-indeed (npm)") {
+		t.Errorf("expanded frame should show the full label\n%s", m.frame())
+	}
+}
+
+// TestFlowModel_TinyHeightKeepsCountsAndNav (review B7): the banner may
+// compact first; counts, states and navigation must survive.
+func TestFlowModel_TinyHeightKeepsCountsAndNav(t *testing.T) {
+	_, m := summaryFixture(t)
+	m = updateMsg(t, m, tea.WindowSizeMsg{Width: 80, Height: 8})
+	v := m.frame()
+	if contains(v, "▓") {
+		t.Errorf("the banner must compact at tiny heights\n%s", v)
+	}
+	for _, want := range []string{"1 succeeded · 1 failed · 1 skipped", "q/enter/ctrl+c dismiss"} {
+		if !contains(v, want) {
+			t.Errorf("tiny frame lost %q\n%s", want, v)
+		}
+	}
+	if lines := strings.Split(strings.TrimSuffix(v, "\n"), "\n"); len(lines) > 8 {
+		t.Errorf("frame is %d lines at height 8", len(lines))
+	}
+}
+
+// TestFlowModel_DetailViewShowsFullContent (review B7): the d view
+// exposes full, wrapped detail — reason and tail — at any width.
+func TestFlowModel_DetailViewShowsFullContent(t *testing.T) {
+	_, m := flowFixture(t)
+	m = updateMsg(t, m, tea.WindowSizeMsg{Width: 40, Height: 24})
+	m.phase = phaseApply
+	m.rows = []applyRow{{
+		label:  "claude (native)",
+		state:  rowFailed,
+		reason: "REASON-START installer exited with an error after a long struggle REASON-END",
+		tail:   "TAIL-START boom\nmore output TAIL-END",
+	}}
+	m = updateKey(t, m, "d")
+	v := m.frame()
+	// Wrap boundaries may split a marker across lines: join the rendered
+	// lines before checking, which is exactly what paging lets the user
+	// read in full.
+	joined := strings.ReplaceAll(v, "\n", "")
+	for _, frag := range []string{"REASON-START", "REASON-END", "TAIL-START", "TAIL-END"} {
+		if !contains(joined, frag) {
+			t.Errorf("detail view lost %q\n%s", frag, v)
+		}
 	}
 }

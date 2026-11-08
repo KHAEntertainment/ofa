@@ -337,15 +337,31 @@ func (a *App) runDetect(cat []catalog.Harness) ([]detect.Instance, []detect.Fail
 // state file is the scan record, and a latest-only file would corrupt
 // drift.
 func (a *App) runPipeline(cat []catalog.Harness) ([]detect.Instance, []resolve.Resolution, []detect.Failure, ExitCode) {
+	return a.runPipelineUntil(cat, nil)
+}
+
+// runPipelineUntil is runPipeline with a stop gate between stages for
+// the interactive flow (issue #62): once stop is closed, no further
+// stage launches — the result returns empty after joining the background
+// work. stop == nil runs exactly as runPipeline. Every path, plain or
+// interactive, joins the brew prefetch before returning: a spawned
+// `brew outdated` (and its child process) must never outlive the run,
+// whether or not resolve consumed the future (BrewFuture.Join is
+// idempotent and cached, so this is never a second consumptive wait).
+func (a *App) runPipelineUntil(cat []catalog.Harness, stop <-chan struct{}) ([]detect.Instance, []resolve.Resolution, []detect.Failure, ExitCode) {
 	var prefetch *resolve.BrewFuture
 	if catHasBrewTier(cat) {
 		prefetch = resolve.PrefetchBrew(a.ResolveRunner)
 	}
+	defer prefetch.Join()
 
 	insts, failures, code := a.runDetect(cat)
 	if code != ExitOK {
-		// The prefetch completes into its own buffer and is collected.
 		return nil, nil, failures, code
+	}
+	if stopped(stop) {
+		// Cancellation observed between stages: resolve never launches.
+		return nil, nil, failures, ExitOK
 	}
 
 	// Cache load is best-effort: a corrupt state file surfaces through
@@ -367,6 +383,20 @@ func (a *App) runPipeline(cat []catalog.Harness) ([]detect.Instance, []resolve.R
 		}
 	}
 	return insts, res, failures, ExitOK
+}
+
+// stopped reports whether a stop has been requested on the channel.
+// Nil (plain callers) never stops.
+func stopped(stop <-chan struct{}) bool {
+	if stop == nil {
+		return false
+	}
+	select {
+	case <-stop:
+		return true
+	default:
+		return false
+	}
 }
 
 // catHasBrewTier reports whether the catalog has any brew-tier install,

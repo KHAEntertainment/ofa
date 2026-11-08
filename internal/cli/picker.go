@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"io"
 	"os"
-	"sort"
 	"strings"
 	"sync"
 	"unicode/utf8"
@@ -16,7 +15,6 @@ import (
 	"ofa/internal/catalog"
 	"ofa/internal/picker"
 	"ofa/internal/resolve"
-	"ofa/internal/update"
 )
 
 // isTerminal reports whether f is a character device — a necessary but
@@ -212,21 +210,35 @@ func (a *App) pickerFlow() ExitCode {
 			sink.bind(diag)
 			return a.pickerScan(stop, &cat)
 		},
-		Build: func(selected []resolve.Resolution) ([]update.Request, []picker.SkippedRow) {
-			requests, skip := buildRequests(cat, selected, false /* picker is always quiet */, a.Pins)
-			// Stable rows: buildRequests reports skips keyed by label and
-			// map iteration order is random, so sort for a deterministic
-			// progress screen.
-			labels := make([]string, 0, len(skip))
-			for label := range skip {
-				labels = append(labels, label)
+		// Build adapts each selection through buildRequests individually:
+		// one row per selection, in selection order, with the selection
+		// index as stable identity. Per-selection calls keep the
+		// label-keyed skip map from collapsing duplicate installs.
+		Build: func(selected []resolve.Resolution) picker.FlowPlan {
+			var plan picker.FlowPlan
+			for i, r := range selected {
+				reqs, skips := buildRequests(cat, []resolve.Resolution{r}, false /* picker is always quiet */, a.Pins)
+				if len(reqs) == 1 {
+					plan.Rows = append(plan.Rows, picker.FlowRow{
+						RowID:        i,
+						Label:        reqs[0].Label,
+						RequestIndex: len(plan.Requests),
+					})
+					plan.Requests = append(plan.Requests, reqs[0])
+					continue
+				}
+				label, reason := labelFor(r), "not actionable"
+				for lk, rv := range skips {
+					label, reason = lk, rv
+				}
+				plan.Rows = append(plan.Rows, picker.FlowRow{
+					RowID:        i,
+					Label:        label,
+					RequestIndex: -1,
+					Reason:       reason,
+				})
 			}
-			sort.Strings(labels)
-			skipped := make([]picker.SkippedRow, 0, len(skip))
-			for _, label := range labels {
-				skipped = append(skipped, picker.SkippedRow{Label: label, Reason: skip[label]})
-			}
-			return requests, skipped
+			return plan
 		},
 		Exec: a.UpdateExec,
 	})
@@ -245,14 +257,6 @@ func (a *App) pickerFlow() ExitCode {
 // so the flow waits for them and never claims they were canceled.
 func (a *App) pickerScan(stop <-chan struct{}, catOut *[]catalog.Harness) picker.ScanResult {
 	var res picker.ScanResult
-	stopped := func() bool {
-		select {
-		case <-stop:
-			return true
-		default:
-			return false
-		}
-	}
 
 	// First-run auto-scan (cli-surface spec): populate the state file so
 	// later runs skip it. Its report lands in the TUI like any other
@@ -264,7 +268,7 @@ func (a *App) pickerScan(stop <-chan struct{}, catOut *[]catalog.Harness) picker
 			return res
 		}
 	}
-	if stopped() {
+	if stopped(stop) {
 		return res
 	}
 	cat, code := a.loadCatalog()
@@ -277,10 +281,10 @@ func (a *App) pickerScan(stop <-chan struct{}, catOut *[]catalog.Harness) picker
 		return res
 	}
 	a.warnUnknownPins(cat)
-	if stopped() {
+	if stopped(stop) {
 		return res
 	}
-	_, resolutions, _, code := a.runPipeline(cat)
+	_, resolutions, _, code := a.runPipelineUntil(cat, stop)
 	if code != ExitOK {
 		res.Code = int(code)
 		return res
