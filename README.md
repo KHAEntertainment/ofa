@@ -36,20 +36,20 @@ OFA never reimplements an updater. It runs the native one (`brew upgrade`, `npm 
 ### macOS (Homebrew)
 
 ```sh
-$ brew install KHAEntertainment/tap/ofa
+brew install KHAEntertainment/tap/ofa
 ```
 
 ### npm (any platform)
 
 ```sh
-$ npm install -g @khaentertainment/ofa
+npm install -g @khaentertainment/ofa
 ```
 
 ### From source
 
 ```sh
-$ git clone https://github.com/KHAEntertainment/ofa
-$ cd ofa && go build -o ~/.local/bin/ofa ./cmd/ofa
+git clone https://github.com/KHAEntertainment/ofa
+cd ofa && go build -o ~/.local/bin/ofa ./cmd/ofa
 ```
 
 Go 1.26+ required.
@@ -66,7 +66,7 @@ Confirm an attestation exists (no install needed — this follows whatever
 `latest` points at):
 
 ```sh
-$ npm view @khaentertainment/ofa dist.attestations
+npm view @khaentertainment/ofa dist.attestations
 {
   url: 'https://registry.npmjs.org/-/npm/v1/attestations/@khaentertainment%2fofa@0.2.1',
   provenance: { predicateType: 'https://slsa.dev/provenance/v1' }
@@ -77,9 +77,9 @@ To actually verify the signatures, install it as a dependency of a project —
 `npm audit signatures` deliberately refuses global installs (`EAUDITGLOBAL`):
 
 ```sh
-$ mkdir verify && cd verify && npm init -y
-$ npm install @khaentertainment/ofa
-$ npm audit signatures
+mkdir verify && cd verify && npm init -y
+npm install @khaentertainment/ofa
+npm audit signatures
 
 1 package has a verified registry signature
 
@@ -96,8 +96,8 @@ into `~/.local/bin` and later installed via npm or Homebrew, the older local
 binary keeps winning — and will keep reporting its own version:
 
 ```sh
-$ which -a ofa            # every copy, in PATH order
-$ ofa --version           # what you are actually running
+which -a ofa            # every copy, in PATH order
+ofa --version           # what you are actually running
 ```
 
 Remove or update the stale copy to let the packaged binary take over. This is
@@ -139,15 +139,15 @@ First run on a machine with no `~/.config/ofa/state.json` auto-scans first, so t
 ### Non-interactive
 
 ```sh
-$ ofa check             # what's outdated? exit 1 if anything pending
-$ ofa check --json      # jq-friendly
-$ ofa check --refresh   # bypass cached latest versions (--refresh also on apply and `ofa`)
-$ ofa apply --dry-run   # show the plan without running
-$ ofa apply --yes       # run all available updates
-$ ofa apply --only pi   # narrow to one harness
-$ ofa apply --verbose   # stream each installer's full output (default: progress lines)
-$ ofa scan              # detect + write state, report drift since last scan
-$ ofa doctor <bin>      # agent-drafted catalog entry for an undetected binary
+ofa check             # what's outdated? exit 1 if anything pending
+ofa check --json      # jq-friendly
+ofa check --refresh   # bypass cached latest versions (--refresh also on apply and `ofa`)
+ofa apply --dry-run   # show the plan without running
+ofa apply --yes       # run all available updates
+ofa apply --only pi   # narrow to one harness
+ofa apply --verbose   # stream each installer's full output (default: progress lines)
+ofa scan              # detect + write state, report drift since last scan
+ofa doctor <bin>      # agent-drafted catalog entry for an undetected binary
 ```
 
 `ofa apply` without `--yes` exits `3` (cancelled) when the confirmation is
@@ -321,10 +321,10 @@ runs with no tools and no session persistence, which is what the trust
 model requires.
 
 ```sh
-$ ofa doctor                 # gap check: list undetected binaries, or draft for the single one
-$ ofa doctor <bin>           # draft an entry for one binary
-$ ofa doctor --list          # previous sessions and their verdicts
-$ ofa doctor --install 20261028T123456Z   # install a proposal saved by an earlier run
+ofa doctor                 # gap check: list undetected binaries, or draft for the single one
+ofa doctor <bin>           # draft an entry for one binary
+ofa doctor --list          # previous sessions and their verdicts
+ofa doctor --install 20261028T123456Z   # install a proposal saved by an earlier run
 ```
 
 Each session writes `~/.config/ofa/doctor/history/<timestamp>/`: the facts
@@ -419,10 +419,10 @@ and uncommitted to any date.
 The Catalog is the contribution surface. Adding a harness:
 
 ```sh
-$ cp internal/catalog/data/agy.toml internal/catalog/data/your-harness.toml
-$ # edit id, name, installs (method/bin/package/version/latest/update)
-$ go test ./...
-$ # open a PR
+cp internal/catalog/data/agy.toml internal/catalog/data/your-harness.toml
+# edit id, name, installs (method/bin/package/version/latest/update)
+go test ./...
+# open a PR
 ```
 
 If `ofa doctor` (see [Agent-assisted repair](#agent-assisted-repair-ofa-doctor)) finds a binary on your machine that doesn't match a catalog entry, it drafts a TOML for you to review, install into your user catalog, and contribute upstream. Doctor is an opt-in command — not part of the default `ofa` path.
