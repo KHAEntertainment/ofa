@@ -1,0 +1,9 @@
+--- stdout ---
+scan: 3 harnesses, 1 with updates, 1 updaters available
+
+  claude         2.1.300                          [self]  claude → updater available
+  qwen           0.22.1                           [npm]  qwen → 0.25.2
+  codex          0.162.1                          [brew]  codex (at latest)
+--- stderr ---
+--- exit ---
+1

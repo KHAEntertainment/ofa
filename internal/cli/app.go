@@ -108,18 +108,19 @@ type App struct {
 	// Now is injected so tests can pin timestamps.
 	Now func() time.Time
 
-	// StderrIsTTY reports whether the picker may animate its loading
-	// indicator (issue #12). The default reuses the stat-based isTerminal
-	// check; tests override it to exercise both gates without needing a
-	// real terminal.
+	// StderrIsTTY reports whether stderr is a real terminal: it gates the
+	// scanning screen's banner on the plain fallback (issue #43/#12) and,
+	// with StdinIsTTY, the interactive TUI (issue #62). The default is
+	// stderrIsTTY — a termios check through stdinIsTTY, not a stat-only
+	// mode test, so /dev/null and /dev/zero are correctly excluded; tests
+	// override it to exercise both gates without needing a real terminal.
 	StderrIsTTY func(io.Writer) bool
 
-	// StdinIsTTY reports whether doctor's install prompt may read an
-	// interactive answer from Stdin. The default is stricter than
-	// StderrIsTTY's stat-based check: it asks the device itself (a
-	// termios ioctl) whether stdin is a real terminal, and excludes
-	// /dev/null; tests override it so the prompt and the
-	// non-interactive branch are both reachable without a real terminal.
+	// StdinIsTTY reports whether stdin is a real terminal (a termios
+	// ioctl that excludes /dev/null). It gates doctor's install prompt
+	// and, with StderrIsTTY, the interactive picker TUI (issue #62).
+	// Tests override it so the interactive and non-interactive branches
+	// are both reachable without a real terminal.
 	StdinIsTTY func(io.Reader) bool
 
 	// ConfigLoader reads the user config (~/.config/ofa/config.toml).
@@ -336,15 +337,31 @@ func (a *App) runDetect(cat []catalog.Harness) ([]detect.Instance, []detect.Fail
 // state file is the scan record, and a latest-only file would corrupt
 // drift.
 func (a *App) runPipeline(cat []catalog.Harness) ([]detect.Instance, []resolve.Resolution, []detect.Failure, ExitCode) {
+	return a.runPipelineUntil(cat, nil)
+}
+
+// runPipelineUntil is runPipeline with a stop gate between stages for
+// the interactive flow (issue #62): once stop is closed, no further
+// stage launches — the result returns empty after joining the background
+// work. stop == nil runs exactly as runPipeline. Every path, plain or
+// interactive, joins the brew prefetch before returning: a spawned
+// `brew outdated` (and its child process) must never outlive the run,
+// whether or not resolve consumed the future (BrewFuture.Join is
+// idempotent and cached, so this is never a second consumptive wait).
+func (a *App) runPipelineUntil(cat []catalog.Harness, stop <-chan struct{}) ([]detect.Instance, []resolve.Resolution, []detect.Failure, ExitCode) {
 	var prefetch *resolve.BrewFuture
 	if catHasBrewTier(cat) {
 		prefetch = resolve.PrefetchBrew(a.ResolveRunner)
 	}
+	defer prefetch.Join()
 
 	insts, failures, code := a.runDetect(cat)
 	if code != ExitOK {
-		// The prefetch completes into its own buffer and is collected.
 		return nil, nil, failures, code
+	}
+	if stopped(stop) {
+		// Cancellation observed between stages: resolve never launches.
+		return nil, nil, failures, ExitOK
 	}
 
 	// Cache load is best-effort: a corrupt state file surfaces through
@@ -366,6 +383,20 @@ func (a *App) runPipeline(cat []catalog.Harness) ([]detect.Instance, []resolve.R
 		}
 	}
 	return insts, res, failures, ExitOK
+}
+
+// stopped reports whether a stop has been requested on the channel.
+// Nil (plain callers) never stops.
+func stopped(stop <-chan struct{}) bool {
+	if stop == nil {
+		return false
+	}
+	select {
+	case <-stop:
+		return true
+	default:
+		return false
+	}
 }
 
 // catHasBrewTier reports whether the catalog has any brew-tier install,

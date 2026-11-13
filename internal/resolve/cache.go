@@ -1,6 +1,7 @@
 package resolve
 
 import (
+	"sync"
 	"time"
 )
 
@@ -79,10 +80,16 @@ type brewOutcome struct {
 // BrewFuture is an in-flight `brew outdated` query. Create one with
 // PrefetchBrew before detection runs so the query overlaps the scan, and
 // pass it via Config.Prefetch; Resolve consumes it when brew-tier
-// installs exist. The channel is buffered, so an unconsumed future
-// finishes without blocking.
+// installs exist. The outcome is cached on first wait, so waiting is
+// idempotent: a Wait after Resolve consumed the future — or a second
+// Wait — returns the same result instead of re-consuming the channel,
+// and Join can always drain the spawned query on any exit path.
 type BrewFuture struct {
 	ch chan brewOutcome
+
+	mu   sync.Mutex
+	out  brewOutcome
+	done bool
 }
 
 // PrefetchBrew starts `brew outdated` in the background. The runner is
@@ -96,14 +103,29 @@ func PrefetchBrew(run Runner) *BrewFuture {
 	return f
 }
 
-// wait blocks for the query. Resolve calls it at most once, and only
-// when brew-tier installs exist — at most one consumer per future. The
-// channel is drained by that read: sharing one Config.Prefetch across
-// two Resolve calls would deadlock the second waiter, which is why the
-// CLI builds a fresh future per invocation and never reuses it.
+// wait blocks for the query and caches its outcome. The first call
+// drains the channel; every later call returns the cached outcome. The
+// lock is held across the receive so concurrent waiters serialize into
+// exactly one consumption — never a second, unbounded wait.
 func (f *BrewFuture) wait() (*brewResolver, error) {
-	o := <-f.ch
-	return o.res, o.err
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if !f.done {
+		f.out = <-f.ch
+		f.done = true
+	}
+	return f.out.res, f.out.err
+}
+
+// Join waits for the spawned query to finish and discards the outcome.
+// Idempotent and safe whether or not Resolve already waited: pipelines
+// call it on every exit path so no background `brew outdated` (and its
+// child process) outlives the run. Nil-safe.
+func (f *BrewFuture) Join() {
+	if f == nil {
+		return
+	}
+	_, _ = f.wait()
 }
 
 // fetchLatest resolves one package's latest version through cfg's cache:

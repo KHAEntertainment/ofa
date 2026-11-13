@@ -1,0 +1,14 @@
+--- stdout ---
+
+Will run 2 update(s)
+  - claude (native)
+  - qwen (npm)
+
+
+Summary: 1 succeeded, 1 failed, 0 skipped
+FAILURES:
+  - qwen (npm): exit 1, err=stub failure
+      stub tail
+--- stderr ---
+--- exit ---
+1

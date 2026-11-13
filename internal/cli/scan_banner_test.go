@@ -1,218 +1,55 @@
 package cli
 
 import (
-	"bytes"
 	"io"
 	"os"
 	"regexp"
 	"strings"
-	"sync"
 	"testing"
-	"time"
 
 	"ofa/internal/banner"
-	"ofa/internal/catalog"
-	"ofa/internal/detect"
-	"ofa/internal/resolve"
 )
 
-// The OFA banner on the harness scanning screen (issue #43).
+// The OFA banner on the harness scanning screen (issue #43), and the
+// interactive flow's byte contract (issue #62).
 //
-// The scanning screen is the one place the brand was missing: the picker
-// draws the banner, but the wait before it only showed a spinner line.
-// These tests pin the contract of the fix:
+// Issue #62 moved the scan inside the TUI: the banner, the short tagline
+// and the "Scanning System for Harnesses..." caption now live in the alt
+// screen's scanning frame (pinned in internal/picker), and the old
+// stderr spinner before the picker is gone. What remains on the normal
+// streams is the non-interactive fallback only. These tests pin the
+// contract of what is left:
 //
-//   - the banner and its short tagline are written to stderr, above the
-//     spinner line, when stderr is a terminal;
-//   - they are written exactly once, no matter how many spinner frames
-//     are painted, and the pipeline itself never redraws them;
-//   - they are written before the first-run notice, so the first run is
-//     branded too, and a returning user is branded exactly once;
-//   - a non-TTY stderr, a usage error and the `ofa scan` subcommand get no
-//     banner bytes at all — including a stderr that is a character device
-//     but not a terminal;
-//   - NO_COLOR strips the banner's colors, while the spinner's cursor
-//     control escapes stay.
+//   - the fallback's banner and short tagline are written to stderr,
+//     above the plain scan output, when stderr is a terminal;
+//   - they are written exactly once, before the first-run notice, so a
+//     first run is branded too, and a returning user is branded exactly
+//     once;
+//   - the interactive path writes no banner, spinner or notice bytes to
+//     the normal streams at all (pinned in cli_test.go and the picker
+//     package);
+//   - a non-TTY stderr, a usage error and the `ofa scan` subcommand get
+//     no banner bytes at all — including a stderr that is a character
+//     device but not a terminal;
+//   - NO_COLOR strips the banner's colors.
 //
 // Nothing here reaches a real terminal, a real `ofa` install or the
 // developer's own config: the app is built by newTestApp against temp
-// paths, and the spinner frames are observed rather than waited for.
+// paths.
 
 // sgrPattern matches the SGR escape sequences — the color and style codes.
-// Cursor control escapes such as "\x1b[2K" are deliberately not matched:
-// the spinner needs them, and only the colors are at stake in the
-// NO_COLOR contract.
 var sgrPattern = regexp.MustCompile("\x1b\\[[0-9;]*m")
-
-// braillePattern matches the spinner's braille frames.
-var braillePattern = regexp.MustCompile(`[\x{2800}-\x{28ff}]`)
 
 // stripSGR removes the color escapes from a captured terminal stream, so a
 // test can look for the banner's plain glyphs whether or not the banner
 // was drawn with colors.
 func stripSGR(s string) string { return sgrPattern.ReplaceAllString(s, "") }
 
-// frameSignal is a mutex-guarded buffer that reports when the spinner has
-// written its second frame.
-//
-// The spinner draws from its own goroutine, so a test must never read the
-// buffer while a frame may be in flight. This writer takes the lock for
-// every write and for every read, and closes secondFrame once the second
-// frame has landed — a synchronization point, not a sleep.
-type frameSignal struct {
-	mu          sync.Mutex
-	buf         bytes.Buffer
-	frames      int
-	secondFrame chan struct{}
-	once        sync.Once
-}
-
-func newFrameSignal() *frameSignal {
-	return &frameSignal{secondFrame: make(chan struct{})}
-}
-
-func (w *frameSignal) Write(p []byte) (int, error) {
-	w.mu.Lock()
-	w.buf.Write(p)
-	if braillePattern.Match(p) {
-		w.frames++
-		if w.frames >= 2 {
-			w.once.Do(func() { close(w.secondFrame) })
-		}
-	}
-	w.mu.Unlock()
-	return len(p), nil
-}
-
-// String returns what has been written so far. Safe to read once the
-// writer is done — the tests read only after Stop joined the goroutine.
-func (w *frameSignal) String() string {
-	w.mu.Lock()
-	defer w.mu.Unlock()
-	return w.buf.String()
-}
-
-// Frames returns how many spinner frames have been written.
-func (w *frameSignal) Frames() int {
-	w.mu.Lock()
-	defer w.mu.Unlock()
-	return w.frames
-}
-
-// TestScanBanner_TTYDrawsBannerOnceAboveSpinner is the core of issue #43:
-// on a terminal the banner and the short tagline sit above the spinner
-// line, the scanning line carries the new caption, and the banner appears
-// exactly once however many frames the spinner paints.
-func TestScanBanner_TTYDrawsBannerOnceAboveSpinner(t *testing.T) {
-	t.Setenv("NO_COLOR", "1") // plain art: the bytes are exactly banner.Plain()
-
-	a, _, _, sd, sr, _ := newTestApp(t, nil, nil)
-	a.StderrIsTTY = func(io.Writer) bool { return true }
-	sd.instances = oneClaude()
-
-	// The spinner paints from its own goroutine, so the test observes its
-	// frames instead of sleeping and hoping. The resolve waits for the
-	// second frame to have been written, so the pipeline cannot finish
-	// before the spinner has painted twice. The wait is bounded: on a
-	// timeout the resolve returns and the assertions below fail with the
-	// real frame count.
-	sig := newFrameSignal()
-	a.Stderr = sig
-	sr.res = []resolve.Resolution{{HarnessID: "claude", Tier: "self"}}
-	a.ResolveFn = func(insts []detect.Instance, cat []catalog.Harness, run resolve.Runner, get resolve.Getter, cfg resolve.Config) []resolve.Resolution {
-		select {
-		case <-sig.secondFrame:
-		case <-time.After(5 * time.Second):
-		}
-		return sr.res
-	}
-
-	// The two calls pickerCmd makes, in the order it makes them.
-	a.drawScanBanner()
-	if _, code := a.pickerPipeline(testCatalog(t)); code != ExitOK {
-		t.Fatalf("pickerPipeline exit = %d, want %d", code, ExitOK)
-	}
-
-	// Safe to read now: pickerPipeline's deferred Stop joined the
-	// drawing goroutine before it returned.
-	got := sig.String()
-	if n := strings.Count(got, banner.Plain()); n != 1 {
-		t.Errorf("banner art appears %d times in %q, want exactly 1", n, got)
-	}
-	if !strings.Contains(got, scanTagline) {
-		t.Errorf("stderr = %q, want the short tagline %q", got, scanTagline)
-	}
-	if !strings.Contains(got, scanCaption) {
-		t.Errorf("stderr = %q, want the scanning caption %q", got, scanCaption)
-	}
-
-	// The banner belongs above the spinner line.
-	art := strings.Index(got, banner.Plain())
-	frame := strings.Index(got, "⠋")
-	if art < 0 || frame < 0 || art > frame {
-		t.Errorf("stderr = %q, want the banner before the first spinner frame", got)
-	}
-
-	// The spinner really did paint more than one frame, so "drawn once"
-	// was tested against a redraw opportunity.
-	if frames := sig.Frames(); frames < 2 {
-		t.Errorf("spinner painted %d frames, want at least 2 to prove the banner is not redrawn", frames)
-	}
-}
-
-// TestScanBanner_SpinnerKeepsCursorControlEscapes: the NO_COLOR contract
-// is about colors. The spinner still needs its cursor control escapes to
-// redraw in place.
-func TestScanBanner_SpinnerKeepsCursorControlEscapes(t *testing.T) {
-	t.Setenv("NO_COLOR", "1")
-
-	a, _, stderr, _, sr, _ := newTestApp(t, nil, nil)
-	a.StderrIsTTY = func(io.Writer) bool { return true }
-	sr.res = []resolve.Resolution{{HarnessID: "claude", Tier: "self"}}
-
-	a.drawScanBanner()
-	if _, code := a.pickerPipeline(testCatalog(t)); code != ExitOK {
-		t.Fatalf("pickerPipeline exit = %d, want %d", code, ExitOK)
-	}
-
-	got := stderr.String()
-	if !strings.Contains(got, "\x1b[2K") {
-		t.Errorf("stderr = %q, want the spinner's cursor control escape", got)
-	}
-	if sgr := sgrPattern.FindAllString(got, -1); len(sgr) != 0 {
-		t.Errorf("stderr carries %d SGR escapes under NO_COLOR, want none: %q", len(sgr), got)
-	}
-}
-
-// TestPickerPipeline_AloneDrawsNoBanner: the banner is drawn once, before
-// the scan. The pipeline must not draw a second copy of it — that is what
-// would double the brand on the scanning screen.
-func TestPickerPipeline_AloneDrawsNoBanner(t *testing.T) {
-	t.Setenv("NO_COLOR", "1")
-
-	a, _, stderr, _, sr, _ := newTestApp(t, nil, nil)
-	a.StderrIsTTY = func(io.Writer) bool { return true }
-	sr.res = []resolve.Resolution{{HarnessID: "claude", Tier: "self"}}
-
-	if _, code := a.pickerPipeline(testCatalog(t)); code != ExitOK {
-		t.Fatalf("pickerPipeline exit = %d, want %d", code, ExitOK)
-	}
-
-	got := stderr.String()
-	if strings.Contains(stripSGR(got), banner.Plain()) {
-		t.Errorf("the pipeline drew the banner: %q", got)
-	}
-	if strings.Contains(got, scanTagline) {
-		t.Errorf("the pipeline drew the tagline: %q", got)
-	}
-	if !strings.Contains(got, scanCaption) {
-		t.Errorf("stderr = %q, want the scanning caption %q", got, scanCaption)
-	}
-}
-
 // TestScanBanner_FirstRunShowsBannerBeforeScanNotice: the first run
 // ("first run: scanning...") is branded too, and the banner comes before
-// the notice — exactly once.
+// the notice — exactly once. This is the non-interactive fallback path
+// (issue #62); the interactive path brands its first run inside the TUI
+// (pinned in internal/picker).
 func TestScanBanner_FirstRunShowsBannerBeforeScanNotice(t *testing.T) {
 	t.Setenv("NO_COLOR", "1")
 
@@ -365,8 +202,10 @@ func TestStderrIsTTY_CharacterDeviceIsNotATerminal(t *testing.T) {
 
 	// The positive case needs a real terminal, which a machine without a
 	// controlling terminal (a CI runner) does not have. It is a skip
-	// rather than a pass: the default output says SKIP, so a run that
-	// never checked the positive case cannot read as one that did.
+	// rather than a pass — but note a skip is only visible under `go test
+	// -v` (or -json); the default output does not show it. CI must run
+	// this package verbosely to tell a run that checked the positive
+	// case from one that did not.
 	t.Run("a controlling terminal is a terminal", func(t *testing.T) {
 		tty, err := os.OpenFile("/dev/tty", os.O_RDWR, 0)
 		if err != nil {

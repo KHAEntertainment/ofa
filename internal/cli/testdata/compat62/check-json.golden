@@ -1,0 +1,59 @@
+--- stdout ---
+{
+  "scanned_at": "2025-01-01T00:00:00Z",
+  "harness_count": 3,
+  "install_count": 3,
+  "update_count": 1,
+  "updater_available_count": 1,
+  "harnesses": {
+    "claude": {
+      "name": "Claude Code",
+      "installs": [
+        {
+          "method": "native",
+          "bin": "claude",
+          "version": "2.1.300",
+          "status": "active",
+          "tier": "self",
+          "outdated": false,
+          "updater_available": true
+        }
+      ]
+    },
+    "codex": {
+      "name": "Codex CLI",
+      "installs": [
+        {
+          "method": "brew-cask",
+          "package": "codex",
+          "bin": "codex",
+          "version": "0.162.1",
+          "status": "active",
+          "tier": "brew",
+          "latest": "0.162.1",
+          "outdated": false,
+          "updater_available": false
+        }
+      ]
+    },
+    "qwen": {
+      "name": "Qwen Code",
+      "installs": [
+        {
+          "method": "npm",
+          "package": "@qwen-code/qwen-code",
+          "bin": "qwen",
+          "version": "0.22.1",
+          "status": "active",
+          "tier": "npm",
+          "latest": "0.25.2",
+          "outdated": true,
+          "updater_available": false
+        }
+      ]
+    }
+  }
+}
+--- stderr ---
+--- exit ---
+1

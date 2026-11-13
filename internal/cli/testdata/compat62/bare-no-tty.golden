@@ -1,0 +1,12 @@
+--- stdout ---
+3 harnesses (3 installs)
+initial scan
+
+  claude         native                 2.1.300    active
+  codex          codex                  0.162.1    active
+  qwen           @qwen-code/qwen-code   0.22.1     active
+--- stderr ---
+first run: scanning...
+ofa: no TTY detected; use `ofa scan`, `ofa check`, or `ofa apply` instead
+--- exit ---
+2
