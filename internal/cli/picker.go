@@ -35,6 +35,26 @@ func isTerminal(f *os.File) bool {
 	return (info.Mode() & os.ModeCharDevice) != 0
 }
 
+// stdinIsInteractive reports whether the bare picker's stdin gate passes:
+// a.Stdin must be an *os.File that isTerminal accepts — the exact check
+// pickerCmd has always made, hoisted so the first-run block can answer
+// "is this an interactive run?" before it scans (issue #66) without the
+// gate itself moving or changing meaning.
+//
+// It is a package variable only so tests can drive the interactive
+// first-run path without a real terminal; production behavior is the
+// historical stat-based check verbatim — deliberately NOT doctor's
+// stricter termios gate, which would change non-interactive exits.
+var stdinIsInteractive = func(r io.Reader) bool {
+	f, ok := r.(*os.File)
+	return ok && isTerminal(f)
+}
+
+// openPicker is picker.Run behind a seam so tests can assert what
+// reached the picker (issue #66) without opening a TUI. Production
+// behavior is picker.Run itself.
+var openPicker = picker.Run
+
 // stderrIsTTY is the default StderrIsTTY gate for the picker's loading
 // indicator and the scanning screen's banner.
 //
@@ -167,22 +187,43 @@ func (a *App) pickerCmd(args []string) ExitCode {
 	// the flags parse, so a usage error never gains banner output.
 	a.drawScanBanner()
 
+	// The stdin gate is answered before the first-run scan, not inside
+	// it: the auto-scan's state-save failure is recoverable only on the
+	// interactive path (issue #66), so the recovery decision needs the
+	// answer up front. Evaluating it here does not move the gate itself —
+	// non-interactive runs still scan first and then bail below, in the
+	// same order and bytes as before.
+	interactive := stdinIsInteractive(a.Stdin)
+
 	// First-run auto-scan. Run scan only if there's no state file; the
 	// scan writes the file as a side effect, so subsequent runs skip.
 	// This runs even when stdin is not a TTY — a user piping `ofa` into
 	// a non-interactive context still benefits from a populated state.
 	if _, err := os.Stat(a.StatePath); errors.Is(err, os.ErrNotExist) {
 		fmt.Fprintln(a.Stderr, "first run: scanning...")
-		if code := a.scanCmd([]string{}); code != ExitOK {
+		code, saveErr := a.scanCmd([]string{})
+		switch {
+		case saveErr != nil && interactive:
+			// Issue #66: detection and reporting already succeeded and
+			// the picker never needs state.json on disk, so the
+			// persistence failure is reported exactly once — a warning
+			// naming the path and the cause — and the run goes on to
+			// the picker with this run's scan results held in memory.
+			fmt.Fprintf(a.Stderr, "ofa: warning: cannot save state: %v\n", saveErr)
+		case saveErr != nil:
+			// Non-interactive: identical to the pre-fix behavior —
+			// fatal state line naming path and cause, non-zero exit,
+			// no picker. Recovery is the TTY path only.
+			fmt.Fprintf(a.Stderr, "ofa: state: %v\n", saveErr)
+			return code
+		case code != ExitOK:
+			// Catalog, detection, and reporting failures stay fatal on
+			// every path; only the save failure above is recoverable.
 			return code
 		}
 	}
 
-	// Use a.Stdin (not os.Stdin) so tests can inject a non-TTY reader
-	// and exercise the bail-out path. isTerminal on a nil reader
-	// returns false, which is the correct behavior for tests.
-	stdin, ok := a.Stdin.(*os.File)
-	if !ok || !isTerminal(stdin) {
+	if !interactive {
 		fmt.Fprintln(a.Stderr, "ofa: no TTY detected; use `ofa scan`, `ofa check`, or `ofa apply` instead")
 		return ExitError
 	}
@@ -200,7 +241,7 @@ func (a *App) pickerCmd(args []string) ExitCode {
 		return code
 	}
 
-	outcome, err := picker.Run(resolutions, a.Pins)
+	outcome, err := openPicker(resolutions, a.Pins)
 	if err != nil {
 		fmt.Fprintf(a.Stderr, "ofa: picker: %v\n", err)
 		return ExitError

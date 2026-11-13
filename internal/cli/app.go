@@ -197,7 +197,16 @@ func (a *App) Run() ExitCode {
 		a.usage()
 		return ExitOK
 	case "scan":
-		return a.scanCmd(a.Args[1:])
+		code, saveErr := a.scanCmd(a.Args[1:])
+		if saveErr != nil {
+			// The scan subcommand reports a persistence failure as a
+			// fatal state error, naming the path and the cause (issue
+			// #66): scripts keep seeing the original diagnostic and a
+			// non-zero exit. The interactive first run reports the
+			// same error itself, once, as a warning.
+			fmt.Fprintf(a.Stderr, "ofa: state: %v\n", saveErr)
+		}
+		return code
 	case "check", "status":
 		return a.checkCmd(a.Args[1:])
 	case "apply", "update":
@@ -410,13 +419,11 @@ func (a *App) loadState() (*stateFile, ExitCode) {
 	return prev, ExitOK
 }
 
-// saveState writes the current scan via the state package. Returns
-// ExitCode so callers can decide whether to continue after a save failure
-// (we currently propagate it as ExitError).
-func (a *App) saveState(f *stateFile) ExitCode {
-	if err := saveStateFile(a.StatePath, f); err != nil {
-		fmt.Fprintf(a.Stderr, "ofa: state: %v\n", err)
-		return ExitError
-	}
-	return ExitOK
+// saveState writes the current scan via the state package and returns
+// the persistence error, if any. It prints nothing: the caller reports
+// the failure, so `ofa scan` keeps its fatal `ofa: state:` line while
+// the interactive first run reports it exactly once as a warning
+// (issue #66).
+func (a *App) saveState(f *stateFile) error {
+	return saveStateFile(a.StatePath, f)
 }

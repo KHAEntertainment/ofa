@@ -12,28 +12,33 @@ import (
 // scanCmd implements `ofa scan [--json]`. Detects installs, reports drift
 // vs. the saved state, and writes the new state. Resolution is *not*
 // performed — scan answers "what's installed?" not "what's outdated?".
-// Use `ofa check` for the latter.
-func (a *App) scanCmd(args []string) ExitCode {
+//
+// The error result is non-nil only when the catalog, detection and the
+// human/JSON report all succeeded and only the state write failed: the
+// separation the interactive first run needs to treat that one failure
+// as recoverable without ever mistaking a catalog or detection failure
+// for it (issue #66). Every other failure returns nil.
+func (a *App) scanCmd(args []string) (ExitCode, error) {
 	fs := flag.NewFlagSet("scan", flag.ContinueOnError)
 	fs.SetOutput(a.Stderr)
 	jsonOut := fs.Bool("json", false, "emit JSON on stdout")
 	if err := fs.Parse(args); err != nil {
-		return ExitError
+		return ExitError, nil
 	}
 
 	cat, code := a.loadCatalog()
 	if code != ExitOK {
-		return code
+		return code, nil
 	}
 	// Detect only — scan answers "what's installed?", and resolving here
 	// would run every registry query for results scan discards (issue #8).
 	insts, failures, code := a.runDetect(cat)
 	if code != ExitOK {
-		return code
+		return code, nil
 	}
 	prev, code := a.loadState()
 	if code != ExitOK {
-		return code
+		return code, nil
 	}
 	current := reconcileDegraded(prev, state.FromInstances(insts, a.Now()), failures)
 	// Carry the latest-version cache forward: detect doesn't refresh it
@@ -50,7 +55,10 @@ func (a *App) scanCmd(args []string) ExitCode {
 	return a.printScanHuman(current, prev, drift)
 }
 
-func (a *App) printScanHuman(current *stateFile, prev *stateFile, drift state.Drift) ExitCode {
+// printScanHuman renders the human report and persists the scan. The
+// returned error is the state-save failure, if any — it is not printed
+// here; the caller reports it (issue #66).
+func (a *App) printScanHuman(current *stateFile, prev *stateFile, drift state.Drift) (ExitCode, error) {
 	fmt.Fprintf(a.Stdout, "%d harnesses (%d installs)\n", harnessCount(current), installCount(current))
 	if prev == nil {
 		fmt.Fprintln(a.Stdout, "initial scan")
@@ -60,13 +68,17 @@ func (a *App) printScanHuman(current *stateFile, prev *stateFile, drift state.Dr
 		printDrift(a.Stdout, drift)
 	}
 	printInstancesTable(a.Stdout, current)
-	if code := a.saveState(current); code != ExitOK {
-		return code
+	if err := a.saveState(current); err != nil {
+		return ExitError, err
 	}
-	return ExitOK
+	return ExitOK, nil
 }
 
-func (a *App) printScanJSON(current *stateFile, drift state.Drift, failures []detect.Failure) ExitCode {
+// printScanJSON renders the JSON report and persists the scan. The
+// returned error is the state-save failure, if any — it is not printed
+// here; the caller reports it (issue #66). A JSON encoding failure has
+// already printed its own diagnostic, so it returns a nil error.
+func (a *App) printScanJSON(current *stateFile, drift state.Drift, failures []detect.Failure) (ExitCode, error) {
 	type scanOut struct {
 		ScannedAt    string                   `json:"scanned_at"`
 		HarnessCount int                      `json:"harness_count"`
@@ -89,14 +101,14 @@ func (a *App) printScanJSON(current *stateFile, drift state.Drift, failures []de
 	enc.SetIndent("", "  ")
 	if err := enc.Encode(out); err != nil {
 		fmt.Fprintf(a.Stderr, "ofa: json: %v\n", err)
-		return ExitError
+		return ExitError, nil
 	}
 	// Save after stdout succeeded so a JSON consumer never sees output
 	// without a state file updated.
-	if code := a.saveState(current); code != ExitOK {
-		return code
+	if err := a.saveState(current); err != nil {
+		return ExitError, err
 	}
-	return ExitOK
+	return ExitOK, nil
 }
 
 // harnessCount returns the number of distinct harnesses in f.
