@@ -6,14 +6,18 @@ package cli
 // the fix.
 //
 // Every path here is a t.TempDir() fixture; nothing touches HOME, the
-// network, a real detector/installer/agent/config, or a real terminal or
-// TUI. The two interactive-path seams (stdinIsInteractive, openPicker)
-// are overridden per test and restored with t.Cleanup; no test in this
-// file runs in parallel, so the package variables are safe under -race.
-// The deterministic save failure is a dangling symlink — os.Stat reports
-// ErrNotExist (the first-run trigger) while the write fails with ENOENT
-// naming the state path — which behaves identically for root and
-// unprivileged users on Linux and macOS.
+// network, a real detector/installer/agent/config, or a real TUI. The
+// interactive-path seams (stdinIsInteractive admission seam, openPicker)
+// and the App's StdinIsTTY recovery predicate are overridden per test
+// and restored with t.Cleanup; no test in this file runs in parallel, so
+// the package variables are safe under -race. The blanket-true override
+// is not the only eligibility proof: the default-predicate behavior is
+// pinned by the /dev/null + /dev/zero regression and the /dev/tty
+// positive test below (issue #66, B67-1). The deterministic save failure
+// is a dangling symlink — os.Stat reports ErrNotExist (the first-run
+// trigger) while the write fails with ENOENT naming the state path —
+// which behaves identically for root and unprivileged users on Linux and
+// macOS.
 
 import (
 	"bytes"
@@ -52,14 +56,19 @@ func stubOpenPicker(t *testing.T) *pickerProbe {
 	return p
 }
 
-// stubInteractiveGate forces the stdin gate to answer "terminal" so a
-// test can drive the interactive path with an ordinary reader instead of
-// a real pty. Restored by t.Cleanup.
-func stubInteractiveGate(t *testing.T) {
+// stubInteractiveGate makes a run look interactive end to end for the
+// integration tests: the admission predicate (stat seam) answers true
+// and the App's recovery predicate (StdinIsTTY) is overridden to true.
+// Both are restored by t.Cleanup (the App is per-test). Changed in
+// B67-1: recovery no longer rides on the admission seam alone, so an
+// integration test must satisfy both predicates; the defaults are
+// pinned separately by the /dev/null, /dev/zero and /dev/tty tests.
+func stubInteractiveGate(t *testing.T, a *App) {
 	t.Helper()
-	orig := stdinIsInteractive
+	origPred := stdinIsInteractive
 	stdinIsInteractive = func(io.Reader) bool { return true }
-	t.Cleanup(func() { stdinIsInteractive = orig })
+	t.Cleanup(func() { stdinIsInteractive = origPred })
+	a.StdinIsTTY = func(io.Reader) bool { return true }
 }
 
 // danglingStatePath returns a state path shaped like a first run whose
@@ -92,7 +101,7 @@ func TestPickerCmd_SaveFailureReachesPicker(t *testing.T) {
 	a.StatePath = statePath
 	sd.instances = oneClaude()
 	sr.res = []resolve.Resolution{{HarnessID: "claude", Tier: "self", Package: "claude-code"}}
-	stubInteractiveGate(t)
+	stubInteractiveGate(t, a)
 	probe := stubOpenPicker(t)
 
 	if code := a.Run(); code != ExitOK {
@@ -158,7 +167,7 @@ func TestPickerCmd_UnwritableStateDirStillReachesPicker(t *testing.T) {
 	a.StatePath = statePath
 	sd.instances = oneClaude()
 	sr.res = []resolve.Resolution{{HarnessID: "claude"}}
-	stubInteractiveGate(t)
+	stubInteractiveGate(t, a)
 	probe := stubOpenPicker(t)
 
 	if code := a.Run(); code != ExitOK {
@@ -183,11 +192,12 @@ func TestPickerCmd_UnwritableStateDirStillReachesPicker(t *testing.T) {
 }
 
 // TestPickerCmd_NonInteractiveSaveFailureKeepsOriginalBytesAndExit:
-// recovery is the TTY path only. Without a terminal the run must be
+// recovery is the real-TTY path only. With a plain (non-file) reader the
+// default StdinIsTTY recovery predicate answers no, so the run must be
 // byte-for-byte what it was before the fix — the fatal `ofa: state:` line
 // naming path and cause, exit 2, no warning — and it never reaches the
-// gate, so no no-TTY message appears either. Uses the real
-// stdinIsInteractive predicate (a bytes.Reader is not a terminal).
+// admission gate, so no no-TTY message appears either. Both predicates
+// stay at their production defaults.
 func TestPickerCmd_NonInteractiveSaveFailureKeepsOriginalBytesAndExit(t *testing.T) {
 	statePath := danglingStatePath(t)
 	a, _, stderr, sd, sr, _ := newTestApp(t, nil, bytes.NewReader(nil))
@@ -221,7 +231,7 @@ func TestPickerCmd_FirstRunCatalogFailureStaysFatal(t *testing.T) {
 	a.CatalogLoader = func() ([]catalog.Harness, []catalog.Problem, error) {
 		return nil, nil, errors.New("catalog exploded")
 	}
-	stubInteractiveGate(t)
+	stubInteractiveGate(t, a)
 	probe := stubOpenPicker(t)
 
 	if code := a.Run(); code != ExitError {
@@ -251,7 +261,7 @@ func TestPickerCmd_SaveRecoveryNotInheritedAcrossRuns(t *testing.T) {
 	a.StatePath = statePath
 	sd.instances = oneClaude()
 	sr.res = []resolve.Resolution{{HarnessID: "claude"}}
-	stubInteractiveGate(t)
+	stubInteractiveGate(t, a)
 	probe := stubOpenPicker(t)
 
 	if code := a.Run(); code != ExitOK {
@@ -334,5 +344,101 @@ func TestScanJSON_SaveFailureExitsError(t *testing.T) {
 	}
 	if strings.Contains(got, "cannot save state") {
 		t.Errorf("scan must keep the fatal diagnostic, not the interactive warning: %q", got)
+	}
+}
+
+// TestPickerCmd_SaveFailureNonTerminalCharDeviceKeepsFatalDiagnostic is
+// the B67-1 regression: /dev/null and /dev/zero are character devices,
+// so the historical admission gate lets them through — but they are not
+// terminals. With the DEFAULT predicates (no overrides at all) a
+// first-run save failure must keep the exact pre-fix fatal diagnostic
+// and exit 2, with the picker and the resolve pipeline never reached.
+// Root-portable: no permission bits are involved.
+func TestPickerCmd_SaveFailureNonTerminalCharDeviceKeepsFatalDiagnostic(t *testing.T) {
+	for _, dev := range []string{os.DevNull, "/dev/zero"} {
+		t.Run(dev, func(t *testing.T) {
+			f, err := os.Open(dev)
+			if err != nil {
+				t.Skipf("%s not available here: %v", dev, err)
+			}
+			t.Cleanup(func() { f.Close() })
+
+			statePath := danglingStatePath(t)
+			a, _, stderr, sd, sr, _ := newTestApp(t, nil, f)
+			a.StatePath = statePath
+			sd.instances = oneClaude()
+			sr.res = []resolve.Resolution{{HarnessID: "claude"}}
+			// Only the picker recorder is stubbed; both predicates stay
+			// at their production defaults.
+			probe := stubOpenPicker(t)
+
+			code := a.Run()
+			if code != ExitError {
+				t.Fatalf("exit = %d, want %d (stderr: %q)", code, ExitError, stderr.String())
+			}
+			want := "first run: scanning...\n" +
+				fmt.Sprintf("ofa: state: open %s: no such file or directory\n", statePath)
+			if stderr.String() != want {
+				t.Errorf("stderr bytes = %q, want exactly %q", stderr.String(), want)
+			}
+			if probe.calls != 0 {
+				t.Errorf("picker opened %d times for %s stdin, want 0", probe.calls, dev)
+			}
+			if len(sr.cfgs) != 0 {
+				t.Errorf("resolve ran %d times for %s stdin, want 0 (pipeline never reached)", len(sr.cfgs), dev)
+			}
+		})
+	}
+}
+
+// TestPickerCmd_SaveFailureRecoversOnControllingTerminal is the positive
+// half of B67-1 with the DEFAULT predicates — no overrides at all. stdin
+// is the real controlling terminal (/dev/tty), so both the historical
+// admission gate and the StdinIsTTY recovery predicate answer from the
+// device itself: the save failure recovers, exactly one warning is
+// printed, and the picker seam is reached with this run's in-memory
+// resolutions. Skips where there is no controlling terminal (CI runner);
+// predicate-level real-terminal evidence and the nil/pipe/file/dir/null/
+// zero rejections live in TestStdinIsTTY_NonTerminalInputs.
+func TestPickerCmd_SaveFailureRecoversOnControllingTerminal(t *testing.T) {
+	tty, err := os.OpenFile("/dev/tty", os.O_RDWR, 0)
+	if err != nil {
+		t.Skipf("no controlling terminal here (%v)", err)
+	}
+	t.Cleanup(func() { tty.Close() })
+
+	statePath := danglingStatePath(t)
+	a, out, stderr, sd, sr, _ := newTestApp(t, nil, tty)
+	a.StatePath = statePath
+	sd.instances = oneClaude()
+	sr.res = []resolve.Resolution{{HarnessID: "claude"}}
+	// Only the picker recorder is stubbed; both predicates stay at their
+	// production defaults.
+	probe := stubOpenPicker(t)
+
+	if code := a.Run(); code != ExitOK {
+		t.Fatalf("bare ofa exit = %d, want %d (stderr: %q)", code, ExitOK, stderr.String())
+	}
+	if probe.calls != 1 {
+		t.Fatalf("picker opened %d times, want 1 (stderr: %q)", probe.calls, stderr.String())
+	}
+	if len(probe.res) != 1 || probe.res[0].HarnessID != "claude" {
+		t.Errorf("picker resolutions = %+v, want this run's in-memory claude result", probe.res)
+	}
+	got := stderr.String()
+	if n := strings.Count(got, "cannot save state"); n != 1 {
+		t.Errorf("save failure reported %d times, want exactly 1: %q", n, got)
+	}
+	if !strings.Contains(got, statePath) || !strings.Contains(got, "no such file or directory") {
+		t.Errorf("warning should name path and cause, got %q", got)
+	}
+	if strings.Contains(got, "ofa: state:") {
+		t.Errorf("real-TTY path must warn once, not print the fatal state line: %q", got)
+	}
+	if !strings.Contains(out.String(), "initial scan") || !strings.Contains(out.String(), "claude") {
+		t.Errorf("stdout should show the in-memory scan report, got %q", out.String())
+	}
+	if _, err := os.Stat(statePath); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("state file should still be absent after the failed save, stat err = %v", err)
 	}
 }
